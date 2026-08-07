@@ -234,6 +234,7 @@ jobs:
           if ($responseText -notmatch '(?m)^HTTP/\S+ 404') {
             throw "Could not determine whether tag $tag exists: $responseText"
           }
+          exit 0
 
       - name: Create release and upload packages
         if: inputs.dry_run == false
