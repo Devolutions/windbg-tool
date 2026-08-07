@@ -1,0 +1,28 @@
+[package]
+name = "windbg-tool"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+iced-x86 = "1.21"
+rmcp.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing-subscriber.workspace = true
+windbg-dbgeng = { path = "..\\windbg-dbgeng" }
+windbg-install = { path = "..\\windbg-install" }
+windbg-symbols = { path = "..\\windbg-symbols" }
+windbg-ttd = { path = "..\\windbg-ttd" }
+
+[target.'cfg(windows)'.dependencies]
+windows = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Kernel",
+    "Win32_System_Threading",
+] }

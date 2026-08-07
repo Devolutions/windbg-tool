@@ -1,0 +1,275 @@
+name: Smoke tests
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  dump-smoke:
+    name: Process dump smoke test
+    runs-on: windows-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Select stable Rust
+        shell: pwsh
+        run: rustup default stable
+
+      - name: Restore debugger dependencies
+        shell: pwsh
+        run: cargo xtask deps
+
+      - name: Build windbg-tool
+        shell: pwsh
+        run: cargo build -p windbg-tool
+
+      - name: Agent command smoke tests
+        shell: pwsh
+        timeout-minutes: 5
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          $tool = Join-Path $PWD 'target\debug\windbg-tool.exe'
+
+          Write-Host 'Checking canonical debug capability matrix'
+          $debugCapabilities = & $tool --compact debug capabilities | ConvertFrom-Json
+          if ($debugCapabilities.canonical_command -ne 'debug capabilities') {
+            throw "Unexpected canonical command: $($debugCapabilities.canonical_command)"
+          }
+          $matrixBackends = @($debugCapabilities.backend_matrix | ForEach-Object { $_.backend })
+          foreach ($backend in @('ttd_cursor', 'dbgeng_live', 'dbgeng_dump', 'dbgeng_remote_plan')) {
+            if ($matrixBackends -notcontains $backend) {
+              throw "debug capabilities missing backend '$backend'"
+            }
+          }
+
+          Write-Host 'Checking remote doctor/status/plan'
+          $remoteDoctor = & $tool --compact remote doctor --transport tcp:port=0 | ConvertFrom-Json
+          if ($remoteDoctor.schema_version -ne 1 -or $remoteDoctor.status.parsed_tcp_port -ne 0) {
+            throw "remote doctor returned unexpected payload: $($remoteDoctor | ConvertTo-Json -Compress -Depth 20)"
+          }
+          if (-not (@($remoteDoctor.diagnostics) | Where-Object { $_.id -eq 'remote.probe.opt_in' })) {
+            throw 'remote doctor should report that TCP probing is opt-in'
+          }
+
+          $remoteStatus = & $tool --compact remote status --transport tcp:port=0 | ConvertFrom-Json
+          if ($remoteStatus.schema_version -ne 1 -or $null -ne $remoteStatus.probe) {
+            throw "remote status should not probe unless requested: $($remoteStatus | ConvertTo-Json -Compress -Depth 20)"
+          }
+
+          $remotePlan = & $tool --compact remote plan --server target01 | ConvertFrom-Json
+          $stepIds = @($remotePlan.steps | ForEach-Object { $_.id })
+          foreach ($step in @('target_start_server', 'host_connect', 'verify')) {
+            if ($stepIds -notcontains $step) {
+              throw "remote plan missing step '$step'"
+            }
+          }
+
+          Write-Host 'Checking breakpoint planner and CLI schema'
+          $breakpointPlan = & $tool --compact breakpoint plan --target 1 --address 0x1000 | ConvertFrom-Json
+          if (-not $breakpointPlan.supported -or $breakpointPlan.safety -ne 'mutating') {
+            throw "breakpoint plan returned unexpected payload: $($breakpointPlan | ConvertTo-Json -Compress -Depth 20)"
+          }
+
+          $debugSchema = & $tool --compact cli-schema debug snapshot | ConvertFrom-Json
+          if ($debugSchema.command.path -ne 'debug snapshot' -or $debugSchema.command.metadata.command -ne 'debug snapshot') {
+            throw "cli-schema did not include debug snapshot metadata: $($debugSchema | ConvertTo-Json -Compress -Depth 20)"
+          }
+
+          Write-Host 'Checking optional action log'
+          $logPath = Join-Path $env:RUNNER_TEMP 'windbg-tool-action-log.jsonl'
+          Remove-Item -Path $logPath -Force -ErrorAction SilentlyContinue
+          $env:WINDBG_TOOL_ACTION_LOG = $logPath
+          try {
+            & $tool --compact debug capabilities | Out-Null
+            $logSummary = & $tool --compact debug log summarize --path $logPath | ConvertFrom-Json
+          }
+          finally {
+            Remove-Item Env:WINDBG_TOOL_ACTION_LOG -ErrorAction SilentlyContinue
+          }
+          if ($logSummary.total_entries -lt 1 -or $logSummary.failed_entries -ne 0) {
+            throw "action log summary returned unexpected payload: $($logSummary | ConvertTo-Json -Compress -Depth 20)"
+          }
+          $loggedPath = @($logSummary.recent[0].command_path)
+          if ($loggedPath.Count -ne 2 -or $loggedPath[0] -ne 'debug' -or $loggedPath[1] -ne 'capabilities') {
+            throw "action log did not redact to the expected command path: $($logSummary | ConvertTo-Json -Compress -Depth 20)"
+          }
+
+      - name: Create and inspect ping dump
+        shell: pwsh
+        timeout-minutes: 10
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          $tool = Join-Path $PWD 'target\debug\windbg-tool.exe'
+          $dumpDir = Join-Path $env:RUNNER_TEMP 'windbg-tool-smoke'
+          New-Item -ItemType Directory -Path $dumpDir -Force | Out-Null
+          $dumpPath = Join-Path $dumpDir 'ping.dmp'
+          Remove-Item -Path $dumpPath -Force -ErrorAction SilentlyContinue
+
+          Write-Host 'Launching ping.exe'
+          $ping = Start-Process `
+            -FilePath 'C:\Windows\System32\ping.exe' `
+            -ArgumentList @('127.0.0.1', '-n', '10') `
+            -PassThru
+
+          try {
+            Start-Sleep -Seconds 1
+
+            Write-Host 'Creating process dump'
+            $created = & $tool dump create `
+              --process-id $ping.Id `
+              --output $dumpPath `
+              --kind mini `
+              --overwrite | Tee-Object -Variable createOutput
+            $createOutput | ConvertFrom-Json | Out-Null
+
+            if (-not (Test-Path $dumpPath)) {
+              throw "Expected dump file was not created: $dumpPath"
+            }
+
+            $dumpFile = Get-Item $dumpPath
+            if ($dumpFile.Length -le 0) {
+              throw "Dump file is empty: $dumpPath"
+            }
+          }
+          finally {
+            if (-not $ping.HasExited) {
+              Write-Host 'Terminating ping.exe'
+              Stop-Process -Id $ping.Id -Force
+              $ping.WaitForExit()
+            }
+          }
+
+          Write-Host 'Opening and inspecting dump'
+          $inspection = & $tool dump inspect $dumpPath --max-frames 8 | ConvertFrom-Json
+          if ($inspection.target.kind -ne 'dump') {
+            throw "Expected dump target kind, got '$($inspection.target.kind)'"
+          }
+
+          Write-Host 'Checking modules'
+          $pingModule = $inspection.modules | Where-Object {
+            ($_.module_name -like '*ping*') -or
+            ($_.image_name -like '*ping.exe*') -or
+            ($_.loaded_image_name -like '*ping.exe*')
+          } | Select-Object -First 1
+          if (-not $pingModule) {
+            throw "Expected loaded modules to include ping.exe"
+          }
+
+          Write-Host 'Checking threads'
+          if (-not $inspection.threads -or $inspection.threads.Count -lt 1) {
+            throw "Expected at least one thread in the dump"
+          }
+
+          Write-Host 'Checking registers'
+          if (
+            -not $inspection.registers.instruction_offset -and
+            -not $inspection.registers.stack_offset -and
+            -not $inspection.registers.frame_offset
+          ) {
+            throw "Expected at least one current-thread register offset in the dump"
+          }
+
+          Write-Host 'Checking stack'
+          if (-not $inspection.frames -or $inspection.frames.Count -lt 1) {
+            throw "Expected at least one stack frame in the dump"
+          }
+
+          Write-Host 'Checking daemon-backed agent commands on the dump target'
+          $pipe = "\\.\pipe\windbg-tool-ci-$PID"
+          $daemon = Start-Process `
+            -FilePath $tool `
+            -ArgumentList @('--pipe', $pipe, 'daemon', 'start') `
+            -PassThru
+          $daemonReady = $false
+          for ($attempt = 0; $attempt -lt 50; $attempt++) {
+            Start-Sleep -Milliseconds 100
+            $statusOutput = & $tool --pipe $pipe daemon status 2>$null
+            if ($LASTEXITCODE -eq 0) {
+              $statusOutput | ConvertFrom-Json | Out-Null
+              $daemonReady = $true
+              break
+            }
+            if ($daemon.HasExited) {
+              throw "Daemon exited before becoming ready with code $($daemon.ExitCode)"
+            }
+          }
+          if (-not $daemonReady) {
+            throw "Daemon did not become ready on pipe $pipe"
+          }
+
+          $targetId = $null
+          try {
+            $opened = & $tool --pipe $pipe dump open $dumpPath | ConvertFrom-Json
+            $targetId = $opened.target_id
+            if (-not $targetId) {
+              throw "dump open did not return a target_id: $($opened | ConvertTo-Json -Compress -Depth 20)"
+            }
+
+            $debugCapabilities = & $tool --pipe $pipe --compact debug capabilities --target $targetId | ConvertFrom-Json
+            if (
+              $debugCapabilities.selected.subject.kind -ne 'target' -or
+              $debugCapabilities.selected.matrix.backend -ne 'dbgeng_dump' -or
+              $debugCapabilities.selected.matrix.operations.stack -ne 'supported'
+            ) {
+              throw "debug capabilities did not describe the dump target: $($debugCapabilities | ConvertTo-Json -Compress -Depth 20)"
+            }
+
+            $snapshot = & $tool --pipe $pipe --compact debug snapshot `
+              --target $targetId `
+              --include status `
+              --include stack `
+              --include modules `
+              --max-frames 8 `
+              --max-modules 32 | ConvertFrom-Json
+            if (
+              $snapshot.canonical_command -ne 'debug snapshot' -or
+              $snapshot.subject.kind -ne 'target' -or
+              -not $snapshot.sections.status.status -or
+              -not $snapshot.sections.stack.status -or
+              -not $snapshot.sections.modules.status
+            ) {
+              throw "debug snapshot returned unexpected dump-target sections: $($snapshot | ConvertTo-Json -Compress -Depth 20)"
+            }
+
+            $symbolsDoctor = & $tool --pipe $pipe --compact symbols doctor --target $targetId | ConvertFrom-Json
+            if ($symbolsDoctor.schema_version -ne 1 -or $symbolsDoctor.subject.kind -ne 'target' -or $symbolsDoctor.doctor.status -ne 'ok') {
+              throw "symbols doctor returned unexpected dump-target payload: $($symbolsDoctor | ConvertTo-Json -Compress -Depth 20)"
+            }
+
+            $triage = & $tool --pipe $pipe --compact triage symbol-health --target $targetId | ConvertFrom-Json
+            if ($triage.schema_version -ne 1 -or $triage.kind -ne 'symbol_health' -or $triage.evidence.snapshot.canonical_command -ne 'debug snapshot') {
+              throw "triage did not include debug snapshot evidence: $($triage | ConvertTo-Json -Compress -Depth 20)"
+            }
+
+            $breakpointPlan = & $tool --pipe $pipe --compact breakpoint plan --target $targetId --address 0x1000 | ConvertFrom-Json
+            if (-not $breakpointPlan.supported -or $breakpointPlan.safety -ne 'mutating') {
+              throw "breakpoint plan returned unexpected dump-target payload: $($breakpointPlan | ConvertTo-Json -Compress -Depth 20)"
+            }
+          }
+          finally {
+            if ($targetId) {
+              & $tool --pipe $pipe target close --target $targetId | Out-Null
+            }
+            & $tool --pipe $pipe daemon shutdown | Out-Null
+            if ($daemon -and -not $daemon.HasExited) {
+              if (-not $daemon.WaitForExit(5000)) {
+                Stop-Process -Id $daemon.Id -Force
+                $daemon.WaitForExit()
+              }
+            }
+          }
+
+      - name: Upload dump on failure
+        if: failure()
+        uses: actions/upload-artifact@v6
+        with:
+          name: ping-dump-smoke
+          path: ${{ runner.temp }}\windbg-tool-smoke\ping.dmp
+          if-no-files-found: ignore
+          retention-days: 3
