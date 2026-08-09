@@ -5643,15 +5643,19 @@ fn dump_evidence_grades(
         Some("not_set") => "not_established",
         _ => "not_established",
     };
-    let stack_participant_grade = driver_evidence["observations"]
-        .as_array()
-        .is_some_and(|observations| {
-            observations
-                .iter()
-                .any(|observation| observation["kind"] == "validated_stack_module")
-        })
-        .then_some("observed")
-        .unwrap_or("not_established");
+    let stack_participant_grade =
+        if driver_evidence["observations"]
+            .as_array()
+            .is_some_and(|observations| {
+                observations
+                    .iter()
+                    .any(|observation| observation["kind"] == "validated_stack_module")
+            })
+        {
+            "observed"
+        } else {
+            "not_established"
+        };
     json!({
         "grading_scale": {
             "observed": "Captured directly from the dump.",
