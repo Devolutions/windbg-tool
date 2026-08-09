@@ -5643,12 +5643,15 @@ fn dump_evidence_grades(
         Some("not_set") => "not_established",
         _ => "not_established",
     };
-    let external_driver_grade =
-        if driver_evidence["status"].as_str() == Some("direct_evidence_present") {
-            "observed"
-        } else {
-            "not_established"
-        };
+    let stack_participant_grade = driver_evidence["observations"]
+        .as_array()
+        .is_some_and(|observations| {
+            observations
+                .iter()
+                .any(|observation| observation["kind"] == "validated_stack_module")
+        })
+        .then_some("observed")
+        .unwrap_or("not_established");
     json!({
         "grading_scale": {
             "observed": "Captured directly from the dump.",
@@ -5668,9 +5671,14 @@ fn dump_evidence_grades(
                 "detail": "KiBugCheckDriver is meaningful only when the kernel populated a non-null driver string.",
             },
             {
+                "topic": "third_party_driver_stack_participation",
+                "grade": stack_participant_grade,
+                "detail": "A module in the validated saved stack is a direct participation observation, not an attribution of the initiating write or root cause.",
+            },
+            {
                 "topic": "third_party_driver_causation",
-                "grade": external_driver_grade,
-                "detail": "Loaded modules are inventory only. Attribution requires a fault, validated stack, or populated bugcheck-driver observation.",
+                "grade": "not_established",
+                "detail": "Neither loaded-module inventory nor a module's presence in the saved stack proves third-party-driver causation. A non-null bugcheck-driver record or faulting driver code remains separate evidence.",
             },
         ],
     })
@@ -7261,6 +7269,35 @@ mod tests {
         assert_eq!(grades["observations"][0]["grade"], "possible");
         assert_eq!(grades["observations"][1]["grade"], "not_established");
         assert_eq!(grades["observations"][2]["grade"], "not_established");
+        assert_eq!(grades["observations"][3]["grade"], "not_established");
+
+        let stack_participant_grades = dump_evidence_grades(
+            &json!({
+                "status": "direct_evidence_present",
+                "observations": [{
+                    "kind": "validated_stack_module",
+                    "module": "thirdparty"
+                }]
+            }),
+            &json!({"classification": "outside_central_table_tracker_like_unclassified"}),
+            &json!({"status": "not_set"}),
+        );
+        assert_eq!(
+            stack_participant_grades["observations"][2]["topic"],
+            "third_party_driver_stack_participation"
+        );
+        assert_eq!(
+            stack_participant_grades["observations"][2]["grade"],
+            "observed"
+        );
+        assert_eq!(
+            stack_participant_grades["observations"][3]["topic"],
+            "third_party_driver_causation"
+        );
+        assert_eq!(
+            stack_participant_grades["observations"][3]["grade"],
+            "not_established"
+        );
     }
 
     #[test]
