@@ -94,12 +94,41 @@ Cross-compiling the ARM64 package from an x64 machine requires the Visual Studio
 
 ### Publishing a GitHub Release
 
-Run the **Windows packages** workflow with **Run workflow** and enter an unprefixed semantic version such as `0.1.0`. After both package matrix jobs complete, the workflow creates the `v0.1.0` tag at the commit selected for the dispatch and publishes a GitHub Release containing:
+Run the **Windows packages** workflow with **Run workflow** and enter an unprefixed semantic version such as `0.1.0`. After both package matrix jobs complete, the workflow signs the project-owned Windows binaries, creates the .NET tool packages, and publishes a GitHub Release containing:
 
 - `windbg-tool-x64.zip`
 - `windbg-tool-arm64.zip`
+- `Devolutions.WinDbg.Tool.win-x64.<version>.nupkg`
+- `Devolutions.WinDbg.Tool.win-arm64.<version>.nupkg`
+- `Devolutions.WinDbg.Tool.any.<version>.nupkg`
+- `Devolutions.WinDbg.Tool.<version>.nupkg`
+- `checksums.txt`
 
-Select **dry_run** to build both ZIPs, validate their contents, validate the version, and confirm that the tag is available without creating a tag or GitHub Release. The workflow rejects existing tags and invalid versions rather than replacing a release. Each ZIP contains the statically linked Rust executable and native bridge plus the required dynamic TTD Replay, DbgEng, and symbol runtime DLLs.
+Select **dry_run** to build both ZIPs, validate their contents, validate the version, and confirm that the tag is available without creating a tag or GitHub Release. Set **sign_dry_run** to exercise Azure Trusted Signing during a dry run when the signing configuration is available. The workflow rejects existing tags and invalid versions rather than replacing a release. Each ZIP contains the statically linked Rust executable and native bridge plus the required dynamic TTD Replay, DbgEng, and symbol runtime DLLs.
+
+The workflow uses the `publish-prod` environment by default; choose `test` to use `publish-test`. Configure the Azure Trusted Signing secrets for non-dry-run releases, and add `NUGET_BOT_USERNAME` when NuGet publishing is enabled:
+
+- `AZURE_CLIENT_ID`
+- `AZURE_TENANT_ID`
+- `AZURE_SUBSCRIPTION_ID`
+- `TRUSTED_SIGNING_ENDPOINT`
+- `TRUSTED_SIGNING_ACCOUNT_NAME`
+- `TRUSTED_SIGNING_PROFILE_NAME`
+- `NUGET_BOT_USERNAME`
+
+The optional `TRUSTED_SIGNING_TIMESTAMP_SERVER` environment variable defaults to `http://timestamp.acs.microsoft.com/`. The workflow obtains the Azure Artifact Signing access token with GitHub OIDC and publishes through `NuGet/login@v1`; no long-lived NuGet API key is stored. It signs `windbg-tool.exe`, `ttd_replay_bridge.dll`, and the generated .NET launcher assemblies while preserving the signatures on Microsoft-provided runtime DLLs. The ZIP and NuGet containers themselves are not Authenticode-signed; they contain the signed Windows payloads.
+
+For a local package smoke test, place the architecture-specific release payloads under `target\dotnet-tool\win-x64` and `target\dotnet-tool\win-arm64`, then run:
+
+```powershell
+$stagingRoot = Resolve-Path target\dotnet-tool
+dotnet pack packaging\dotnet-tool\Devolutions.WinDbg.Tool.csproj `
+  -c Release `
+  -p:PackageVersion=0.1.0 `
+  -p:WindbgToolStagingRoot=$stagingRoot `
+  -o artifacts\nuget
+./scripts\Test-WindbgDotnetToolPackage.ps1 -Version 0.1.0 -PackageDir artifacts\nuget
+```
 
 To smoke-test the packaged MCP server:
 
