@@ -41,11 +41,22 @@ The built executable is:
 target\debug\windbg-tool.exe
 ```
 
-Release ZIP artifacts are built by the Windows packaging workflow. Run **Windows packages** manually with an unprefixed semantic version such as `0.1.0` to publish the `v0.1.0` GitHub Release. Select **dry_run** to build and validate the packages without creating a tag or release. The release contains `windbg-tool-x64.zip` and `windbg-tool-arm64.zip`.
+Release ZIP artifacts are built by the Windows packaging workflow. Run **Windows packages** manually with an unprefixed semantic version such as `0.1.0` to publish the `v0.1.0` GitHub Release. Select **dry_run** to build, sign, and validate the packages without creating a tag or release. The release contains `windbg-tool-x64.zip`, `windbg-tool-arm64.zip`, the .NET tool packages, and `checksums.txt`.
 
 The local equivalent uses `cargo xtask deps --arch <amd64|arm64>`, `cargo xtask native-build --arch <amd64|arm64> --static-crt`, a release build for the matching MSVC Rust target, and `cargo xtask package --profile release`. Both packages statically link the MSVC runtime and bundle their required TTD, DbgEng, symbol, and native-bridge DLLs.
 
 For deeper setup, test commands, runtime details, and workspace notes, see [the development guide](docs/development.md).
+
+## Install as a .NET tool
+
+On Windows with the .NET 10 SDK or later, install the global tool containing signed Windows payloads from NuGet:
+
+```powershell
+dotnet tool install --global Devolutions.WinDbg.Tool
+windbg-tool discover
+```
+
+The package includes `win-x64` and `win-arm64` payloads and exposes the same `windbg-tool` command as the release ZIPs.
 
 ## CLI quick start
 

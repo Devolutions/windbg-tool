@@ -22,3 +22,6 @@ native/**/x86/
 native/**/ARM64/
 native/**/.vs/
 scripts/TTDDownload/
+packaging/dotnet-tool/bin/
+packaging/dotnet-tool/obj/
+artifacts/

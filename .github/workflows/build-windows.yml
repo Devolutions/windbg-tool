@@ -10,15 +10,68 @@ on:
         required: true
         type: string
       dry_run:
-        description: Build and validate release packages without creating a tag or release
+        description: Build, sign, and validate release packages without creating a tag or release
         required: false
         default: false
         type: boolean
+      publish_nuget:
+        description: Publish .NET tool packages containing signed Windows payloads to NuGet.org
+        required: false
+        default: true
+        type: boolean
+      github_env:
+        description: GitHub environment for Azure Trusted Signing and NuGet publishing
+        required: false
+        default: auto
+        type: choice
+        options:
+          - auto
+          - test
+          - prod
 
 permissions:
   contents: read
 
 jobs:
+  preflight:
+    name: Validate release dispatch
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      publish_env: ${{ steps.resolve.outputs.publish_env }}
+
+    steps:
+      - name: Resolve release environment
+        id: resolve
+        shell: pwsh
+        env:
+          REQUESTED_ENV: ${{ inputs.github_env }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          $dryRun = [System.Boolean]::Parse($env:DRY_RUN)
+          $isMaster = $env:GITHUB_REF -eq 'refs/heads/master'
+
+          if (-not $dryRun -and -not $isMaster) {
+            throw 'Non-dry-run releases must be dispatched from the master branch.'
+          }
+
+          if (-not $isMaster) {
+            $publishEnvironment = 'publish-test'
+          }
+          else {
+            $publishEnvironment = switch ($env:REQUESTED_ENV) {
+              'test' { 'publish-test'; break }
+              default { 'publish-prod' }
+            }
+          }
+
+          "publish_env=$publishEnvironment" |
+            Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          Write-Host "Release environment: $publishEnvironment"
+
   package:
     name: Package ${{ matrix.label }}
     runs-on: windows-latest
@@ -183,12 +236,356 @@ jobs:
           path: target\package\${{ matrix.artifact }}.zip
           if-no-files-found: error
 
+  sign-and-pack:
+    name: Sign and pack .NET tool
+    if: github.event_name == 'workflow_dispatch'
+    needs:
+      - package
+      - preflight
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    environment: ${{ needs.preflight.outputs.publish_env }}
+    permissions:
+      id-token: write
+      contents: read
+    env:
+      VERSION: ${{ inputs.version }}
+      PSIGN_VERSION: 0.6.1
+      PSIGN_SHA256: 5e5bba2e76dc28c0b974493d6c81cac7fb3cd33c1c57f370dd1a520b3a794a07
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Download unsigned Windows x64 package
+        uses: actions/download-artifact@v8
+        with:
+          name: windbg-tool-x64
+          path: work/archives/win-x64
+
+      - name: Download unsigned Windows ARM64 package
+        uses: actions/download-artifact@v8
+        with:
+          name: windbg-tool-arm64
+          path: work/archives/win-arm64
+
+      - name: Setup .NET SDK
+        uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Resolve signing mode
+        id: signing_mode
+        shell: pwsh
+        env:
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          TRUSTED_SIGNING_ENDPOINT: ${{ secrets.TRUSTED_SIGNING_ENDPOINT }}
+          TRUSTED_SIGNING_ACCOUNT_NAME: ${{ secrets.TRUSTED_SIGNING_ACCOUNT_NAME }}
+          TRUSTED_SIGNING_PROFILE_NAME: ${{ secrets.TRUSTED_SIGNING_PROFILE_NAME }}
+        run: |
+          $requiredValues = @(
+            $env:AZURE_CLIENT_ID,
+            $env:AZURE_TENANT_ID,
+            $env:AZURE_SUBSCRIPTION_ID,
+            $env:TRUSTED_SIGNING_ENDPOINT,
+            $env:TRUSTED_SIGNING_ACCOUNT_NAME,
+            $env:TRUSTED_SIGNING_PROFILE_NAME
+          )
+
+          $hasSigningSecrets = $true
+          foreach ($value in $requiredValues) {
+            if ([string]::IsNullOrWhiteSpace($value)) {
+              $hasSigningSecrets = $false
+              break
+            }
+          }
+
+          if (-not $hasSigningSecrets) {
+            throw 'Azure Trusted Signing configuration is required for every release dispatch, including dry runs.'
+          }
+
+          "should_sign=true" |
+            Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          Write-Host 'Windows binaries will be signed with Azure Trusted Signing.'
+
+      - name: Download Linux psign-tool
+        if: steps.signing_mode.outputs.should_sign == 'true'
+        shell: pwsh
+        run: |
+          $toolRoot = Join-Path $env:RUNNER_TEMP 'psign-tool'
+          if (Test-Path -LiteralPath $toolRoot) {
+            Remove-Item -LiteralPath $toolRoot -Recurse -Force
+          }
+
+          New-Item -ItemType Directory -Force -Path $toolRoot | Out-Null
+          $archivePath = Join-Path $toolRoot 'psign-tool.zip'
+          $archiveUrl = "https://github.com/Devolutions/psign/releases/download/v$env:PSIGN_VERSION/psign-tool-linux-x64.zip"
+          Invoke-WebRequest -Uri $archiveUrl -OutFile $archivePath
+          $archiveHash = (Get-FileHash -LiteralPath $archivePath -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($archiveHash -ne $env:PSIGN_SHA256) {
+            throw "SHA-256 mismatch for downloaded psign-tool: expected $env:PSIGN_SHA256, got $archiveHash"
+          }
+          Expand-Archive -LiteralPath $archivePath -DestinationPath $toolRoot -Force
+
+          $toolPath = Join-Path $toolRoot 'psign-tool'
+          if (-not (Test-Path -LiteralPath $toolPath -PathType Leaf)) {
+            throw "Linux psign-tool was not found after extracting $archiveUrl"
+          }
+
+          & chmod +x $toolPath
+          $toolRoot | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          & $toolPath --version
+          if ($LASTEXITCODE -ne 0) {
+            throw 'The downloaded psign-tool could not be executed.'
+          }
+
+      - name: Azure login for Trusted Signing
+        if: steps.signing_mode.outputs.should_sign == 'true'
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Arrange package payloads
+        shell: pwsh
+        run: |
+          $workRoot = Join-Path $PWD 'work'
+          $archiveRoot = Join-Path $workRoot 'archives'
+          $stagingRoot = Join-Path $workRoot 'payload'
+          New-Item -ItemType Directory -Force -Path $stagingRoot | Out-Null
+
+          foreach ($rid in @('win-x64', 'win-arm64')) {
+            $archiveDirectory = Join-Path $archiveRoot $rid
+            $archive = Get-ChildItem -LiteralPath $archiveDirectory -Filter '*.zip' -File |
+              Select-Object -First 1
+            if ($null -eq $archive) {
+              throw "Unsigned package ZIP was not downloaded for $rid."
+            }
+
+            $payloadDirectory = Join-Path $stagingRoot $rid
+            New-Item -ItemType Directory -Force -Path $payloadDirectory | Out-Null
+            Expand-Archive -LiteralPath $archive.FullName -DestinationPath $payloadDirectory -Force
+
+            foreach ($file in @(
+                'windbg-tool.exe',
+                'ttd_replay_bridge.dll',
+                'TTDReplay.dll',
+                'TTDReplayCPU.dll',
+                'dbgeng.dll',
+                'dbgcore.dll',
+                'dbghelp.dll',
+                'dbgmodel.dll',
+                'msdia140.dll',
+                'srcsrv.dll')) {
+              $path = Join-Path $payloadDirectory $file
+              if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+                throw "Package for $rid is missing required file: $file"
+              }
+            }
+          }
+
+      - name: Build dotnet tool launcher
+        shell: pwsh
+        run: |
+          $project = (Resolve-Path (Join-Path $PWD 'packaging/dotnet-tool/Devolutions.WinDbg.Tool.csproj')).Path
+          $stagingRoot = (Resolve-Path (Join-Path $PWD 'work/payload')).Path
+
+          dotnet restore $project
+          if ($LASTEXITCODE -ne 0) {
+            throw 'dotnet tool project restore failed.'
+          }
+
+          foreach ($rid in @('win-x64', 'win-arm64', 'any')) {
+            $buildArgs = @(
+              'build',
+              $project,
+              '-c', 'Release',
+              '-r', $rid,
+              '--no-restore',
+              "-p:WindbgToolStagingRoot=$stagingRoot"
+            )
+
+            & dotnet @buildArgs
+            if ($LASTEXITCODE -ne 0) {
+              throw "dotnet tool launcher build failed for $rid."
+            }
+          }
+
+      - name: Code sign Windows binaries with Trusted Signing
+        if: steps.signing_mode.outputs.should_sign == 'true'
+        shell: pwsh
+        env:
+          TRUSTED_SIGNING_ENDPOINT: ${{ secrets.TRUSTED_SIGNING_ENDPOINT }}
+          TRUSTED_SIGNING_ACCOUNT_NAME: ${{ secrets.TRUSTED_SIGNING_ACCOUNT_NAME }}
+          TRUSTED_SIGNING_PROFILE_NAME: ${{ secrets.TRUSTED_SIGNING_PROFILE_NAME }}
+          TRUSTED_SIGNING_TIMESTAMP_SERVER: ${{ vars.TRUSTED_SIGNING_TIMESTAMP_SERVER || 'http://timestamp.acs.microsoft.com/' }}
+        run: |
+          $accessToken = az account get-access-token `
+            --scope https://codesigning.azure.net/.default `
+            --query accessToken `
+            --output tsv
+
+          if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($accessToken)) {
+            throw 'Failed to acquire a Trusted Signing data-plane access token.'
+          }
+
+          $projectRoot = Join-Path $PWD 'packaging/dotnet-tool'
+          $targets = @()
+          foreach ($rid in @('win-x64', 'win-arm64')) {
+            $payloadRoot = Join-Path (Join-Path $PWD 'work/payload') $rid
+            $outputRoot = Join-Path (Join-Path (Join-Path (Join-Path $projectRoot 'bin') 'Release') 'net10.0') $rid
+            $targets += Join-Path $payloadRoot 'windbg-tool.exe'
+            $targets += Join-Path $payloadRoot 'ttd_replay_bridge.dll'
+            $targets += Join-Path $outputRoot 'Devolutions.WinDbg.Tool.exe'
+            $targets += Join-Path $outputRoot 'Devolutions.WinDbg.Tool.dll'
+          }
+
+          $anyOutputRoot = Join-Path (Join-Path (Join-Path (Join-Path $projectRoot 'bin') 'Release') 'net10.0') 'any'
+          $targets += Join-Path $anyOutputRoot 'Devolutions.WinDbg.Tool.dll'
+
+          foreach ($target in ($targets | Sort-Object -Unique)) {
+            if (-not (Test-Path -LiteralPath $target -PathType Leaf)) {
+              throw "Signing target was not produced: $target"
+            }
+
+            psign-tool --mode portable --verbose sign `
+              --artifact-signing-endpoint "$env:TRUSTED_SIGNING_ENDPOINT" `
+              --artifact-signing-account-name "$env:TRUSTED_SIGNING_ACCOUNT_NAME" `
+              --artifact-signing-profile-name "$env:TRUSTED_SIGNING_PROFILE_NAME" `
+              --artifact-signing-access-token "$accessToken" `
+              --timestamp-url "$env:TRUSTED_SIGNING_TIMESTAMP_SERVER" `
+              --timestamp-digest sha256 `
+              --digest sha256 `
+              --exit-codes azure `
+              "$target"
+
+            if ($LASTEXITCODE -ne 0) {
+              throw "Trusted Signing failed for $target with exit code $LASTEXITCODE"
+            }
+          }
+
+      - name: Pack dotnet tool packages
+        shell: pwsh
+        run: |
+          $project = (Resolve-Path (Join-Path $PWD 'packaging/dotnet-tool/Devolutions.WinDbg.Tool.csproj')).Path
+          $stagingRoot = (Resolve-Path (Join-Path $PWD 'work/payload')).Path
+          $outputDirectory = Join-Path $PWD 'artifacts/nuget'
+
+          if (Test-Path -LiteralPath $outputDirectory) {
+            Remove-Item -LiteralPath $outputDirectory -Recurse -Force
+          }
+          New-Item -ItemType Directory -Force -Path $outputDirectory | Out-Null
+
+          $packArgs = @(
+            'pack',
+            $project,
+            '-c', 'Release',
+            '--no-build',
+            '--no-restore',
+            "-p:PackageVersion=$env:VERSION",
+            "-p:WindbgToolStagingRoot=$stagingRoot",
+            '-o', $outputDirectory
+          )
+
+          & dotnet @packArgs
+          if ($LASTEXITCODE -ne 0) {
+            throw 'dotnet tool package creation failed.'
+          }
+
+          $packages = @(Get-ChildItem -LiteralPath $outputDirectory -Filter 'Devolutions.WinDbg.Tool*.nupkg' -File)
+          $ridPackages = @($packages | Where-Object {
+            $_.Name -match '^Devolutions\.WinDbg\.Tool\.(win-x64|win-arm64|any)\.'
+          })
+          $pointerPackages = @($packages | Where-Object {
+            $_.Name -notmatch '^Devolutions\.WinDbg\.Tool\.(win-x64|win-arm64|any)\.'
+          })
+
+          if ($ridPackages.Count -ne 3) {
+            throw "Expected win-x64, win-arm64, and any packages; found $($ridPackages.Count)."
+          }
+          if ($pointerPackages.Count -ne 1) {
+            throw "Expected one dotnet tool pointer package; found $($pointerPackages.Count)."
+          }
+
+      - name: Rebuild signed Windows ZIPs
+        shell: pwsh
+        run: |
+          $releaseDirectory = Join-Path $PWD 'artifacts/release'
+          $stagingRoot = Join-Path $PWD 'work/payload'
+          New-Item -ItemType Directory -Force -Path $releaseDirectory | Out-Null
+
+          foreach ($mapping in @(
+              @{ Rid = 'win-x64'; Name = 'windbg-tool-x64.zip' },
+              @{ Rid = 'win-arm64'; Name = 'windbg-tool-arm64.zip' })) {
+            $payloadDirectory = Join-Path $stagingRoot $mapping.Rid
+            $archivePath = Join-Path $releaseDirectory $mapping.Name
+            if (Test-Path -LiteralPath $archivePath) {
+              Remove-Item -LiteralPath $archivePath -Force
+            }
+
+            Compress-Archive `
+              -Path (Join-Path $payloadDirectory '*') `
+              -DestinationPath $archivePath `
+              -Force
+          }
+
+      - name: Upload signed Windows packages
+        uses: actions/upload-artifact@v7
+        with:
+          name: signed-windbg-tool
+          path: artifacts/release/windbg-tool-*.zip
+          if-no-files-found: error
+
+      - name: Upload dotnet tool packages
+        uses: actions/upload-artifact@v7
+        with:
+          name: windbg-tool-nuget
+          path: artifacts/nuget/Devolutions.WinDbg.Tool*.nupkg
+          if-no-files-found: error
+
+  smoke-dotnet-tool:
+    name: Smoke-test installed .NET tool
+    if: github.event_name == 'workflow_dispatch'
+    needs: sign-and-pack
+    runs-on: windows-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Setup .NET SDK
+        uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Download dotnet tool packages
+        uses: actions/download-artifact@v8
+        with:
+          name: windbg-tool-nuget
+          path: artifacts\nuget
+
+      - name: Install and run dotnet tool
+        shell: pwsh
+        run: |
+          ./scripts/Test-WindbgDotnetToolPackage.ps1 `
+            -Version '${{ inputs.version }}' `
+            -PackageDir (Resolve-Path 'artifacts\nuget') `
+            -ToolPath (Join-Path $env:RUNNER_TEMP 'windbg-tool-package-smoke')
+
   release:
     name: Publish GitHub Release
-    needs: package
+    needs:
+      - package
+      - sign-and-pack
+      - smoke-dotnet-tool
+      - preflight
     if: github.event_name == 'workflow_dispatch'
     runs-on: windows-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
     permissions:
       contents: write
     env:
@@ -196,12 +593,17 @@ jobs:
       VERSION: ${{ inputs.version }}
 
     steps:
-      - name: Download packages
+      - name: Download signed Windows packages
         uses: actions/download-artifact@v8
         with:
+          name: signed-windbg-tool
           path: release-assets
-          pattern: windbg-tool-*
-          merge-multiple: true
+
+      - name: Download dotnet tool packages
+        uses: actions/download-artifact@v8
+        with:
+          name: windbg-tool-nuget
+          path: release-assets\dotnet-tool
 
       - name: Validate release inputs and assets
         shell: pwsh
@@ -223,6 +625,28 @@ jobs:
               throw "Release asset was not downloaded: $asset"
             }
           }
+
+          $nugetPackages = @(Get-ChildItem -Path 'release-assets\dotnet-tool' -Filter 'Devolutions.WinDbg.Tool*.nupkg' -File)
+          if ($nugetPackages.Count -ne 4) {
+            throw "Expected four dotnet tool packages, found $($nugetPackages.Count)."
+          }
+
+      - name: Generate release checksums
+        shell: pwsh
+        run: |
+          $files = @(Get-ChildItem -Path 'release-assets' -Recurse -File |
+            Where-Object { $_.Extension -in @('.zip', '.nupkg') } |
+            Sort-Object Name)
+          if ($files.Count -ne 6) {
+            throw "Expected six checksum inputs, found $($files.Count)."
+          }
+
+          $checksums = foreach ($file in $files) {
+            $hash = (Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+            "$hash  $($file.Name)"
+          }
+          $checksums |
+            Set-Content -LiteralPath 'release-assets\checksums.txt' -Encoding ascii
 
           $response = & gh api --include "repos/$env:GITHUB_REPOSITORY/git/ref/tags/$tag" 2>&1
           $exitCode = $LASTEXITCODE
@@ -247,6 +671,10 @@ jobs:
             (Join-Path $PWD 'release-assets\windbg-tool-x64.zip'),
             (Join-Path $PWD 'release-assets\windbg-tool-arm64.zip')
           )
+          $assets += Get-ChildItem -Path 'release-assets\dotnet-tool' -Filter 'Devolutions.WinDbg.Tool*.nupkg' -File |
+            Sort-Object Name |
+            ForEach-Object { $_.FullName }
+          $assets += Join-Path $PWD 'release-assets\checksums.txt'
           & gh release create $tag $assets `
             --repo $env:GITHUB_REPOSITORY `
             --target $env:GITHUB_SHA `
@@ -256,4 +684,103 @@ jobs:
       - name: Report dry run
         if: inputs.dry_run
         shell: pwsh
-        run: Write-Host "Dry run completed. Would create v$env:VERSION with the validated package ZIPs."
+        run: Write-Host "Dry run completed. Would create v$env:VERSION with the validated ZIPs, NuGet packages, and checksums."
+
+  publish-nuget:
+    name: Publish .NET tool to NuGet.org
+    if: github.event_name == 'workflow_dispatch' && inputs.publish_nuget
+    needs:
+      - sign-and-pack
+      - smoke-dotnet-tool
+      - preflight
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: ${{ needs.preflight.outputs.publish_env }}
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - name: Resolve publish mode
+        id: publish_mode
+        shell: pwsh
+        env:
+          NUGET_BOT_USERNAME: ${{ secrets.NUGET_BOT_USERNAME }}
+        run: |
+          $dryRun = [System.Boolean]::Parse('${{ inputs.dry_run }}')
+          $hasLoginUser = -not [string]::IsNullOrWhiteSpace($env:NUGET_BOT_USERNAME)
+
+          "dry_run=$($dryRun.ToString().ToLowerInvariant())" |
+            Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          "has_login_user=$($hasLoginUser.ToString().ToLowerInvariant())" |
+            Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+
+          if (-not $dryRun -and -not $hasLoginUser) {
+            throw 'NUGET_BOT_USERNAME is required when dry_run is false.'
+          }
+
+          Write-Host "NuGet dry-run mode: $dryRun"
+
+      - name: Download dotnet tool packages
+        uses: actions/download-artifact@v8
+        with:
+          name: windbg-tool-nuget
+          path: dist
+
+      - name: Setup .NET SDK
+        uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: 10.0.x
+
+      - name: NuGet login (OIDC)
+        if: steps.publish_mode.outputs.dry_run != 'true' && steps.publish_mode.outputs.has_login_user == 'true'
+        id: nuget-login
+        uses: NuGet/login@v1
+        with:
+          user: ${{ secrets.NUGET_BOT_USERNAME }}
+
+      - name: Publish to NuGet.org (RID first, pointer last)
+        shell: pwsh
+        env:
+          NUGET_SOURCE: https://api.nuget.org/v3/index.json
+        run: |
+          $dryRun = [System.Boolean]::Parse('${{ inputs.dry_run }}')
+          $apiKey = '${{ steps.nuget-login.outputs.NUGET_API_KEY }}'
+
+          if ($dryRun) {
+            $apiKey = 'dry-run-key'
+            Write-Host 'Dry Run: NuGet push commands will be printed but not executed.'
+          }
+          elseif ([string]::IsNullOrWhiteSpace($apiKey)) {
+            throw 'NuGet login did not return an API key.'
+          }
+
+          $toolPackages = @(Get-ChildItem -Path 'dist' -Recurse -File -Filter 'Devolutions.WinDbg.Tool*.nupkg' |
+            Sort-Object Name)
+          $ridPattern = '^Devolutions\.WinDbg\.Tool\.(win-x64|win-arm64|any)\.'
+          $ridPackages = @($toolPackages | Where-Object { $_.Name -match $ridPattern })
+          $pointerPackages = @($toolPackages | Where-Object { $_.Name -notmatch $ridPattern })
+
+          if ($ridPackages.Count -ne 3) {
+            throw "Expected three RID packages (win-x64, win-arm64, any); found $($ridPackages.Count)."
+          }
+          if ($pointerPackages.Count -ne 1) {
+            throw "Expected one dotnet tool pointer package; found $($pointerPackages.Count)."
+          }
+
+          foreach ($package in (@($ridPackages) + @($pointerPackages))) {
+            $pushArgs = @(
+              'nuget', 'push', "$($package.FullName)",
+              '--api-key', "$apiKey",
+              '--source', "$env:NUGET_SOURCE",
+              '--skip-duplicate', '--no-symbols'
+            )
+
+            Write-Host "dotnet nuget push `"$($package.FullName)`" --api-key *** --source `"$env:NUGET_SOURCE`" --skip-duplicate --no-symbols"
+            if (-not $dryRun) {
+              & dotnet @pushArgs
+              if ($LASTEXITCODE -ne 0) {
+                throw "dotnet nuget push failed for $($package.Name) with exit code $LASTEXITCODE."
+              }
+            }
+          }

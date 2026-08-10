@@ -1,0 +1,51 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+
+    <PackAsTool>true</PackAsTool>
+    <ToolCommandName>windbg-tool</ToolCommandName>
+    <PackageId>Devolutions.WinDbg.Tool</PackageId>
+
+    <Version Condition="'$(Version)' == ''">0.1.0</Version>
+    <Authors>Devolutions</Authors>
+    <Description>RID-specific dotnet tool wrapper around the signed windbg-tool Windows executable.</Description>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+    <PackageProjectUrl>https://github.com/Devolutions/windbg-tool</PackageProjectUrl>
+    <PackageTags>windbg;debugging;ttd;time-travel-debugging;dotnet-tool</PackageTags>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <RepositoryType>git</RepositoryType>
+    <RepositoryUrl>https://github.com/Devolutions/windbg-tool</RepositoryUrl>
+    <PackageRequireLicenseAcceptance>false</PackageRequireLicenseAcceptance>
+
+    <NoPackageAnalysis>true</NoPackageAnalysis>
+    <ToolPackageRuntimeIdentifiers>win-x64;win-arm64;any</ToolPackageRuntimeIdentifiers>
+    <RuntimeIdentifiers>win-x64;win-arm64;any</RuntimeIdentifiers>
+    <RollForward>Major</RollForward>
+  </PropertyGroup>
+
+  <PropertyGroup>
+    <WindbgToolStagingRoot Condition="'$(WindbgToolStagingRoot)' == ''">$(MSBuildProjectDirectory)/../../target/dotnet-tool</WindbgToolStagingRoot>
+    <WindbgToolPayloadDirectory>$(WindbgToolStagingRoot)/$(RuntimeIdentifier)</WindbgToolPayloadDirectory>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <None Include="README.md" Pack="true" PackagePath="README.md" />
+
+    <None Include="$(WindbgToolPayloadDirectory)/**/*"
+          Pack="true"
+          PackagePath="tools/net10.0/$(RuntimeIdentifier)/%(RecursiveDir)%(Filename)%(Extension)"
+          Visible="false"
+          Condition="('$(RuntimeIdentifier)' == 'win-x64' or '$(RuntimeIdentifier)' == 'win-arm64') and Exists('$(WindbgToolPayloadDirectory)')" />
+  </ItemGroup>
+
+  <Target Name="ValidateWindbgToolStaging"
+          BeforeTargets="GenerateNuspec"
+          Condition="'$(RuntimeIdentifier)' == 'win-x64' or '$(RuntimeIdentifier)' == 'win-arm64'">
+    <Error Condition="!Exists('$(WindbgToolPayloadDirectory)/windbg-tool.exe')"
+           Text="Missing staged windbg-tool executable for RuntimeIdentifier '$(RuntimeIdentifier)': $(WindbgToolPayloadDirectory)/windbg-tool.exe" />
+    <Error Condition="!Exists('$(WindbgToolPayloadDirectory)/ttd_replay_bridge.dll')"
+           Text="Missing staged TTD replay bridge for RuntimeIdentifier '$(RuntimeIdentifier)': $(WindbgToolPayloadDirectory)/ttd_replay_bridge.dll" />
+  </Target>
+</Project>
