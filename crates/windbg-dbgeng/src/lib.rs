@@ -9,6 +9,7 @@ use std::sync::{
 };
 use std::{
     env, fs,
+    io::{Read, Seek, SeekFrom},
     path::{Path, PathBuf},
     sync::OnceLock,
     time::Instant,
@@ -29,6 +30,8 @@ pub const MAX_VIRTUAL_MEMORY_MAP_REGIONS: u32 = 4096;
 pub const MAX_THREAD_ACCOUNTING_THREADS: u32 = 128;
 pub const MAX_MODULE_PARAMETER_QUERIES: usize = 128;
 pub const MAX_SYMBOL_ENTRY_OFFSET_REGIONS: usize = 16;
+pub const MAX_MINIDUMP_DIRECTORY_ENTRIES: u32 = 512;
+pub const MAX_CAPTURED_EVENT_CODE_BYTES: u32 = 64;
 const DEFAULT_DBGENG_SYMBOL_CACHE: &str = ".windbg-symbol-cache";
 const DBGENG_DLL_NAME: &str = "dbgeng.dll";
 const DBGENG_RUNTIME_COMPONENTS: [&str; 4] = [
@@ -1004,6 +1007,52 @@ pub struct DebuggerEventInfo {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct CapturedEventCode {
+    pub source: String,
+    pub status: String,
+    pub code_offset: Option<u64>,
+    pub code_bytes: Option<String>,
+    pub bytes_returned: Option<u32>,
+    pub byte_limit: u32,
+    pub detail: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct MinidumpDirectoryEntry {
+    pub index: u32,
+    pub stream_type: u32,
+    pub stream_name: String,
+    pub data_rva: u32,
+    pub data_size: u32,
+    pub range_status: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct MinidumpStreamPresence {
+    pub stream_type: u32,
+    pub stream_name: String,
+    pub occurrences: u32,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct MinidumpDirectoryInventory {
+    pub source: String,
+    pub status: String,
+    pub file_bytes: Option<u64>,
+    pub signature: Option<String>,
+    pub version: Option<u32>,
+    pub stream_count: Option<u32>,
+    pub stream_directory_rva: Option<u32>,
+    pub checksum: Option<u32>,
+    pub time_date_stamp: Option<u32>,
+    pub flags: Option<u64>,
+    pub directory_entry_limit: u32,
+    pub entries: Vec<MinidumpDirectoryEntry>,
+    pub documented_stream_presence: Vec<MinidumpStreamPresence>,
+    pub detail: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct ThreadContext {
     pub thread: ThreadInfo,
     pub registers: CoreRegisterState,
@@ -1036,6 +1085,324 @@ pub fn open_dump_session(options: DumpOpenOptions) -> anyhow::Result<DebuggerSes
 
 pub fn write_process_dump(options: ProcessDumpOptions) -> anyhow::Result<DumpWriteResult> {
     write_process_dump_impl(options)
+}
+
+const MINIDUMP_HEADER_SIZE: usize = 32;
+const MINIDUMP_DIRECTORY_SIZE: usize = 12;
+const MINIDUMP_SIGNATURE: u32 = 0x504d_444d;
+
+pub fn inspect_minidump_directory(path: &Path) -> MinidumpDirectoryInventory {
+    let file_bytes = match fs::metadata(path) {
+        Ok(metadata) => metadata.len(),
+        Err(error) => {
+            return unavailable_minidump_directory(
+                None,
+                format!("Could not read dump metadata: {error}"),
+            );
+        }
+    };
+    if file_bytes < MINIDUMP_HEADER_SIZE as u64 {
+        return unavailable_minidump_directory(
+            Some(file_bytes),
+            format!(
+                "File contains {file_bytes} bytes, fewer than the documented {MINIDUMP_HEADER_SIZE}-byte MINIDUMP_HEADER."
+            ),
+        );
+    }
+
+    let mut file = match fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) => {
+            return unavailable_minidump_directory(
+                Some(file_bytes),
+                format!("Could not open the dump for bounded header inspection: {error}"),
+            );
+        }
+    };
+    let mut header = [0_u8; MINIDUMP_HEADER_SIZE];
+    if let Err(error) = file.read_exact(&mut header) {
+        return unavailable_minidump_directory(
+            Some(file_bytes),
+            format!("Could not read the documented MINIDUMP_HEADER: {error}"),
+        );
+    }
+
+    let signature = minidump_u32(&header, 0);
+    let signature_text = format!("0x{signature:08X}");
+    if signature != MINIDUMP_SIGNATURE {
+        return MinidumpDirectoryInventory {
+            source: "raw_minidump_directory".to_string(),
+            status: "not_minidump".to_string(),
+            file_bytes: Some(file_bytes),
+            signature: Some(signature_text),
+            version: None,
+            stream_count: None,
+            stream_directory_rva: None,
+            checksum: None,
+            time_date_stamp: None,
+            flags: None,
+            directory_entry_limit: MAX_MINIDUMP_DIRECTORY_ENTRIES,
+            entries: Vec::new(),
+            documented_stream_presence: Vec::new(),
+            detail: "The file does not have the documented MDMP signature, so no MINIDUMP directory or stream payload was interpreted.".to_string(),
+        };
+    }
+
+    let version = minidump_u32(&header, 4);
+    let stream_count = minidump_u32(&header, 8);
+    let stream_directory_rva = minidump_u32(&header, 12);
+    let checksum = minidump_u32(&header, 16);
+    let time_date_stamp = minidump_u32(&header, 20);
+    let flags = minidump_u64(&header, 24);
+    let mut inventory = MinidumpDirectoryInventory {
+        source: "raw_minidump_directory".to_string(),
+        status: "captured".to_string(),
+        file_bytes: Some(file_bytes),
+        signature: Some(signature_text),
+        version: Some(version),
+        stream_count: Some(stream_count),
+        stream_directory_rva: Some(stream_directory_rva),
+        checksum: Some(checksum),
+        time_date_stamp: Some(time_date_stamp),
+        flags: Some(flags),
+        directory_entry_limit: MAX_MINIDUMP_DIRECTORY_ENTRIES,
+        entries: Vec::new(),
+        documented_stream_presence: Vec::new(),
+        detail: "Only the documented MINIDUMP header and directory are inspected. Stream payloads, including unknown or application-defined streams, are not decoded.".to_string(),
+    };
+    if stream_count > MAX_MINIDUMP_DIRECTORY_ENTRIES {
+        inventory.status = "directory_entry_limit_exceeded".to_string();
+        inventory.detail = format!(
+            "The documented header reports {stream_count} directory entries, exceeding the bounded {MAX_MINIDUMP_DIRECTORY_ENTRIES}-entry limit; no directory entries or stream payloads were read."
+        );
+        return inventory;
+    }
+
+    let directory_bytes = (stream_count as usize)
+        .checked_mul(MINIDUMP_DIRECTORY_SIZE)
+        .expect("the bounded MINIDUMP directory count fits usize");
+    let directory_start = u64::from(stream_directory_rva);
+    let Some(directory_end) = directory_start.checked_add(directory_bytes as u64) else {
+        inventory.status = "invalid_directory_range".to_string();
+        inventory.detail =
+            "The documented MINIDUMP directory range overflowed while validating its file bounds."
+                .to_string();
+        return inventory;
+    };
+    if directory_start < MINIDUMP_HEADER_SIZE as u64 || directory_end > file_bytes {
+        inventory.status = "invalid_directory_range".to_string();
+        inventory.detail = format!(
+            "The documented MINIDUMP directory range 0x{directory_start:X}..0x{directory_end:X} is outside the {file_bytes}-byte file."
+        );
+        return inventory;
+    }
+    if let Err(error) = file.seek(SeekFrom::Start(directory_start)) {
+        inventory.status = "unavailable".to_string();
+        inventory.detail = format!("Could not seek to the documented MINIDUMP directory: {error}");
+        return inventory;
+    }
+    let mut directory = vec![0_u8; directory_bytes];
+    if let Err(error) = file.read_exact(&mut directory) {
+        inventory.status = "unavailable".to_string();
+        inventory.detail = format!("Could not read the documented MINIDUMP directory: {error}");
+        return inventory;
+    }
+
+    for (index, entry) in directory.chunks_exact(MINIDUMP_DIRECTORY_SIZE).enumerate() {
+        let stream_type = minidump_u32(entry, 0);
+        let data_size = minidump_u32(entry, 4);
+        let data_rva = minidump_u32(entry, 8);
+        let range_status = minidump_stream_range_status(file_bytes, data_rva, data_size);
+        inventory.entries.push(MinidumpDirectoryEntry {
+            index: index as u32,
+            stream_type,
+            stream_name: minidump_stream_name(stream_type),
+            data_rva,
+            data_size,
+            range_status,
+        });
+    }
+    inventory.documented_stream_presence = MINIDUMP_DOCUMENTED_STREAM_TYPES
+        .iter()
+        .map(|(stream_type, stream_name)| MinidumpStreamPresence {
+            stream_type: *stream_type,
+            stream_name: (*stream_name).to_string(),
+            occurrences: inventory
+                .entries
+                .iter()
+                .filter(|entry| entry.stream_type == *stream_type)
+                .count() as u32,
+        })
+        .collect();
+    if inventory
+        .entries
+        .iter()
+        .any(|entry| entry.range_status != "empty" && entry.range_status != "within_file")
+    {
+        inventory.status = "captured_with_invalid_stream_ranges".to_string();
+    }
+    inventory
+}
+
+fn unavailable_minidump_directory(
+    file_bytes: Option<u64>,
+    detail: String,
+) -> MinidumpDirectoryInventory {
+    MinidumpDirectoryInventory {
+        source: "raw_minidump_directory".to_string(),
+        status: "unavailable".to_string(),
+        file_bytes,
+        signature: None,
+        version: None,
+        stream_count: None,
+        stream_directory_rva: None,
+        checksum: None,
+        time_date_stamp: None,
+        flags: None,
+        directory_entry_limit: MAX_MINIDUMP_DIRECTORY_ENTRIES,
+        entries: Vec::new(),
+        documented_stream_presence: Vec::new(),
+        detail,
+    }
+}
+
+fn minidump_u32(bytes: &[u8], offset: usize) -> u32 {
+    u32::from_le_bytes(
+        bytes[offset..offset + std::mem::size_of::<u32>()]
+            .try_into()
+            .expect("validated MINIDUMP field bounds"),
+    )
+}
+
+fn minidump_u64(bytes: &[u8], offset: usize) -> u64 {
+    u64::from_le_bytes(
+        bytes[offset..offset + std::mem::size_of::<u64>()]
+            .try_into()
+            .expect("validated MINIDUMP field bounds"),
+    )
+}
+
+fn minidump_stream_range_status(file_bytes: u64, data_rva: u32, data_size: u32) -> String {
+    if data_size == 0 {
+        return "empty".to_string();
+    }
+    let start = u64::from(data_rva);
+    let Some(end) = start.checked_add(u64::from(data_size)) else {
+        return "range_overflow".to_string();
+    };
+    if start < MINIDUMP_HEADER_SIZE as u64 {
+        "overlaps_header".to_string()
+    } else if end <= file_bytes {
+        "within_file".to_string()
+    } else {
+        "outside_file".to_string()
+    }
+}
+
+fn minidump_stream_name(stream_type: u32) -> String {
+    let name = match stream_type {
+        0 => "unused",
+        1 => "reserved_0",
+        2 => "reserved_1",
+        3 => "thread_list",
+        4 => "module_list",
+        5 => "memory_list",
+        6 => "exception",
+        7 => "system_info",
+        8 => "thread_ex_list",
+        9 => "memory64_list",
+        10 => "comment_a",
+        11 => "comment_w",
+        12 => "handle_data",
+        13 => "function_table",
+        14 => "unloaded_module_list",
+        15 => "misc_info",
+        16 => "memory_info_list",
+        17 => "thread_info_list",
+        18 => "handle_operation_list",
+        19 => "token",
+        20 => "javascript_data",
+        21 => "system_memory_info",
+        22 => "process_vm_counters",
+        23 => "ipt_trace",
+        24 => "thread_names",
+        25 => "compressed_memory",
+        26 => "compressed_memory_sql",
+        0x8000 => "ce_stream_null",
+        0x8001 => "ce_stream_system_info",
+        0x8002 => "ce_stream_exception",
+        0x8003 => "ce_stream_module_list",
+        0x8004 => "ce_stream_process_list",
+        0x8005 => "ce_stream_thread_list",
+        0x8006 => "ce_stream_thread_context_list",
+        0x8007 => "ce_stream_thread_call_stack_list",
+        0x8008 => "ce_stream_memory_virtual_list",
+        0x8009 => "ce_stream_memory_physical_list",
+        0x800a => "ce_stream_bucket_parameters",
+        0x800b => "ce_stream_process_module_map",
+        0x800c => "ce_stream_diagnosis_list",
+        0x800d..=0xffff => "reserved",
+        _ => {
+            return if stream_type > 0xffff {
+                "application_defined".to_string()
+            } else {
+                format!("unknown_0x{stream_type:08X}")
+            };
+        }
+    };
+    name.to_string()
+}
+
+const MINIDUMP_DOCUMENTED_STREAM_TYPES: &[(u32, &str)] = &[
+    (3, "thread_list"),
+    (4, "module_list"),
+    (5, "memory_list"),
+    (6, "exception"),
+    (7, "system_info"),
+    (8, "thread_ex_list"),
+    (9, "memory64_list"),
+    (10, "comment_a"),
+    (11, "comment_w"),
+    (12, "handle_data"),
+    (13, "function_table"),
+    (14, "unloaded_module_list"),
+    (15, "misc_info"),
+    (16, "memory_info_list"),
+    (17, "thread_info_list"),
+    (18, "handle_operation_list"),
+    (19, "token"),
+    (20, "javascript_data"),
+    (21, "system_memory_info"),
+    (22, "process_vm_counters"),
+    (23, "ipt_trace"),
+    (24, "thread_names"),
+    (25, "compressed_memory"),
+    (26, "compressed_memory_sql"),
+    (0x8000, "ce_stream_null"),
+    (0x8001, "ce_stream_system_info"),
+    (0x8002, "ce_stream_exception"),
+    (0x8003, "ce_stream_module_list"),
+    (0x8004, "ce_stream_process_list"),
+    (0x8005, "ce_stream_thread_list"),
+    (0x8006, "ce_stream_thread_context_list"),
+    (0x8007, "ce_stream_thread_call_stack_list"),
+    (0x8008, "ce_stream_memory_virtual_list"),
+    (0x8009, "ce_stream_memory_physical_list"),
+    (0x800a, "ce_stream_bucket_parameters"),
+    (0x800b, "ce_stream_process_module_map"),
+    (0x800c, "ce_stream_diagnosis_list"),
+];
+
+fn unavailable_captured_event_code(detail: String) -> CapturedEventCode {
+    CapturedEventCode {
+        source: "dbgeng_iddebugadvanced_request_captured_event_code".to_string(),
+        status: "unavailable".to_string(),
+        code_offset: None,
+        code_bytes: None,
+        bytes_returned: None,
+        byte_limit: MAX_CAPTURED_EVENT_CODE_BYTES,
+        detail,
+    }
 }
 
 #[cfg(windows)]
@@ -1582,6 +1949,145 @@ impl DebuggerSession {
             module_base,
             exit_code,
         })
+    }
+
+    pub fn captured_event_code(&self) -> CapturedEventCode {
+        use windows::core::Interface;
+        use windows::Win32::Foundation::E_NOINTERFACE;
+        use windows::Win32::System::Diagnostics::Debug::Extensions::{
+            IDebugAdvanced2, IDebugAdvanced3, DEBUG_REQUEST_GET_CAPTURED_EVENT_CODE_OFFSET,
+            DEBUG_REQUEST_READ_CAPTURED_EVENT_CODE_STREAM,
+        };
+
+        enum CapturedEventRequestInterface {
+            Advanced2(IDebugAdvanced2),
+            Advanced3(IDebugAdvanced3),
+        }
+
+        let (advanced, interface_name) = match self.client.cast::<IDebugAdvanced3>() {
+            Ok(advanced) => (
+                CapturedEventRequestInterface::Advanced3(advanced),
+                "IDebugAdvanced3",
+            ),
+            Err(advanced3_error) => match self.client.cast::<IDebugAdvanced2>() {
+                Ok(advanced) => (
+                    CapturedEventRequestInterface::Advanced2(advanced),
+                    "IDebugAdvanced2",
+                ),
+                Err(advanced2_error) => {
+                    return unavailable_captured_event_code(format!(
+                        "DbgEng did not expose IDebugAdvanced3 or its compatible IDebugAdvanced2 Request ABI for captured-event code requests: IDebugAdvanced3={advanced3_error}; IDebugAdvanced2={advanced2_error}"
+                    ));
+                }
+            },
+        };
+        macro_rules! request {
+            ($request:expr, $outbuffer:expr, $outbuffersize:expr, $outsize:expr) => {
+                match &advanced {
+                    CapturedEventRequestInterface::Advanced2(advanced) => unsafe {
+                        advanced.Request($request, None, 0, $outbuffer, $outbuffersize, $outsize)
+                    },
+                    CapturedEventRequestInterface::Advanced3(advanced) => unsafe {
+                        advanced.Request($request, None, 0, $outbuffer, $outbuffersize, $outsize)
+                    },
+                }
+            };
+        }
+
+        let mut code_offset = 0u64;
+        let mut offset_size = 0u32;
+        if let Err(error) = request!(
+            DEBUG_REQUEST_GET_CAPTURED_EVENT_CODE_OFFSET,
+            Some((&mut code_offset as *mut u64).cast()),
+            std::mem::size_of::<u64>() as u32,
+            Some(&mut offset_size)
+        ) {
+            return CapturedEventCode {
+                source: "dbgeng_iddebugadvanced_request_captured_event_code".to_string(),
+                status: if error.code() == E_NOINTERFACE {
+                    "captured_event_code_memory_invalid".to_string()
+                } else {
+                    "unavailable".to_string()
+                },
+                code_offset: None,
+                code_bytes: None,
+                bytes_returned: None,
+                byte_limit: MAX_CAPTURED_EVENT_CODE_BYTES,
+                detail: if error.code() == E_NOINTERFACE {
+                    format!(
+                    "DbgEng {interface_name} returned E_NOINTERFACE for DEBUG_REQUEST_GET_CAPTURED_EVENT_CODE_OFFSET. Microsoft documents this result as invalid memory at the current stored event's instruction pointer, so no captured code offset or bytes are available."
+                )
+                } else {
+                    format!(
+                    "DbgEng {interface_name} did not provide the captured-event instruction pointer: {error}"
+                )
+                },
+            };
+        }
+        if offset_size != std::mem::size_of::<u64>() as u32 {
+            return CapturedEventCode {
+                source: "dbgeng_iddebugadvanced_request_captured_event_code".to_string(),
+                status: "invalid_response".to_string(),
+                code_offset: None,
+                code_bytes: None,
+                bytes_returned: Some(offset_size),
+                byte_limit: MAX_CAPTURED_EVENT_CODE_BYTES,
+                detail: format!(
+                    "DbgEng returned {offset_size} bytes for DEBUG_REQUEST_GET_CAPTURED_EVENT_CODE_OFFSET; the documented ULONG64 result requires {} bytes.",
+                    std::mem::size_of::<u64>()
+                ),
+            };
+        }
+
+        let mut code = [0u8; MAX_CAPTURED_EVENT_CODE_BYTES as usize];
+        let mut code_size = 0u32;
+        if let Err(error) = request!(
+            DEBUG_REQUEST_READ_CAPTURED_EVENT_CODE_STREAM,
+            Some(code.as_mut_ptr().cast()),
+            MAX_CAPTURED_EVENT_CODE_BYTES,
+            Some(&mut code_size)
+        ) {
+            return CapturedEventCode {
+                source: "dbgeng_iddebugadvanced_request_captured_event_code".to_string(),
+                status: "code_bytes_unavailable".to_string(),
+                code_offset: Some(code_offset),
+                code_bytes: None,
+                bytes_returned: None,
+                byte_limit: MAX_CAPTURED_EVENT_CODE_BYTES,
+                detail: format!(
+                    "DbgEng {interface_name} provided the captured-event instruction pointer but not its bounded code snapshot: {error}"
+                ),
+            };
+        }
+        if code_size > MAX_CAPTURED_EVENT_CODE_BYTES {
+            return CapturedEventCode {
+                source: "dbgeng_iddebugadvanced_request_captured_event_code".to_string(),
+                status: "invalid_response".to_string(),
+                code_offset: Some(code_offset),
+                code_bytes: None,
+                bytes_returned: Some(code_size),
+                byte_limit: MAX_CAPTURED_EVENT_CODE_BYTES,
+                detail: format!(
+                    "DbgEng reported {code_size} captured-event bytes, exceeding the documented {MAX_CAPTURED_EVENT_CODE_BYTES}-byte maximum."
+                ),
+            };
+        }
+        let code = &code[..code_size as usize];
+        CapturedEventCode {
+            source: "dbgeng_iddebugadvanced_request_captured_event_code".to_string(),
+            status: if code.is_empty() {
+                "captured_empty".to_string()
+            } else {
+                "captured".to_string()
+            },
+            code_offset: Some(code_offset),
+            code_bytes: (!code.is_empty()).then(|| encode_hex(code)),
+            bytes_returned: Some(code_size),
+            byte_limit: MAX_CAPTURED_EVENT_CODE_BYTES,
+            detail: format!(
+                "The offset and bytes are a bounded DbgEng {interface_name} snapshot of the current stored event. They are not promoted to original-exception, fault-address, thread, or causation evidence without an independent match to the bugcheck contract."
+            ),
+        }
     }
 
     pub fn detach(&self) -> anyhow::Result<()> {
@@ -3165,6 +3671,10 @@ impl DebuggerSession {
         anyhow::bail!("DbgEng sessions are only supported on Windows")
     }
 
+    pub fn captured_event_code(&self) -> CapturedEventCode {
+        unavailable_captured_event_code("DbgEng sessions are only supported on Windows".to_string())
+    }
+
     pub fn detach(&self) -> anyhow::Result<()> {
         anyhow::bail!("DbgEng sessions are only supported on Windows")
     }
@@ -3947,6 +4457,98 @@ mod tests {
         assert_eq!(event_type_name(2), "exception");
         assert_eq!(event_type_name(64), "load_module");
         assert_eq!(event_type_name(0xFFFF), "unknown");
+    }
+
+    #[test]
+    fn inventories_documented_minidump_directory_entries_without_reading_payloads() {
+        let directory = temporary_runtime_directory("minidump-directory");
+        let path = directory.join("fixture.dmp");
+        fs::create_dir_all(&directory).unwrap();
+        let mut bytes = vec![0_u8; 0x100];
+        bytes[..4].copy_from_slice(b"MDMP");
+        bytes[4..8].copy_from_slice(&0x0000_a793_u32.to_le_bytes());
+        bytes[8..12].copy_from_slice(&3_u32.to_le_bytes());
+        bytes[12..16].copy_from_slice(&(MINIDUMP_HEADER_SIZE as u32).to_le_bytes());
+        bytes[16..20].copy_from_slice(&0x1234_5678_u32.to_le_bytes());
+        bytes[20..24].copy_from_slice(&0x1020_3040_u32.to_le_bytes());
+        bytes[24..32].copy_from_slice(&0x9abc_def0_1234_5678_u64.to_le_bytes());
+        let entries = [
+            (6_u32, 16_u32, 0x80_u32),
+            (14_u32, 0_u32, 0_u32),
+            (0x1234_u32, 32_u32, 0xf0_u32),
+        ];
+        for (index, (stream_type, data_size, data_rva)) in entries.into_iter().enumerate() {
+            let offset = MINIDUMP_HEADER_SIZE + index * MINIDUMP_DIRECTORY_SIZE;
+            bytes[offset..offset + 4].copy_from_slice(&stream_type.to_le_bytes());
+            bytes[offset + 4..offset + 8].copy_from_slice(&data_size.to_le_bytes());
+            bytes[offset + 8..offset + 12].copy_from_slice(&data_rva.to_le_bytes());
+        }
+        fs::write(&path, bytes).unwrap();
+
+        let inventory = inspect_minidump_directory(&path);
+
+        let _ = fs::remove_dir_all(&directory);
+        assert_eq!(inventory.status, "captured_with_invalid_stream_ranges");
+        assert_eq!(inventory.signature.as_deref(), Some("0x504D444D"));
+        assert_eq!(inventory.stream_count, Some(3));
+        assert_eq!(inventory.entries.len(), 3);
+        assert_eq!(inventory.entries[0].stream_name, "exception");
+        assert_eq!(inventory.entries[0].range_status, "within_file");
+        assert_eq!(inventory.entries[1].stream_name, "unloaded_module_list");
+        assert_eq!(inventory.entries[1].range_status, "empty");
+        assert_eq!(inventory.entries[2].stream_name, "unknown_0x00001234");
+        assert_eq!(inventory.entries[2].range_status, "outside_file");
+        assert_eq!(
+            inventory
+                .documented_stream_presence
+                .iter()
+                .find(|stream| stream.stream_name == "exception")
+                .map(|stream| stream.occurrences),
+            Some(1)
+        );
+        assert_eq!(
+            inventory
+                .documented_stream_presence
+                .iter()
+                .find(|stream| stream.stream_name == "thread_info_list")
+                .map(|stream| stream.occurrences),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn refuses_to_decode_non_minidump_files() {
+        let directory = temporary_runtime_directory("not-minidump");
+        let path = directory.join("fixture.dmp");
+        fs::create_dir_all(&directory).unwrap();
+        let mut bytes = vec![0_u8; MINIDUMP_HEADER_SIZE];
+        bytes[..4].copy_from_slice(b"PAGE");
+        fs::write(&path, bytes).unwrap();
+
+        let inventory = inspect_minidump_directory(&path);
+
+        let _ = fs::remove_dir_all(&directory);
+        assert_eq!(inventory.status, "not_minidump");
+        assert_eq!(inventory.signature.as_deref(), Some("0x45474150"));
+        assert!(inventory.entries.is_empty());
+    }
+
+    #[test]
+    fn rejects_out_of_file_minidump_directories() {
+        let directory = temporary_runtime_directory("invalid-minidump-directory");
+        let path = directory.join("fixture.dmp");
+        fs::create_dir_all(&directory).unwrap();
+        let mut bytes = vec![0_u8; MINIDUMP_HEADER_SIZE];
+        bytes[..4].copy_from_slice(b"MDMP");
+        bytes[8..12].copy_from_slice(&1_u32.to_le_bytes());
+        bytes[12..16].copy_from_slice(&0x100_u32.to_le_bytes());
+        fs::write(&path, bytes).unwrap();
+
+        let inventory = inspect_minidump_directory(&path);
+
+        let _ = fs::remove_dir_all(&directory);
+        assert_eq!(inventory.status, "invalid_directory_range");
+        assert!(inventory.entries.is_empty());
     }
 
     #[test]

@@ -95,6 +95,7 @@ pub fn capability_contract(kind: &str) -> Value {
                 "stack": "supported",
                 "query_symbols": "supported",
                 "query_source": "supported",
+                "last_event": "supported_snapshot_event_if_available",
                 "step": "unsupported",
                 "continue": "unsupported",
                 "set_breakpoint": "unsupported",
@@ -105,13 +106,13 @@ pub fn capability_contract(kind: &str) -> Value {
                 "timeline": "unsupported"
             },
             "mutability": {
-                "read_only": ["memory", "modules", "threads", "stack", "symbols", "source", "disassembly"],
+                "read_only": ["last_event", "memory", "modules", "threads", "stack", "symbols", "source", "disassembly"],
                 "target_execution": [],
                 "destructive": ["close"]
             },
             "required_identifiers": ["target_id"],
             "limitations": [
-                "Dump targets are immutable snapshots and do not have a live event stream."
+                "Dump targets are immutable snapshots and do not have a live event stream. The bounded last-event query reports DbgEng's captured load-time stop only if it is available."
             ]
         }),
         "dbgeng_remote_plan" => json!({
@@ -200,5 +201,19 @@ mod tests {
         assert!(catalog
             .iter()
             .any(|contract| contract["backend"] == "dbgeng_dump"));
+    }
+
+    #[test]
+    fn dump_contract_distinguishes_last_event_from_live_event_streaming() {
+        let contract = capability_contract("dbgeng_dump");
+        assert_eq!(
+            contract["operations"]["last_event"],
+            "supported_snapshot_event_if_available"
+        );
+        assert!(contract["limitations"]
+            .as_array()
+            .is_some_and(|limitations| limitations.iter().any(|detail| detail
+                .as_str()
+                .is_some_and(|detail| detail.contains("do not have a live event stream")))));
     }
 }
