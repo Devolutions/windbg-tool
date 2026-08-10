@@ -698,7 +698,6 @@ impl TargetRegistry {
 
     pub fn last_event(&self, request: TargetRequest) -> anyhow::Result<TargetEventResponse> {
         let target = self.target(request.target_id)?;
-        ensure_live_target(request.target_id, target.kind())?;
         Ok(TargetEventResponse {
             target_id: request.target_id,
             event: target
