@@ -10,7 +10,7 @@ on:
         required: true
         type: string
       dry_run:
-        description: Build and validate release packages without creating a tag or release
+        description: Build, sign, and validate release packages without creating a tag or release
         required: false
         default: false
         type: boolean
@@ -28,11 +28,6 @@ on:
           - auto
           - test
           - prod
-      sign_dry_run:
-        description: Sign Windows binaries during a dry run when signing secrets are available
-        required: false
-        default: false
-        type: boolean
 
 permissions:
   contents: read
@@ -290,9 +285,6 @@ jobs:
           TRUSTED_SIGNING_ACCOUNT_NAME: ${{ secrets.TRUSTED_SIGNING_ACCOUNT_NAME }}
           TRUSTED_SIGNING_PROFILE_NAME: ${{ secrets.TRUSTED_SIGNING_PROFILE_NAME }}
         run: |
-          $dryRun = [System.Boolean]::Parse('${{ inputs.dry_run }}')
-          $signDryRun = [System.Boolean]::Parse('${{ inputs.sign_dry_run }}')
-
           $requiredValues = @(
             $env:AZURE_CLIENT_ID,
             $env:AZURE_TENANT_ID,
@@ -310,14 +302,13 @@ jobs:
             }
           }
 
-          $shouldSign = $hasSigningSecrets -and ((-not $dryRun) -or $signDryRun)
-          if (-not $dryRun -and -not $hasSigningSecrets) {
-            throw 'Azure Trusted Signing configuration is required for non-dry-run releases.'
+          if (-not $hasSigningSecrets) {
+            throw 'Azure Trusted Signing configuration is required for every release dispatch, including dry runs.'
           }
 
-          "should_sign=$($shouldSign.ToString().ToLowerInvariant())" |
+          "should_sign=true" |
             Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
-          Write-Host "Windows binaries will be signed with Azure Trusted Signing: $shouldSign"
+          Write-Host 'Windows binaries will be signed with Azure Trusted Signing.'
 
       - name: Download Linux psign-tool
         if: steps.signing_mode.outputs.should_sign == 'true'

@@ -104,9 +104,9 @@ Run the **Windows packages** workflow with **Run workflow** and enter an unprefi
 - `Devolutions.WinDbg.Tool.<version>.nupkg`
 - `checksums.txt`
 
-Select **dry_run** to build both ZIPs, validate their contents, validate the version, and confirm that the tag is available without creating a tag or GitHub Release. Set **sign_dry_run** to exercise Azure Trusted Signing during a dry run when the signing configuration is available. The workflow rejects existing tags and invalid versions rather than replacing a release. Each ZIP contains the statically linked Rust executable and native bridge plus the required dynamic TTD Replay, DbgEng, and symbol runtime DLLs.
+Select **dry_run** to build both ZIPs, sign the Windows payloads, validate their contents, validate the version, and confirm that the tag is available without creating a tag or GitHub Release. The workflow rejects existing tags and invalid versions rather than replacing a release. Each ZIP contains the statically linked Rust executable and native bridge plus the required dynamic TTD Replay, DbgEng, and symbol runtime DLLs.
 
-The workflow uses the `publish-prod` environment by default; choose `test` to use `publish-test`. Configure the Azure Trusted Signing secrets for non-dry-run releases, and add `NUGET_BOT_USERNAME` when NuGet publishing is enabled:
+The workflow uses the `publish-prod` environment by default; choose `test` to use `publish-test`. Configure the Azure Trusted Signing secrets for every dispatch, including dry runs, and add `NUGET_BOT_USERNAME` when NuGet publishing is enabled:
 
 - `AZURE_CLIENT_ID`
 - `AZURE_TENANT_ID`
