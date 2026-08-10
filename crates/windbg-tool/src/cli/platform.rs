@@ -4550,6 +4550,7 @@ pub(super) fn run_dump_inspect(
         .transpose()?;
     let dump_metadata = fs::metadata(&args.path)
         .with_context(|| format!("reading dump metadata for {}", args.path.display()))?;
+    let minidump_directory = windbg_dbgeng::inspect_minidump_directory(&args.path);
     let operation_started = Instant::now();
     let opened_at = Instant::now();
     let session = open_dump_session(DumpOpenOptions {
@@ -4602,6 +4603,7 @@ pub(super) fn run_dump_inspect(
         json!({
             "triage_profile": "bounded_pool_corruption",
             "target": target,
+            "minidump_directory": minidump_directory,
             "modules": modules,
             "threads": threads,
             "registers": registers,
@@ -4621,6 +4623,9 @@ pub(super) fn run_dump_inspect(
                 "total_elapsed_ms": operation_started.elapsed().as_millis() as u64,
                 "bounded_operations": {
                     "stack_frame_limit": args.max_frames,
+                    "minidump_directory_entry_limit": windbg_dbgeng::MAX_MINIDUMP_DIRECTORY_ENTRIES,
+                    "captured_event_code_byte_limit": windbg_dbgeng::MAX_CAPTURED_EVENT_CODE_BYTES,
+                    "minidump_stream_payloads_decoded": false,
                     "whole_dump_scan": false,
                 },
             },
@@ -4897,6 +4902,7 @@ fn dump_triage_value(session: &DebuggerSession, input: DumpTriageInput<'_>) -> V
     let fault = fault_address.map(|address| dump_address_observation(session, address, 8));
     let exception_context =
         dump_exception_context(session, input.target, bugcheck_data, input.max_frames);
+    let snapshot_event = dump_snapshot_event_observation(session, input.bugcheck);
     let symbol_modules = dump_symbol_modules(session, fault_address, &exception_context);
     let symbol_readiness = dump_symbol_readiness(session, &symbol_modules, input.refresh_symbols);
     let driver_evidence = dump_driver_evidence(
@@ -4922,6 +4928,7 @@ fn dump_triage_value(session: &DebuggerSession, input: DumpTriageInput<'_>) -> V
         "bugcheck": dump_bugcheck_value(input.bugcheck),
         "fault": fault,
         "exception_context": exception_context,
+        "snapshot_event": snapshot_event,
         "current_stack": input.current_stack,
         "symbol_readiness": symbol_readiness,
         "native_symbol_prefetch": input.native_symbols,
@@ -5051,6 +5058,78 @@ fn dump_bugcheck_value(bugcheck: &windbg_dbgeng::BugCheckDataResult) -> Value {
         "parameters": data.parameters,
         "parameter_roles": parameter_roles,
         "detail": bugcheck.detail,
+    })
+}
+
+fn dump_snapshot_event_observation(
+    session: &DebuggerSession,
+    bugcheck: &windbg_dbgeng::BugCheckDataResult,
+) -> Value {
+    let fault_address = bugcheck.data.as_ref().and_then(dump_fault_address);
+    let captured_code = session.captured_event_code();
+    let (fault_code_snapshot, fault_code_bytes) = match fault_address {
+        Some(address) => {
+            match session.read_memory(address, windbg_dbgeng::MAX_CAPTURED_EVENT_CODE_BYTES) {
+                Ok(memory) => {
+                    let bytes = memory.complete.then_some(memory.data.clone());
+                    (json!(memory), bytes)
+                }
+                Err(error) => (
+                    json!({
+                        "status": "unavailable",
+                        "address": address,
+                        "detail": format!(
+                            "DbgEng could not read the bounded bugcheck fault-code snapshot: {error}"
+                        ),
+                    }),
+                    None,
+                ),
+            }
+        }
+        None => (json!({"status": "not_applicable"}), None),
+    };
+    let code_offset_relation = match (captured_code.code_offset, fault_address) {
+        (Some(captured), Some(fault)) if captured == fault => "exact_match",
+        (Some(_), Some(_)) => "different_from_bugcheck_fault_address",
+        (Some(_), None) => "bugcheck_has_no_documented_fault_address",
+        (None, _) => "captured_event_offset_unavailable",
+    };
+    let code_bytes_relation = match code_offset_relation {
+        "exact_match" => match (
+            captured_code.code_bytes.as_deref(),
+            fault_code_bytes.as_deref(),
+        ) {
+            (Some(captured), Some(fault)) if captured == fault => "exact_match",
+            (Some(captured), Some(fault)) if fault.starts_with(captured) => {
+                "captured_snapshot_matches_current_dump_prefix"
+            }
+            (Some(_), Some(_)) => "different_from_current_dump_memory",
+            (Some(_), None) => "bugcheck_fault_code_unavailable",
+            (None, _) => "captured_event_code_unavailable",
+        },
+        "different_from_bugcheck_fault_address" => "not_compared_different_addresses",
+        "bugcheck_has_no_documented_fault_address" => "not_applicable",
+        _ => "captured_event_code_unavailable",
+    };
+    let last_event = match session.last_event() {
+        Ok(event) => json!({
+            "status": "captured",
+            "event": event,
+        }),
+        Err(error) => json!({
+            "status": "unavailable",
+            "detail": format!("DbgEng could not retrieve the dump's stored last event: {error}"),
+        }),
+    };
+    json!({
+        "provenance": "dump_stored_event_snapshot",
+        "event_role": "metadata_only",
+        "last_event": last_event,
+        "captured_code": captured_code,
+        "bugcheck_fault_code_snapshot": fault_code_snapshot,
+        "code_offset_relation_to_bugcheck_fault_address": code_offset_relation,
+        "code_bytes_relation_to_bugcheck_fault_snapshot": code_bytes_relation,
+        "detail": "The bounded DbgEng captured-event requests report the dump's stored event snapshot. They are compared mechanically with the documented bugcheck fault address and a bounded current-dump memory read, but never promoted to original-exception, context, thread, fault-time register, or causation evidence without an independent provenance match.",
     })
 }
 
