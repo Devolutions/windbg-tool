@@ -636,15 +636,17 @@ jobs:
               [string]$Path,
 
               [Parameter(Mandatory = $true)]
-              [string]$ExpectedCommonName
+              [string]$ExpectedCommonName,
+
+              [Parameter(Mandatory = $true)]
+              [ValidateSet('project', 'microsoft')]
+              [string]$Kind
             )
 
-            & psign-tool portable trust-verify-pe `
-              --prefer-timestamp-signing-time `
-              --require-valid-timestamp `
-              $Path
+            # Digest-only PE binding check (no OS trust store).
+            & psign-tool portable verify-pe $Path
             if ($LASTEXITCODE -ne 0) {
-              throw "Authenticode trust validation failed for $Path."
+              throw "Authenticode digest validation failed for $Path."
             }
 
             $inspectionJson = & psign-tool portable inspect-authenticode $Path
@@ -653,39 +655,68 @@ jobs:
             }
 
             $inspection = $inspectionJson | ConvertFrom-Json
-            $certificates = @(
+            $signers = @(
               foreach ($entry in @($inspection.entries)) {
                 foreach ($signer in @($entry.pkcs7.signers)) {
-                  if (-not [string]::IsNullOrWhiteSpace($signer.signer_certificate_der_base64)) {
-                    $signer.signer_certificate_der_base64
-                  }
+                  $signer
                 }
               }
             )
-            if ($certificates.Count -eq 0) {
-              throw "No embedded Authenticode signer certificate was found for $Path."
+            if ($signers.Count -eq 0) {
+              throw "No embedded Authenticode signer was found for $Path."
             }
 
             $hasExpectedSigner = $false
-            for ($index = 0; $index -lt $certificates.Count; $index++) {
-              $certificate = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new(
-                [Convert]::FromBase64String($certificates[$index])
-              )
-              try {
-                $subject = $certificate.Subject
-              }
-              finally {
-                $certificate.Dispose()
+            $hasRfc3161Timestamp = $false
+            foreach ($signer in $signers) {
+              if (-not [string]::IsNullOrWhiteSpace($signer.signer_certificate_der_base64)) {
+                $certificate = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new(
+                  [Convert]::FromBase64String($signer.signer_certificate_der_base64)
+                )
+                try {
+                  $subject = $certificate.Subject
+                }
+                finally {
+                  $certificate.Dispose()
+                }
+
+                if ($subject -match "CN\s*=\s*$([regex]::Escape($ExpectedCommonName))(?:,|$)") {
+                  $hasExpectedSigner = $true
+                }
               }
 
-              if ($subject -match "CN\s*=\s*$([regex]::Escape($ExpectedCommonName))(?:,|$)") {
-                $hasExpectedSigner = $true
-                break
+              $unsignedOids = @($signer.unsigned_attribute_oids)
+              $timestampHints = @($signer.timestamp_hints)
+              if (
+                ($unsignedOids -contains '1.3.6.1.4.1.311.3.3.1') -or
+                ($timestampHints.kind -contains 'microsoft_nested_rfc3161_attribute') -or
+                -not [string]::IsNullOrWhiteSpace($signer.timestamp_signer_certificate_der_base64)
+              ) {
+                $hasRfc3161Timestamp = $true
               }
             }
 
             if (-not $hasExpectedSigner) {
               throw "Authenticode signer for $Path is not $ExpectedCommonName."
+            }
+
+            if ($Kind -eq 'project') {
+              if (-not $hasRfc3161Timestamp) {
+                throw "Project-owned PE is missing an embedded RFC3161 Authenticode timestamp: $Path."
+              }
+
+              # psign 0.6.x can verify ACS short-lived code-signing chains with
+              # AIA + loose EKU, but --require-valid-timestamp still rejects real
+              # Microsoft ACS RFC3161 tokens. Require the timestamp attribute
+              # above and validate the fresh signer chain without that flag.
+              & psign-tool portable trust-verify-pe `
+                --allow-loose-signing-cert `
+                --online-aia `
+                --prefer-timestamp-signing-time `
+                $Path
+              if ($LASTEXITCODE -ne 0) {
+                throw "Authenticode trust validation failed for $Path."
+              }
             }
           }
 
@@ -765,13 +796,18 @@ jobs:
                   $input.Dispose()
                 }
 
-                $expectedCommonName = if ($entryName -in $projectOwnedFiles) {
-                  'Devolutions Inc'
+                if ($entryName -in $projectOwnedFiles) {
+                  Test-ExpectedSigner `
+                    -Path $extractedPath `
+                    -ExpectedCommonName 'Devolutions Inc' `
+                    -Kind project
                 }
                 else {
-                  'Microsoft Corporation'
+                  Test-ExpectedSigner `
+                    -Path $extractedPath `
+                    -ExpectedCommonName 'Microsoft Corporation' `
+                    -Kind microsoft
                 }
-                Test-ExpectedSigner -Path $extractedPath -ExpectedCommonName $expectedCommonName
               }
             }
             finally {
