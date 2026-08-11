@@ -47,16 +47,31 @@ The local equivalent uses `cargo xtask deps --arch <amd64|arm64>`, `cargo xtask 
 
 For deeper setup, test commands, runtime details, and workspace notes, see [the development guide](docs/development.md).
 
-## Install as a .NET tool
+## Getting started
 
-On Windows with the .NET 10 SDK or later, install the global tool containing signed Windows payloads from NuGet:
+On Windows with the .NET 10 SDK or later, install the global tool from NuGet:
 
 ```powershell
-dotnet tool install --global Devolutions.WinDbg.Tool
+dotnet tool install -g Devolutions.WinDbg.Tool
 windbg-tool discover
+windbg-tool recipes
 ```
 
-The package includes `win-x64` and `win-arm64` payloads and exposes the same `windbg-tool` command as the release ZIPs.
+The package includes signed `win-x64` and `win-arm64` payloads and exposes the
+`windbg-tool` command. Update an existing installation with:
+
+```powershell
+dotnet tool update -g Devolutions.WinDbg.Tool
+```
+
+For trace-driven work, start the local daemon, open a trace with its matching
+binary, and use the returned session and cursor identifiers:
+
+```powershell
+windbg-tool daemon ensure
+windbg-tool open C:\path\to\trace.run --binary-path C:\path\to\binary.exe
+windbg-tool debug snapshot --session 1 --cursor 1
+```
 
 ## CLI quick start
 
@@ -94,6 +109,38 @@ Representative command areas:
 - Platform helpers: `remote explain`, `remote doctor`, `remote plan`, `dbgeng server`, `live launch`, `dump create`, `dump inspect`, `dump triage`, `windbg status`
 
 For a fuller CLI walkthrough, output-shaping flags, and command map, see [the CLI guide](docs/cli.md).
+
+## Analyze a dump in an AI agent session
+
+Start with the daemon-free, read-only triage command. Use `--compact` to keep
+the response focused and `--envelope` so an agent receives a stable JSON
+success or error contract:
+
+```powershell
+windbg-tool --compact --envelope dump triage C:\dumps\failure.dmp --max-frames 32
+```
+
+For follow-up analysis, open the dump in the local daemon. The `dump open`
+response includes the `target_id` to use with bounded target commands:
+
+```powershell
+windbg-tool daemon ensure
+windbg-tool --envelope dump open C:\dumps\failure.dmp
+windbg-tool --compact --envelope debug capabilities --target <target_id>
+windbg-tool --compact --envelope debug snapshot --target <target_id> --max-frames 32 --max-modules 64
+windbg-tool --compact --envelope target threads --target <target_id>
+```
+
+Ask the agent to treat the output as evidence, not a final root-cause verdict:
+identify the failing context and stack, report symbol or dump-content gaps,
+and distinguish a faulting module from a suspected cause. For example:
+
+```text
+Analyze C:\dumps\failure.dmp with windbg-tool. Start with dump triage, then
+open the dump only if targeted follow-up is needed. Summarize evidence from
+the exception, stack, symbols, and modules; call out uncertainty and give the
+next bounded command that would reduce it.
+```
 
 ## MCP quick start
 
