@@ -433,18 +433,47 @@ jobs:
           }
 
           $projectRoot = Join-Path $PWD 'packaging/dotnet-tool'
+          $project = Join-Path $projectRoot 'Devolutions.WinDbg.Tool.csproj'
           $targets = @()
-          foreach ($rid in @('win-x64', 'win-arm64')) {
+          foreach ($rid in @('win-x64', 'win-arm64', 'any')) {
+            # dotnet pack --no-build packages the files resolved by
+            # ComputeResolvedFilesToPublishList.  The apphost and managed
+            # launcher assembly currently come from obj/, not bin/, so sign
+            # the resolved sources rather than the build output copies.
+            $resolvedFilesJson = & dotnet msbuild $project `
+              -nologo `
+              -t:ComputeResolvedFilesToPublishList `
+              -p:Configuration=Release `
+              -p:RuntimeIdentifier=$rid `
+              -p:NoBuild=true `
+              -getItem:ResolvedFileToPublish
+            if ($LASTEXITCODE -ne 0) {
+              throw "Failed to resolve launcher files that dotnet pack will use for $rid."
+            }
+
+            $launcherNames = @('Devolutions.WinDbg.Tool.dll')
+            if ($rid -ne 'any') {
+              $launcherNames += 'Devolutions.WinDbg.Tool.exe'
+            }
+            $resolvedLaunchers = @(
+              ($resolvedFilesJson | ConvertFrom-Json).Items.ResolvedFileToPublish |
+                Where-Object { $_.RelativePath -in $launcherNames } |
+                ForEach-Object { $_.FullPath } |
+                Sort-Object -Unique
+            )
+            if ($resolvedLaunchers.Count -ne $launcherNames.Count) {
+              throw "Expected $($launcherNames.Count) launcher file(s) for $rid, but dotnet pack resolved $($resolvedLaunchers.Count)."
+            }
+            $targets += $resolvedLaunchers
+
+            if ($rid -eq 'any') {
+              continue
+            }
+
             $payloadRoot = Join-Path (Join-Path $PWD 'work/payload') $rid
-            $outputRoot = Join-Path (Join-Path (Join-Path (Join-Path $projectRoot 'bin') 'Release') 'net10.0') $rid
             $targets += Join-Path $payloadRoot 'windbg-tool.exe'
             $targets += Join-Path $payloadRoot 'ttd_replay_bridge.dll'
-            $targets += Join-Path $outputRoot 'Devolutions.WinDbg.Tool.exe'
-            $targets += Join-Path $outputRoot 'Devolutions.WinDbg.Tool.dll'
           }
-
-          $anyOutputRoot = Join-Path (Join-Path (Join-Path (Join-Path $projectRoot 'bin') 'Release') 'net10.0') 'any'
-          $targets += Join-Path $anyOutputRoot 'Devolutions.WinDbg.Tool.dll'
 
           foreach ($target in ($targets | Sort-Object -Unique)) {
             if (-not (Test-Path -LiteralPath $target -PathType Leaf)) {
@@ -531,6 +560,226 @@ jobs:
               -DestinationPath $archivePath `
               -Force
           }
+
+      - name: Validate Authenticode signatures in release packages
+        if: steps.signing_mode.outputs.should_sign == 'true'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+
+          $runtimeFiles = @(
+            'TTDReplay.dll',
+            'TTDReplayCPU.dll',
+            'dbgeng.dll',
+            'dbgcore.dll',
+            'dbghelp.dll',
+            'dbgmodel.dll',
+            'msdia140.dll',
+            'srcsrv.dll'
+          )
+
+          $packageDirectory = Join-Path $PWD 'artifacts/nuget'
+          $packages = @(Get-ChildItem -LiteralPath $packageDirectory -Filter 'Devolutions.WinDbg.Tool*.nupkg' -File)
+          if ($packages.Count -ne 4) {
+            throw "Expected four dotnet tool packages to validate, found $($packages.Count)."
+          }
+
+          $archiveSpecs = @(
+            [pscustomobject]@{
+              ArchivePath = Join-Path $PWD 'artifacts/release/windbg-tool-x64.zip'
+              Kind = 'zip'
+              Rid = 'win-x64'
+            },
+            [pscustomobject]@{
+              ArchivePath = Join-Path $PWD 'artifacts/release/windbg-tool-arm64.zip'
+              Kind = 'zip'
+              Rid = 'win-arm64'
+            }
+          )
+
+          foreach ($rid in @('win-x64', 'win-arm64', 'any')) {
+            $ridPattern = "^Devolutions\.WinDbg\.Tool\.$([regex]::Escape($rid))\..+\.nupkg$"
+            $ridPackage = @($packages | Where-Object { $_.Name -match $ridPattern })
+            if ($ridPackage.Count -ne 1) {
+              throw "Expected one $rid dotnet tool package to validate, found $($ridPackage.Count)."
+            }
+
+            $archiveSpecs += [pscustomobject]@{
+              ArchivePath = $ridPackage[0].FullName
+              Kind = if ($rid -eq 'any') { 'any-nupkg' } else { 'rid-nupkg' }
+              Rid = $rid
+            }
+          }
+
+          $pointerPackages = @($packages | Where-Object {
+            $_.Name -notmatch '^Devolutions\.WinDbg\.Tool\.(win-x64|win-arm64|any)\..+\.nupkg$'
+          })
+          if ($pointerPackages.Count -ne 1) {
+            throw "Expected one dotnet tool pointer package to validate, found $($pointerPackages.Count)."
+          }
+          $archiveSpecs += [pscustomobject]@{
+            ArchivePath = $pointerPackages[0].FullName
+            Kind = 'pointer-nupkg'
+            Rid = $null
+          }
+
+          $validationRoot = Join-Path $env:RUNNER_TEMP 'windbg-tool-signature-validation'
+          if (Test-Path -LiteralPath $validationRoot) {
+            Remove-Item -LiteralPath $validationRoot -Recurse -Force
+          }
+          New-Item -ItemType Directory -Force -Path $validationRoot | Out-Null
+
+          function Test-ExpectedSigner {
+            param(
+              [Parameter(Mandatory = $true)]
+              [string]$Path,
+
+              [Parameter(Mandatory = $true)]
+              [string]$ExpectedCommonName
+            )
+
+            & psign-tool portable trust-verify-pe `
+              --prefer-timestamp-signing-time `
+              --require-valid-timestamp `
+              $Path
+            if ($LASTEXITCODE -ne 0) {
+              throw "Authenticode trust validation failed for $Path."
+            }
+
+            $inspectionJson = & psign-tool portable inspect-authenticode $Path
+            if ($LASTEXITCODE -ne 0) {
+              throw "Could not inspect the Authenticode signer for $Path."
+            }
+
+            $inspection = $inspectionJson | ConvertFrom-Json
+            $certificates = @(
+              foreach ($entry in @($inspection.entries)) {
+                foreach ($signer in @($entry.pkcs7.signers)) {
+                  if (-not [string]::IsNullOrWhiteSpace($signer.signer_certificate_der_base64)) {
+                    $signer.signer_certificate_der_base64
+                  }
+                }
+              }
+            )
+            if ($certificates.Count -eq 0) {
+              throw "No embedded Authenticode signer certificate was found for $Path."
+            }
+
+            $hasExpectedSigner = $false
+            for ($index = 0; $index -lt $certificates.Count; $index++) {
+              $certificate = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new(
+                [Convert]::FromBase64String($certificates[$index])
+              )
+              try {
+                $subject = $certificate.Subject
+              }
+              finally {
+                $certificate.Dispose()
+              }
+
+              if ($subject -match "CN\s*=\s*$([regex]::Escape($ExpectedCommonName))(?:,|$)") {
+                $hasExpectedSigner = $true
+                break
+              }
+            }
+
+            if (-not $hasExpectedSigner) {
+              throw "Authenticode signer for $Path is not $ExpectedCommonName."
+            }
+          }
+
+          $extractionIndex = 0
+          foreach ($spec in $archiveSpecs) {
+            if (-not (Test-Path -LiteralPath $spec.ArchivePath -PathType Leaf)) {
+              throw "Release archive was not produced: $($spec.ArchivePath)"
+            }
+
+            $prefix = if ($spec.Kind -eq 'zip' -or $spec.Kind -eq 'pointer-nupkg') {
+              ''
+            }
+            else {
+              "tools/net10.0/$($spec.Rid)/"
+            }
+
+            $projectOwnedFiles = @(switch ($spec.Kind) {
+              'zip' {
+                @(
+                  "${prefix}windbg-tool.exe",
+                  "${prefix}ttd_replay_bridge.dll"
+                )
+                break
+              }
+              'rid-nupkg' {
+                @(
+                  "${prefix}Devolutions.WinDbg.Tool.exe",
+                  "${prefix}Devolutions.WinDbg.Tool.dll",
+                  "${prefix}windbg-tool.exe",
+                  "${prefix}ttd_replay_bridge.dll"
+                )
+                break
+              }
+              'any-nupkg' {
+                @("${prefix}Devolutions.WinDbg.Tool.dll")
+                break
+              }
+              default {
+                @()
+              }
+            })
+            $microsoftSignedFiles = if ($spec.Kind -in @('zip', 'rid-nupkg')) {
+              @($runtimeFiles | ForEach-Object { "$prefix$_" })
+            }
+            else {
+              @()
+            }
+            $expectedPeFiles = @($projectOwnedFiles + $microsoftSignedFiles)
+
+            $archive = [IO.Compression.ZipFile]::OpenRead($spec.ArchivePath)
+            try {
+              $actualPeFiles = @(
+                $archive.Entries |
+                  Where-Object { $_.FullName -match '(?i)\.(exe|dll)$' } |
+                  ForEach-Object { $_.FullName }
+              )
+              $unexpectedPeFiles = @($actualPeFiles | Where-Object { $_ -notin $expectedPeFiles })
+              $missingPeFiles = @($expectedPeFiles | Where-Object { $_ -notin $actualPeFiles })
+              if ($unexpectedPeFiles.Count -ne 0 -or $missingPeFiles.Count -ne 0) {
+                $unexpectedText = $unexpectedPeFiles -join ', '
+                $missingText = $missingPeFiles -join ', '
+                throw "PE contents did not match the signed-file manifest for $($spec.ArchivePath). Unexpected: [$unexpectedText]. Missing: [$missingText]."
+              }
+
+              foreach ($entryName in $expectedPeFiles) {
+                $entry = $archive.GetEntry($entryName)
+                $extractedPath = Join-Path $validationRoot ('{0:D3}-{1}' -f $extractionIndex, [IO.Path]::GetFileName($entryName))
+                $extractionIndex++
+
+                $input = $entry.Open()
+                $output = [IO.File]::Open($extractedPath, [IO.FileMode]::Create, [IO.FileAccess]::Write)
+                try {
+                  $input.CopyTo($output)
+                }
+                finally {
+                  $output.Dispose()
+                  $input.Dispose()
+                }
+
+                $expectedCommonName = if ($entryName -in $projectOwnedFiles) {
+                  'Devolutions Inc'
+                }
+                else {
+                  'Microsoft Corporation'
+                }
+                Test-ExpectedSigner -Path $extractedPath -ExpectedCommonName $expectedCommonName
+              }
+            }
+            finally {
+              $archive.Dispose()
+            }
+          }
+
+          Write-Host 'Validated all project-owned and Microsoft runtime PE signatures in release ZIP and NuGet packages.'
 
       - name: Upload signed Windows packages
         uses: actions/upload-artifact@v7
