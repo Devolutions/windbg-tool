@@ -251,7 +251,7 @@ jobs:
     env:
       VERSION: ${{ inputs.version }}
       PSIGN_VERSION: 0.6.2
-            PSIGN_SHA256: f3694e723d270c632b7b104b781112f8d0ed28e9756662446a41e71c0eb26ead
+      PSIGN_SHA256: f3694e723d270c632b7b104b781112f8d0ed28e9756662446a41e71c0eb26ead
 
     steps:
       - name: Checkout
