@@ -1,139 +1,154 @@
 # windbg-tool
 
-`windbg-tool` is a Windows-first command-line tool and MCP server for WinDbg-oriented automation. It is centered on Time Travel Debugging (TTD) replay, but it also covers broader WinDbg workflows such as daemon-backed CLI automation, symbol and source diagnostics, disassembly and memory inspection helpers, DbgEng process-server support, remote debugging command generation, and WinDbg install/update/launch.
+Windows-first CLI and MCP server for WinDbg-oriented debugging workflows.
 
-`windbg-tool` is the product name. You will still see `windbg-ttd` in MCP server configuration and `ttd_*` tool names because the replay/MCP surface grew out of the original TTD-focused implementation.
+Use it to:
 
-## What you can do
+- **Replay TTD traces** — open a `.run` file, seek to positions, inspect registers/memory, and walk history
+- **Triage dumps** — pull exception, stack, module, and symbol evidence from user or kernel dumps
+- **Record new traces** — launch a process under Microsoft Time Travel Debugging
+- **Drive live probes** — one-shot startup breakpoints, managed breakpoints, and startup profiling
+- **Help AI agents** — stable JSON output, recipes, and an MCP server agents can call directly
+- **Manage WinDbg** — check status, update, and launch the debugger
 
-- Run a stdio MCP server for TTD replay workflows.
-- Keep long-lived replay sessions in a local daemon and drive them from the CLI.
-- Open traces, create cursors, seek positions, inspect threads/modules/registers/memory, and replay to watchpoints.
-- Use higher-level helpers such as `discover`, `recipes`, `debug capabilities`, `debug snapshot`, `triage`, `symbols doctor`, `disasm`, `stack backtrace`, and `memory chase`.
-- Plan and diagnose local/remote DbgEng workflows with `remote doctor`, `remote plan`, process-server commands, and WinDbg install/update/launch helpers.
+`windbg-tool` is the product name. You may still see `windbg-ttd` in MCP configs and `ttd_*` tool names — those are the replay/MCP surface names.
 
-## Repository layout
+---
 
-| Path | Purpose |
-| --- | --- |
-| `crates\windbg-tool` | Main `windbg-tool.exe` CLI application |
-| `crates\windbg-ttd` | MCP server, daemon, replay facade, and TTD tool surface |
-| `crates\windbg-dbgeng` | DbgEng helpers for live/process-server scenarios |
-| `crates\windbg-install` | WinDbg download, update, and launch support |
-| `native\ttd-replay-bridge` | Narrow C ABI bridge over the Microsoft TTD Replay API |
-| `xtask` | Development workflow commands |
-| `docs\architecture.md` | Architecture and implementation notes |
+## Install
 
-## Build from source
-
-For a local build with the native replay pieces available:
-
-```powershell
-cargo xtask doctor
-cargo xtask deps
-cargo xtask native-build
-cargo build -p windbg-tool
-```
-
-The built executable is:
-
-```text
-target\debug\windbg-tool.exe
-```
-
-Release ZIP artifacts are built by the Windows packaging workflow. Run **Windows packages** manually with an unprefixed semantic version such as `0.1.0` to publish the `v0.1.0` GitHub Release. Select **dry_run** to build, sign, and validate the packages without creating a tag or release. The release contains `windbg-tool-x64.zip`, `windbg-tool-arm64.zip`, the .NET tool packages, and `checksums.txt`.
-
-The local equivalent uses `cargo xtask deps --arch <amd64|arm64>`, `cargo xtask native-build --arch <amd64|arm64> --static-crt`, a release build for the matching MSVC Rust target, and `cargo xtask package --profile release`. Both packages statically link the MSVC runtime and bundle their required TTD, DbgEng, symbol, and native-bridge DLLs.
-
-For deeper setup, test commands, runtime details, and workspace notes, see [the development guide](docs/development.md).
-
-## Getting started
-
-On Windows with the .NET 10 SDK or later, install the global tool from NuGet:
+Requires Windows and the [.NET 10 SDK](https://dotnet.microsoft.com/download) or later:
 
 ```powershell
 dotnet tool install -g Devolutions.WinDbg.Tool
 windbg-tool discover
-windbg-tool recipes
 ```
 
-The package includes signed `win-x64` and `win-arm64` payloads and exposes the
-`windbg-tool` command. Update an existing installation with:
+Update later with:
 
 ```powershell
 dotnet tool update -g Devolutions.WinDbg.Tool
 ```
 
-For trace-driven work, start the local daemon, open a trace with its matching
-binary, and use the returned session and cursor identifiers:
+The package ships signed `win-x64` and `win-arm64` payloads and puts `windbg-tool` on your PATH.
+
+Prefer building from source? See [docs/development.md](docs/development.md).
+
+---
+
+## 5-minute tour
+
+These commands need no daemon and no trace:
 
 ```powershell
+# What can this install do on this machine?
+windbg-tool discover
+
+# Suggested workflows for common debugging jobs
+windbg-tool recipes
+
+# Machine-readable command map (great for agents and scripts)
+windbg-tool cli-schema
+```
+
+For agents and scripts, prefer stable JSON:
+
+```powershell
+windbg-tool --compact --envelope discover
+```
+
+- `--compact` keeps the payload smaller
+- `--envelope` wraps every response as `{ schema_version, ok, data|error }`
+- Or set `WINDBG_TOOL_ENVELOPE=1` once for the whole shell
+
+---
+
+## Replay a TTD trace
+
+Typical flow: ensure the local daemon, open a trace, then analyze with the returned session and cursor IDs.
+
+```powershell
+# 1. Start or reuse the local daemon
 windbg-tool daemon ensure
+
+# 2. Open the trace (creates a session + cursor)
 windbg-tool open C:\path\to\trace.run --binary-path C:\path\to\binary.exe
+
+# 3. One-shot context for agents or humans
 windbg-tool debug snapshot --session 1 --cursor 1
+
+# 4. Dig in
+windbg-tool disasm --session 1 --cursor 1
+windbg-tool registers --session 1 --cursor 1
+windbg-tool position set --session 1 --cursor 1 --position 50
+windbg-tool memory strings --session 1 --cursor 1 --address 0x12345678 --size 256 --encoding both
 ```
 
-## CLI quick start
+`open` is the best entry point: it loads the trace, creates a cursor, and returns both `session_id` and `cursor_id`. Most replay commands take `--session` / `--cursor` (or `-s` / `-c`).
 
-Some commands work without loading a trace or starting the daemon:
+Useful follow-ups:
+
+| Goal | Command |
+| --- | --- |
+| List active sessions | `windbg-tool sessions` |
+| Trace metadata | `windbg-tool info --session 1` |
+| Jump near a failure | `windbg-tool exception focus --session 1 --cursor 1 --index 0` |
+| Step / seek | `windbg-tool step ...`, `windbg-tool replay to ...` |
+| Stack work | `windbg-tool stack backtrace ...`, `windbg-tool stack recover ...` |
+| Pointer chase | `windbg-tool memory chase --session 1 --cursor 1 --address 0x... --depth 8` |
+| Symbol health | `windbg-tool symbols doctor --session 1` |
+
+Full CLI map: [docs/cli.md](docs/cli.md).
+
+---
+
+## Record a new trace
+
+Needs the Microsoft TTD recorder (`winget install --id Microsoft.TimeTravelDebugging`) and an elevated terminal (or Windows 11 sudo in **Input Closed** / **Inline** mode).
 
 ```powershell
-target\debug\windbg-tool.exe discover
-target\debug\windbg-tool.exe cli-schema
-target\debug\windbg-tool.exe recipes
-target\debug\windbg-tool.exe tools
+windbg-tool --compact trace record `
+  --output C:\traces\app.run `
+  --command-line '"C:\apps\MyApp.exe" /quit-after-work'
 ```
 
-For trace-driven work, the common flow is:
+Capture presets:
 
 ```powershell
-target\debug\windbg-tool.exe daemon ensure
-target\debug\windbg-tool.exe open C:\path\to\trace.run --binary-path C:\path\to\binary.exe
-target\debug\windbg-tool.exe sessions
-target\debug\windbg-tool.exe debug capabilities --session 1 --cursor 1
-target\debug\windbg-tool.exe debug snapshot --session 1 --cursor 1
-target\debug\windbg-tool.exe disasm --session 1 --cursor 1
+# Keep the earliest startup data (up to 1 GiB)
+windbg-tool trace record --profile startup `
+  --output C:\traces\app-startup.run `
+  --command-line '"C:\apps\MyApp.exe"'
+
+# Keep only the newest data in a rolling window
+windbg-tool trace record --profile recent `
+  --output C:\traces\app-recent.run `
+  --command-line '"C:\apps\MyApp.exe"'
 ```
 
-`open` is the best starting command for the CLI because it loads the trace, creates a cursor, and returns both `session_id` and `cursor_id`. Most replay commands then use `--session` and `--cursor` (or the short forms `-s` and `-c`).
+Traces can contain process memory and other sensitive state. Treat `.run` / `.idx` files as local secrets.
 
-For AI agents and robust scripts, add `--envelope` or set `WINDBG_TOOL_ENVELOPE=1` to get stable `{ schema_version, ok, data|error }` JSON responses and structured error codes.
-Set `WINDBG_TOOL_ACTION_LOG=<path>` to append redacted JSONL command outcomes for handoff/resume workflows, then inspect them with `debug log summarize`.
+---
 
-Representative command areas:
+## Triage a dump
 
-- Discovery: `discover`, `cli-schema`, `recipes`, `tools`, `schema`
-- Session and replay: `open`, `load`, `sessions`, `info`, `position set`, `step`, `replay to`
-- Agent workflow: `debug capabilities`, `debug snapshot`, `triage crash`, `symbols doctor`, `breakpoint plan`, `debug log summarize`
-- Analysis: `symbols diagnose`, `disasm`, `memory dump`, `memory strings`, `memory chase`, `stack recover`, `stack backtrace`
-- Platform helpers: `remote explain`, `remote doctor`, `remote plan`, `dbgeng server`, `live launch`, `dump create`, `dump inspect`, `dump triage`, `windbg status`
-
-For a fuller CLI walkthrough, output-shaping flags, and command map, see [the CLI guide](docs/cli.md).
-
-## Analyze a dump in an AI agent session
-
-Start with the daemon-free, read-only triage command. Use `--compact` to keep
-the response focused and `--envelope` so an agent receives a stable JSON
-success or error contract:
+Start read-only — no daemon required:
 
 ```powershell
 windbg-tool --compact --envelope dump triage C:\dumps\failure.dmp --max-frames 32
 ```
 
-For follow-up analysis, open the dump in the local daemon. The `dump open`
-response includes the `target_id` to use with bounded target commands:
+Open the dump for interactive follow-up:
 
 ```powershell
 windbg-tool daemon ensure
 windbg-tool --envelope dump open C:\dumps\failure.dmp
-windbg-tool --compact --envelope debug capabilities --target <target_id>
-windbg-tool --compact --envelope debug snapshot --target <target_id> --max-frames 32 --max-modules 64
+# Use the returned target_id:
+windbg-tool --compact --envelope debug snapshot --target <target_id> --max-frames 32
 windbg-tool --compact --envelope target threads --target <target_id>
 ```
 
-Ask the agent to treat the output as evidence, not a final root-cause verdict:
-identify the failing context and stack, report symbol or dump-content gaps,
-and distinguish a faulting module from a suspected cause. For example:
+Prompt template for an AI agent:
 
 ```text
 Analyze C:\dumps\failure.dmp with windbg-tool. Start with dump triage, then
@@ -142,48 +157,113 @@ the exception, stack, symbols, and modules; call out uncertainty and give the
 next bounded command that would reduce it.
 ```
 
-## MCP quick start
+---
 
-Run the MCP server over stdio:
+## Live debugging helpers
+
+One-shot native startup breakpoint (launch, break, capture JSON, end):
 
 ```powershell
-target\debug\windbg-tool.exe mcp
+windbg-tool --compact live startup-break `
+  --command-line '"C:\apps\MyApp.exe"' `
+  --module MyApp.exe `
+  --module-offset 0x1000 `
+  --wait-timeout-ms 10000 `
+  --end terminate
 ```
 
-Example MCP client configuration:
+Also available:
+
+| Command | What it does |
+| --- | --- |
+| `live managed-break` | Resolve a managed method via CoreCLR DAC and break at its native entry |
+| `live startup-profile` | Collect bounded startup lifecycle events without placing breakpoints |
+| `live startup-compare` | Diff two startup-profile JSON artifacts offline |
+| `live startup-report` | Render a module-load timeline table from a profile artifact |
+| `live launch` / `live attach` | Broader live DbgEng session helpers |
+
+See [docs/cli.md](docs/cli.md) for flags, hardware-execute mode, and managed-break safety notes (`--allow-runtime-write` is explicit and intended for approved test VMs).
+
+---
+
+## MCP server (for AI agents)
+
+Run over stdio:
+
+```powershell
+windbg-tool mcp
+```
+
+Example client config:
 
 ```json
 {
   "servers": {
     "windbg-ttd": {
-      "command": "D:\\dev\\windbg-tool\\target\\debug\\windbg-tool.exe",
+      "command": "windbg-tool",
       "args": ["mcp"]
     }
   }
 }
 ```
 
-The usual MCP flow is:
+If you built from source, point `command` at `target\debug\windbg-tool.exe` instead.
 
-1. `ttd_load_trace`
-2. `ttd_cursor_create`
-3. `ttd_trace_info`, `ttd_registers`, `ttd_read_memory`, `ttd_memory_watchpoint`, or related tools
+Core replay flow inside MCP:
 
-Helpful starting prompt:
+1. `ttd_load_trace` — open a `.run` / `.idx` / `.ttd`
+2. `ttd_cursor_create` — get a replay cursor
+3. Inspect with `ttd_trace_info`, `ttd_registers`, `ttd_read_memory`, `ttd_memory_watchpoint`, …
+
+Starter prompt:
 
 ```text
-Use the windbg-ttd server to load C:\path\to\trace.run with the matching binary path, create a cursor, summarize the trace, and show the current compact register state.
+Use the windbg-ttd server to load C:\path\to\trace.run with the matching binary
+path, create a cursor, summarize the trace, and show the current compact
+register state.
 ```
 
-For configuration details, session/cursor concepts, symbol settings, and example tool calls/prompts, see [the MCP guide](docs/mcp.md).
+Details and symbol settings: [docs/mcp.md](docs/mcp.md).
+
+---
+
+## Feature map
+
+| Area | Commands |
+| --- | --- |
+| Discovery | `discover`, `cli-schema`, `recipes`, `tools`, `schema` |
+| Sessions & replay | `daemon ensure`, `open`, `load`, `sessions`, `info`, `position set`, `step`, `replay to` |
+| Agent workflows | `debug capabilities`, `debug snapshot`, `triage crash`, `symbols doctor`, `breakpoint plan` |
+| Analysis | `disasm`, `symbols diagnose` / `inspect` / `exports` / `nearest`, `memory dump` / `strings` / `dps` / `chase`, `stack backtrace` / `recover` |
+| Recording | `trace record`, `trace-list` |
+| Dumps | `dump triage`, `dump open`, `dump inspect`, `dump create` |
+| Live / remote | `live …`, `remote explain` / `doctor` / `plan`, `dbgeng server` |
+| WinDbg install | `windbg status`, `windbg update`, `windbg launch` |
+
+### Output shaping for automation
+
+```powershell
+# Stable success/error envelope
+windbg-tool --envelope --compact debug snapshot -s 1 -c 1
+
+# Append redacted JSONL outcomes for handoff/resume
+$env:WINDBG_TOOL_ACTION_LOG = "C:\temp\windbg-tool-actions.jsonl"
+windbg-tool debug log summarize
+```
+
+---
+
+## Privacy
+
+TTD traces and dumps can contain process memory, file paths, registry data, and other machine state. Treat `.run`, `.idx`, `.ttd`, and dump files as sensitive local artifacts. Do not commit them.
+
+---
 
 ## More docs
 
-- [CLI guide](docs/cli.md) - daemon model, CLI workflows, and command groups
-- [MCP guide](docs/mcp.md) - MCP configuration, core tool flow, and example prompts
-- [Development guide](docs/development.md) - build, native dependencies, symbols, tests, and repository hygiene
-- [Architecture notes](docs/architecture.md) - architecture and layering details
-
-## Trace privacy
-
-TTD traces can contain process memory, file paths, registry data, and other sensitive machine state. Treat `.run`, `.idx`, and related replay artifacts as sensitive local files.
+| Doc | When you need it |
+| --- | --- |
+| [CLI guide](docs/cli.md) | Full command walkthroughs, live/managed/startup details |
+| [MCP guide](docs/mcp.md) | Server config, tool families, example prompts |
+| [Development guide](docs/development.md) | Build from source, native deps, tests |
+| [Architecture notes](docs/architecture.md) | Layering and implementation design |
