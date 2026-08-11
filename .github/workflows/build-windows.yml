@@ -250,8 +250,8 @@ jobs:
       contents: read
     env:
       VERSION: ${{ inputs.version }}
-      PSIGN_VERSION: 0.6.1
-      PSIGN_SHA256: 5e5bba2e76dc28c0b974493d6c81cac7fb3cd33c1c57f370dd1a520b3a794a07
+      PSIGN_VERSION: 0.6.2
+            PSIGN_SHA256: f3694e723d270c632b7b104b781112f8d0ed28e9756662446a41e71c0eb26ead
 
     steps:
       - name: Checkout
@@ -705,19 +705,20 @@ jobs:
                 throw "Project-owned PE is missing an embedded RFC3161 Authenticode timestamp: $Path."
               }
 
-              # psign 0.6.x can verify ACS short-lived code-signing chains with
-              # AIA + loose EKU, but --require-valid-timestamp still rejects real
-              # Microsoft ACS RFC3161 tokens. Require the timestamp attribute
-              # above and validate the fresh signer chain without that flag.
+                          # ACS short-lived code-signing certs need timestamp time, loose EKU
+                          # acceptance, and online AIA for intermediate fetch. psign 0.6.2+
+                          # accepts ACS/Microsoft RFC3161 tokens (fractional genTime + nested
+                          # TSA CMS bags).
               & psign-tool portable trust-verify-pe `
-                --allow-loose-signing-cert `
-                --online-aia `
-                --prefer-timestamp-signing-time `
-                $Path
-              if ($LASTEXITCODE -ne 0) {
-                throw "Authenticode trust validation failed for $Path."
-              }
-            }
+                            --prefer-timestamp-signing-time `
+                            --require-valid-timestamp `
+                            --allow-loose-signing-cert `
+                            --online-aia `
+                            $Path
+                          if ($LASTEXITCODE -ne 0) {
+                            throw "Authenticode trust validation failed for $Path."
+                          }
+                        }
           }
 
           $extractionIndex = 0
