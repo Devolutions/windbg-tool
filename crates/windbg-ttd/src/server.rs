@@ -1,3 +1,4 @@
+use crate::daemon::DaemonClient;
 use crate::service::ReplayService;
 use crate::tools::{self, ToolCall};
 use rmcp::{
@@ -10,13 +11,59 @@ use rmcp::{
 };
 use serde_json::{json, Value};
 
-#[derive(Clone, Default)]
+/// Backend used by the stdio MCP server.
+///
+/// Production defaults to the long-lived named-pipe daemon so MCP and CLI share
+/// sessions, targets, and jobs. Local in-process mode remains available for tests
+/// and `WINDBG_TOOL_MCP_IN_PROCESS=1`.
+#[derive(Clone)]
+pub enum McpToolBackend {
+    Local(ReplayService),
+    Daemon(DaemonClient),
+}
+
+#[derive(Clone)]
 pub struct TtdMcpServer {
-    service: ReplayService,
+    backend: McpToolBackend,
+}
+
+impl Default for TtdMcpServer {
+    fn default() -> Self {
+        Self::local()
+    }
+}
+
+impl TtdMcpServer {
+    pub fn local() -> Self {
+        Self {
+            backend: McpToolBackend::Local(ReplayService::default()),
+        }
+    }
+
+    pub fn daemon(client: DaemonClient) -> Self {
+        Self {
+            backend: McpToolBackend::Daemon(client),
+        }
+    }
+
+    pub fn backend_kind(&self) -> &'static str {
+        match self.backend {
+            McpToolBackend::Local(_) => "in_process",
+            McpToolBackend::Daemon(_) => "daemon",
+        }
+    }
+
+    async fn call_backend(&self, call: ToolCall) -> anyhow::Result<Value> {
+        match &self.backend {
+            McpToolBackend::Local(service) => service.call_tool(call).await,
+            McpToolBackend::Daemon(client) => client.call_tool(call).await,
+        }
+    }
 }
 
 impl ServerHandler for TtdMcpServer {
     fn get_info(&self) -> ServerInfo {
+        let backend = self.backend_kind();
         ServerInfo {
             protocol_version: Default::default(),
             capabilities: ServerCapabilities::builder().enable_tools().build(),
@@ -24,11 +71,20 @@ impl ServerHandler for TtdMcpServer {
                 name: "windbg-ttd".to_string(),
                 title: None,
                 version: env!("CARGO_PKG_VERSION").to_string(),
-                description: None,
+                description: Some(format!(
+                    "WinDbg TTD/live/dump automation MCP server (backend={backend})"
+                )),
                 icons: None,
                 website_url: None,
             },
-            instructions: Some("Offline WinDbg Time Travel Debugging trace inspection. Load .run/.idx/.ttd traces, create cursors, seek positions, inspect metadata, and query replay state.".to_string()),
+            instructions: Some(format!(
+                "WinDbg Time Travel Debugging and DbgEng automation. \
+Default backend is the long-lived windbg-tool daemon ({backend}), so sessions/targets/jobs \
+survive MCP reconnects and are visible to the CLI. \
+Prefer composites when available (ttd_open, session_list, daemon_health). \
+Core flow: daemon_health/session_list → ttd_load_trace or ttd_open → ttd_cursor_create → \
+inspect with ttd_trace_info, ttd_registers, ttd_read_memory, ttd_memory_watchpoint, and live/target tools."
+            )),
         }
     }
 
@@ -59,7 +115,7 @@ impl ServerHandler for TtdMcpServer {
             name: request.name.into_owned(),
             arguments: request.arguments.map(Value::Object).unwrap_or(Value::Null),
         };
-        let result = self.service.call_tool(call).await;
+        let result = self.call_backend(call).await;
 
         match result {
             Ok(value) => Ok(tool_text(value)),

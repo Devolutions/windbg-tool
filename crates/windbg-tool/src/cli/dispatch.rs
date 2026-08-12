@@ -25,7 +25,7 @@ pub(super) async fn run_cli() -> anyhow::Result<()> {
     let pipe = cli.pipe.unwrap_or_else(default_pipe_name);
 
     match cli.command {
-        None | Some(Commands::Mcp) => run_mcp_stdio().await,
+        None | Some(Commands::Mcp) => run_mcp_stdio(pipe).await,
         Some(Commands::Discover) => print_value(discover_manifest(), &output),
         Some(Commands::Recipes(args)) => print_value(recipes_value(args)?, &output),
         Some(Commands::Schema(args)) => print_value(tool_schema(&args.tool)?, &output),
@@ -56,9 +56,11 @@ pub(super) async fn run_cli() -> anyhow::Result<()> {
         },
         Some(Commands::Dump { command }) => match command {
             DumpCommand::Open(args) => dump_open_and_print(pipe, args, &output).await,
-            DumpCommand::Inspect(args) => platform::run_dump_inspect(args, &output),
-            DumpCommand::Triage(args) => platform::run_dump_inspect(args, &output),
-            DumpCommand::PoolTriage(args) => platform::run_dump_inspect(args, &output),
+            DumpCommand::Inspect(args) => platform::run_dump_inspect(args, "inspect", &output),
+            DumpCommand::Triage(args) => platform::run_dump_inspect(args, "triage", &output),
+            DumpCommand::PoolTriage(args) => {
+                platform::run_dump_inspect(args, "pool_triage", &output)
+            }
             DumpCommand::Create(args) => platform::run_dump_create(args, &output),
         },
         Some(Commands::DbgSrv(args)) => platform::run_dbgeng_server(args, &output),
@@ -109,7 +111,7 @@ pub(super) async fn run_cli() -> anyhow::Result<()> {
         }
         Some(Commands::Symbols { command }) => match command {
             SymbolsCommand::Diagnose(args) => symbols_diagnose_and_print(pipe, args, &output).await,
-            SymbolsCommand::Inspect(args) => print_value(diagnose_pe(&args.path)?, &output),
+            SymbolsCommand::Inspect(args) => symbols_inspect_and_print(args, &output),
             SymbolsCommand::Exports(args) => symbols_exports_and_print(args, &output),
             SymbolsCommand::Nearest(args) => symbols_nearest_and_print(pipe, args, &output).await,
             SymbolsCommand::Doctor(args) => symbols_doctor_and_print(pipe, args, &output).await,

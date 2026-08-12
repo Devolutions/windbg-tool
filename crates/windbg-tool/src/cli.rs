@@ -1,16 +1,21 @@
-use crate::pe_symbols::{diagnose_pe, export_symbol_value, read_export_symbols, ExportSymbol};
 use anyhow::{bail, ensure, Context};
 use clap::{Arg, Args, Command, CommandFactory, Parser, Subcommand, ValueEnum};
-use iced_x86::{
-    Decoder, DecoderOptions, FlowControl, Formatter, Instruction, NasmFormatter, OpKind, Register,
-};
 use rmcp::{transport::stdio, ServiceExt};
 use serde_json::{json, Map, Value};
 use std::fs::{self, OpenOptions};
-use std::io::{BufRead, BufReader, Write};
-use std::path::{Path, PathBuf};
+use std::io::Write;
+use std::path::PathBuf;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
-use windbg_ttd::backend::{capability_catalog, capability_contract};
+use windbg_ttd::analysis::{
+    breakpoint_plan as shared_breakpoint_plan,
+    debug_capabilities_offline as shared_debug_capabilities_offline,
+    debug_log_summarize as shared_debug_log_summarize,
+    module_search_order as shared_module_search_order, parse_u64_argument, recipes_manifest,
+    recipes_value as shared_recipes_value, source_resolve as shared_source_resolve,
+    BreakpointPlanRequest, DebugLogSummarizeRequest, ModuleSearchOrderRequest,
+    SourceResolveRequest,
+};
+use windbg_ttd::backend::capability_catalog;
 use windbg_ttd::daemon::{default_pipe_name, run_daemon, DaemonClient};
 use windbg_ttd::server::TtdMcpServer;
 use windbg_ttd::tools::{self, ToolCall};
@@ -2430,61 +2435,26 @@ async fn debug_capabilities_and_print(
     args: DebugCapabilitiesArgs,
     output: &OutputOptions,
 ) -> anyhow::Result<()> {
-    let client = DaemonClient::new(pipe);
-    let subject = resolve_debug_subject(&args.subject, false)?;
-    let selected = match subject {
-        Some(DebugSubject::Ttd { session, cursor }) => {
-            let capabilities = call_status_value(
-                client
-                    .call_tool(session_call("ttd_capabilities", SessionArgs { session }))
-                    .await,
-            );
-            let architecture = if let Some(cursor) = cursor {
-                Some(call_status_value(
-                    architecture_state_value(
-                        &client,
-                        ArchitectureStateArgs {
-                            session,
-                            cursor,
-                            thread_id: None,
-                        },
-                    )
-                    .await,
-                ))
-            } else {
-                None
-            };
-            Some(json!({
-                "subject": debug_subject_value(&DebugSubject::Ttd { session, cursor }),
-                "capabilities": capabilities,
-                "architecture": architecture,
-                "matrix": capability_contract("ttd_cursor")
-            }))
-        }
-        Some(DebugSubject::Target { target }) => {
-            let status =
-                call_status_value(client.call_tool(target_call("target_status", target)).await);
-            let backend = dbgeng_backend_for_status(&status);
-            Some(json!({
-                "subject": debug_subject_value(&DebugSubject::Target { target }),
-                "status": status,
-                "matrix": capability_contract(backend)
-            }))
-        }
-        None => None,
-    };
-    print_value(
-        json!({
-            "schema_version": 1,
-            "canonical_command": "debug capabilities",
-            "selected": selected,
-            "backend_matrix": capability_catalog(),
-            "safe_command_taxonomy": safe_command_taxonomy()
-        }),
+    // Offline catalog does not need the daemon; session/target enrichment does.
+    if args.subject.session.is_none() && args.subject.target.is_none() {
+        return print_value(shared_debug_capabilities_offline(), output);
+    }
+    call_and_print(
+        pipe,
+        ToolCall {
+            name: "debug_capabilities".into(),
+            arguments: json!({
+                "session_id": args.subject.session,
+                "cursor_id": args.subject.cursor,
+                "target_id": args.subject.target,
+            }),
+        },
         output,
     )
+    .await
 }
 
+#[cfg(test)]
 fn dbgeng_backend_for_status(status: &Value) -> &'static str {
     if status.pointer("/value/target/kind").and_then(Value::as_str) == Some("dump") {
         "dbgeng_dump"
@@ -2509,285 +2479,43 @@ fn debug_log_summarize_and_print(
 }
 
 async fn debug_snapshot_value(pipe: String, args: DebugSnapshotArgs) -> anyhow::Result<Value> {
-    let subject = resolve_debug_subject(&args.subject, true)?
-        .context("debug snapshot requires either --target or --session plus --cursor")?;
-    match subject {
-        DebugSubject::Ttd { session, cursor } => {
-            let cursor = cursor.context("debug snapshot requires --cursor with --session")?;
-            debug_ttd_snapshot_value(pipe, session, cursor, args).await
-        }
-        DebugSubject::Target { target } => debug_target_snapshot_value(pipe, target, args).await,
-    }
-}
-
-async fn debug_ttd_snapshot_value(
-    pipe: String,
-    session: u64,
-    cursor: u64,
-    args: DebugSnapshotArgs,
-) -> anyhow::Result<Value> {
-    let legacy = context_snapshot_value(
-        pipe,
-        ContextSnapshotArgs {
-            session: Some(session),
-            cursor: Some(cursor),
-        },
-    )
-    .await?;
-    let mut sections = Map::new();
-    add_legacy_section(&mut sections, "trace_info", &legacy, "info");
-    add_legacy_section(&mut sections, "capabilities", &legacy, "debug capabilities");
-    add_legacy_section(&mut sections, "position", &legacy, "position get");
-    add_legacy_section(&mut sections, "active_threads", &legacy, "active-threads");
-    add_legacy_section(&mut sections, "stack", &legacy, "stack info");
-    add_legacy_section(
-        &mut sections,
-        "architecture_state",
-        &legacy,
-        "architecture state",
-    );
-    add_legacy_section(
-        &mut sections,
-        "current_disassembly",
-        &legacy,
-        "disasm --session <id> --cursor <id>",
-    );
-    add_legacy_section(&mut sections, "nearest_symbol", &legacy, "symbols nearest");
-    add_legacy_section(&mut sections, "command_line", &legacy, "command-line");
-    add_legacy_section(
-        &mut sections,
-        "timeline_summary",
-        &legacy,
-        "timeline events",
-    );
-    filter_sections(&mut sections, &args.include, &args.exclude);
-    Ok(json!({
-        "schema_version": 1,
-        "canonical_command": "debug snapshot",
-        "subject": debug_subject_value(&DebugSubject::Ttd { session, cursor: Some(cursor) }),
-        "stability": "replayable_cursor",
-        "section_timeout_ms": args.section_timeout_ms,
-        "sections": sections,
-        "diagnostics": [],
-        "next_recommended_safe_commands": [
-            format!("windbg-tool debug capabilities --session {session} --cursor {cursor}"),
-            format!("windbg-tool timeline events --session {session}"),
-            format!("windbg-tool stack backtrace --session {session} --cursor {cursor}")
-        ],
-        "legacy_snapshot": legacy
-    }))
-}
-
-async fn debug_target_snapshot_value(
-    pipe: String,
-    target: u64,
-    args: DebugSnapshotArgs,
-) -> anyhow::Result<Value> {
-    let client = DaemonClient::new(pipe);
-    let mut sections = Map::new();
-    let subject = DebugSubject::Target { target };
-    if snapshot_section_enabled(&args, "status") {
-        let started = Instant::now();
-        sections.insert(
-            "status".to_string(),
-            composite_section(
-                started,
-                call_status_value(client.call_tool(target_call("target_status", target)).await),
-                Some("target status --target <id>"),
-                None,
-            ),
-        );
-    }
-    if snapshot_section_enabled(&args, "capabilities") {
-        sections.insert(
-            "capabilities".to_string(),
-            json!({
-                "status": "ok",
-                "duration_ms": 0,
-                "truncated": false,
-                "value": {
-                    "selection": "target kind is resolved by debug capabilities --target <id>",
-                    "candidates": [
-                        capability_contract("dbgeng_live"),
-                        capability_contract("dbgeng_dump")
-                    ]
-                },
-                "diagnostics": [],
-                "command": "debug capabilities --target <id>"
+    DaemonClient::new(pipe)
+        .call_tool(ToolCall {
+            name: "debug_snapshot".into(),
+            arguments: json!({
+                "session_id": args.subject.session,
+                "cursor_id": args.subject.cursor,
+                "target_id": args.subject.target,
+                "include": args.include,
+                "exclude": args.exclude,
+                "max_frames": args.max_frames,
+                "max_modules": args.max_modules,
+                "max_threads": args.max_threads,
+                "disasm_count": args.disasm_count,
+                "section_timeout_ms": args.section_timeout_ms,
             }),
-        );
-    }
-    if snapshot_section_enabled(&args, "registers") {
-        let started = Instant::now();
-        sections.insert(
-            "registers".to_string(),
-            composite_section(
-                started,
-                call_status_value(
-                    client
-                        .call_tool(target_call("target_core_registers", target))
-                        .await,
-                ),
-                Some("target registers --target <id>"),
-                None,
-            ),
-        );
-    }
-    if snapshot_section_enabled(&args, "event") {
-        let started = Instant::now();
-        sections.insert(
-            "event".to_string(),
-            composite_section(
-                started,
-                call_status_value(
-                    client
-                        .call_tool(target_call("target_last_event", target))
-                        .await,
-                ),
-                Some("target event --target <id>"),
-                None,
-            ),
-        );
-    }
-    if snapshot_section_enabled(&args, "threads") {
-        let started = Instant::now();
-        sections.insert(
-            "threads".to_string(),
-            composite_section(
-                started,
-                call_status_value(
-                    client
-                        .call_tool(target_call("target_list_threads", target))
-                        .await,
-                ),
-                Some("target threads --target <id>"),
-                Some(args.max_threads),
-            ),
-        );
-    }
-    if snapshot_section_enabled(&args, "modules") {
-        let started = Instant::now();
-        sections.insert(
-            "modules".to_string(),
-            composite_section(
-                started,
-                call_status_value(
-                    client
-                        .call_tool(target_call("target_list_modules", target))
-                        .await,
-                ),
-                Some("target modules --target <id>"),
-                Some(args.max_modules),
-            ),
-        );
-    }
-    if snapshot_section_enabled(&args, "stack") {
-        let started = Instant::now();
-        sections.insert(
-            "stack".to_string(),
-            composite_section(
-                started,
-                call_status_value(
-                    client
-                        .call_tool(target_stack_call(TargetStackTraceArgs {
-                            target,
-                            max_frames: args.max_frames,
-                        }))
-                        .await,
-                ),
-                Some("target stack --target <id>"),
-                Some(args.max_frames as usize),
-            ),
-        );
-    }
-    if snapshot_section_enabled(&args, "disassembly") {
-        let started = Instant::now();
-        sections.insert(
-            "disassembly".to_string(),
-            composite_section(
-                started,
-                call_status_value(
-                    client
-                        .call_tool(target_disasm_call(TargetDisasmArgs {
-                            target,
-                            address: None,
-                            count: args.disasm_count,
-                        })?)
-                        .await,
-                ),
-                Some("target disasm --target <id>"),
-                Some(args.disasm_count as usize),
-            ),
-        );
-    }
-    if snapshot_section_enabled(&args, "breakpoints") {
-        let started = Instant::now();
-        sections.insert(
-            "breakpoints".to_string(),
-            composite_section(
-                started,
-                call_status_value(
-                    client
-                        .call_tool(target_call("target_list_breakpoints", target))
-                        .await,
-                ),
-                Some("breakpoint list --target <id>"),
-                None,
-            ),
-        );
-    }
-    if snapshot_section_enabled(&args, "symbol_source") {
-        sections.insert(
-            "symbol_source".to_string(),
-            symbol_source_doctor_value(&client, &subject, None).await,
-        );
-    }
-    Ok(json!({
-        "schema_version": 1,
-        "canonical_command": "debug snapshot",
-        "subject": debug_subject_value(&subject),
-        "stability": "stopped_or_best_effort_live_state",
-        "section_timeout_ms": args.section_timeout_ms,
-        "sections": sections,
-        "diagnostics": [
-            diagnostic_item(
-                "debug.snapshot.live_consistency",
-                "info",
-                "Live target sections are best-effort.",
-                "If another actor continues or steps the target while the snapshot is collected, sections may describe adjacent target states.",
-                "high",
-                None,
-            )
-        ],
-        "next_recommended_safe_commands": [
-            format!("windbg-tool debug capabilities --target {target}"),
-            format!("windbg-tool target stack --target {target}"),
-            format!("windbg-tool breakpoint plan --target {target} --address <addr>")
-        ]
-    }))
+        })
+        .await
 }
-
 async fn symbols_doctor_and_print(
     pipe: String,
     args: SymbolDoctorArgs,
     output: &OutputOptions,
 ) -> anyhow::Result<()> {
-    let client = DaemonClient::new(pipe);
-    let subject = resolve_debug_subject(&args.subject, true)?
-        .context("symbols doctor requires either --target or --session plus --cursor")?;
-    let address = args
-        .address
-        .as_deref()
-        .map(parse_u64_argument)
-        .transpose()?;
-    print_value(
-        json!({
-            "schema_version": 1,
-            "subject": debug_subject_value(&subject),
-            "doctor": symbol_source_doctor_value(&client, &subject, address).await
-        }),
+    call_and_print(
+        pipe,
+        ToolCall {
+            name: "symbols_doctor".into(),
+            arguments: json!({
+                "session_id": args.subject.session,
+                "cursor_id": args.subject.cursor,
+                "target_id": args.subject.target,
+                "address": args.address,
+            }),
+        },
         output,
     )
+    .await
 }
 
 async fn triage_and_print(
@@ -2796,23 +2524,24 @@ async fn triage_and_print(
     args: TriageArgs,
     output: &OutputOptions,
 ) -> anyhow::Result<()> {
-    let snapshot = debug_snapshot_value(
+    call_and_print(
         pipe,
-        DebugSnapshotArgs {
-            subject: args.subject,
-            max_frames: args.max_frames,
-            max_modules: args.max_modules,
-            max_threads: args.max_threads,
-            disasm_count: 8,
-            section_timeout_ms: 2000,
-            include: Vec::new(),
-            exclude: Vec::new(),
+        ToolCall {
+            name: "triage_run".into(),
+            arguments: json!({
+                "kind": kind,
+                "session_id": args.subject.session,
+                "cursor_id": args.subject.cursor,
+                "target_id": args.subject.target,
+                "max_frames": args.max_frames,
+                "max_modules": args.max_modules,
+                "max_threads": args.max_threads,
+            }),
         },
+        output,
     )
-    .await?;
-    print_value(triage_value(kind, snapshot), output)
+    .await
 }
-
 async fn breakpoint_plan_and_print(
     _pipe: String,
     args: BreakpointPlanArgs,
@@ -2821,8 +2550,16 @@ async fn breakpoint_plan_and_print(
     print_value(breakpoint_plan_value(args)?, output)
 }
 
-async fn run_mcp_stdio() -> anyhow::Result<()> {
-    let server = TtdMcpServer::default();
+async fn run_mcp_stdio(pipe: String) -> anyhow::Result<()> {
+    let server = if prefer_in_process_mcp() {
+        TtdMcpServer::local()
+    } else {
+        daemon_mode::ensure_daemon(&pipe)
+            .await
+            .with_context(|| format!("MCP requires a healthy daemon on {pipe}"))?;
+        TtdMcpServer::daemon(DaemonClient::new(pipe))
+    };
+
     let service = server
         .serve(stdio())
         .await
@@ -2834,62 +2571,41 @@ async fn run_mcp_stdio() -> anyhow::Result<()> {
     Ok(())
 }
 
+fn prefer_in_process_mcp() -> bool {
+    matches!(
+        std::env::var("WINDBG_TOOL_MCP_IN_PROCESS").as_deref(),
+        Ok("1") | Ok("true") | Ok("TRUE") | Ok("yes") | Ok("YES")
+    )
+}
+
 async fn open_and_print(
     pipe: String,
     args: OpenArgs,
     output: &OutputOptions,
 ) -> anyhow::Result<()> {
-    let client = DaemonClient::new(pipe);
-    let load = client
-        .call_tool(load_call(LoadArgs {
-            trace_path: args.trace_path,
-            companion_path: args.companion_path,
-            trace_index: args.trace_index,
-            binary_paths: args.binary_paths,
-            symbol_paths: args.symbol_paths,
-            symcache_dir: args.symcache_dir,
-        }))
-        .await?;
-    let session_id = load["session_id"]
-        .as_u64()
-        .context("ttd_load_trace response did not include session_id")?;
-    let cursor = client
-        .call_tool(session_call(
-            "ttd_cursor_create",
-            SessionArgs {
-                session: session_id,
-            },
-        ))
-        .await?;
-    let cursor_id = cursor["cursor_id"]
-        .as_u64()
-        .context("ttd_cursor_create response did not include cursor_id")?;
-
-    let position = if let Some(position) = args.position {
-        Some(
-            client
-                .call_tool(position_set_call(PositionSetArgs {
-                    session: session_id,
-                    cursor: cursor_id,
-                    position,
-                    thread_unique_id: args.thread_unique_id,
-                })?)
-                .await?,
-        )
-    } else {
-        None
-    };
-
-    print_value(
-        json!({
-            "session_id": session_id,
-            "cursor_id": cursor_id,
-            "load": load,
-            "cursor": cursor,
-            "position": position,
-        }),
+    let mut arguments = json!({
+        "trace_path": args.trace_path,
+        "companion_path": args.companion_path,
+        "trace_index": args.trace_index,
+        "thread_unique_id": args.thread_unique_id,
+        "symbols": {
+            "binary_paths": args.binary_paths,
+            "symbol_paths": args.symbol_paths,
+            "symcache_dir": args.symcache_dir,
+        }
+    });
+    if let Some(position) = args.position.as_deref() {
+        arguments["position"] = parse_position_argument(position)?;
+    }
+    call_and_print(
+        pipe,
+        ToolCall {
+            name: "ttd_open".into(),
+            arguments,
+        },
         output,
     )
+    .await
 }
 
 async fn context_snapshot_and_print(
@@ -2901,262 +2617,58 @@ async fn context_snapshot_and_print(
 }
 
 async fn context_snapshot_value(pipe: String, args: ContextSnapshotArgs) -> anyhow::Result<Value> {
-    let client = DaemonClient::new(pipe.clone());
-    let sessions = client.sessions().await?;
-    let selected = select_snapshot_handles(&sessions, args)?;
-    let mut snapshot = json!({
-        "daemon": call_status_value(DaemonClient::new(pipe).health().await),
-        "sessions": sessions,
-        "selected": selected,
-        "recipes": [
-            "windbg-tool recipes crash-triage",
-            "windbg-tool recipes stack-corruption",
-            "windbg-tool recipes symbol-health",
-            "windbg-tool recipes memory-provenance"
-        ],
-    });
-
-    if let Some(session_id) = selected["session_id"].as_u64() {
-        snapshot["trace_info"] = call_status_value(
-            client
-                .call_tool(session_call(
-                    "ttd_trace_info",
-                    SessionArgs {
-                        session: session_id,
-                    },
-                ))
-                .await,
-        );
-        snapshot["capabilities"] = call_status_value(
-            client
-                .call_tool(session_call(
-                    "ttd_capabilities",
-                    SessionArgs {
-                        session: session_id,
-                    },
-                ))
-                .await,
-        );
-        if let Some(cursor_id) = selected["cursor_id"].as_u64() {
-            let cursor_args = CursorArgs {
-                session: session_id,
-                cursor: cursor_id,
-            };
-            snapshot["position"] = call_status_value(
-                client
-                    .call_tool(cursor_call("ttd_position_get", cursor_args.clone()))
-                    .await,
-            );
-            snapshot["active_threads"] = call_status_value(
-                client
-                    .call_tool(cursor_call("ttd_active_threads", cursor_args.clone()))
-                    .await,
-            );
-            snapshot["stack"] = call_status_value(
-                client
-                    .call_tool(cursor_call("ttd_stack_info", cursor_args.clone()))
-                    .await,
-            );
-            snapshot["architecture_state"] = call_status_value(
-                architecture_state_value(
-                    &client,
-                    ArchitectureStateArgs {
-                        session: session_id,
-                        cursor: cursor_id,
-                        thread_id: None,
-                    },
-                )
-                .await,
-            );
-            let current_disassembly = call_status_value(
-                disasm_value(
-                    &client,
-                    &DisasmArgs {
-                        session: session_id,
-                        cursor: cursor_id,
-                        address: None,
-                        count: 4,
-                        bytes: 64,
-                        policy: None,
-                        thread_id: None,
-                    },
-                )
-                .await,
-            );
-            let nearest_symbol_args =
-                current_disassembly["value"]["address"]
-                    .as_u64()
-                    .map(|address| SymbolNearestArgs {
-                        session: session_id,
-                        cursor: cursor_id,
-                        address: format!("0x{address:X}"),
-                        include_exports: false,
-                    });
-            snapshot["current_disassembly"] = current_disassembly;
-            if let Some(args) = nearest_symbol_args {
-                snapshot["nearest_symbol"] =
-                    call_status_value(nearest_symbol_value(&client, &args).await);
-            }
-            snapshot["command_line"] = call_status_value(
-                client
-                    .call_tool(cursor_call("ttd_command_line", cursor_args))
-                    .await,
-            );
-        }
-        snapshot["timeline_summary"] = call_status_value(
-            timeline_events_value(
-                &client,
-                &TimelineEventsArgs {
-                    session: session_id,
-                    kind: "all".to_string(),
-                    max_events: 16,
-                },
-            )
-            .await,
-        );
-    }
-
-    Ok(snapshot)
+    DaemonClient::new(pipe)
+        .call_tool(ToolCall {
+            name: "ttd_context_snapshot".into(),
+            arguments: json!({
+                "session_id": args.session,
+                "cursor_id": args.cursor,
+            }),
+        })
+        .await
 }
-
 async fn symbols_diagnose_and_print(
     pipe: String,
     args: SymbolDiagnoseArgs,
     output: &OutputOptions,
 ) -> anyhow::Result<()> {
-    if args.name.is_some() && args.address.is_some() {
-        bail!("symbols diagnose accepts either --name or --address, not both")
-    }
-    let client = DaemonClient::new(pipe);
-    let trace_info = client
-        .call_tool(session_call(
-            "ttd_trace_info",
-            SessionArgs {
-                session: args.session,
-            },
-        ))
-        .await;
-    let capabilities = client
-        .call_tool(session_call(
-            "ttd_capabilities",
-            SessionArgs {
-                session: args.session,
-            },
-        ))
-        .await;
-    let module_scope = symbol_module_scope(&client, &args).await?;
-    let checks = symbol_diagnostic_checks(capabilities.as_ref().ok(), &module_scope);
-    print_value(
-        json!({
-            "session_id": args.session,
-            "trace_info": call_status_value(trace_info),
-            "capabilities": call_status_value(capabilities),
-            "module_scope": module_scope,
-            "checks": checks,
-            "next_steps": [
-                "Confirm symbols.symbol_path includes the expected symbol server or private symbol path.",
-                "Confirm symbols.image_path includes local binaries when stack walking or disassembly is low fidelity.",
-                "Use modules/module info to select a narrower module before future PDB/source diagnostics.",
-                "Use windbg-tool recipes symbol-health for the broader TimDbg workflow."
-            ]
-        }),
+    call_and_print(
+        pipe,
+        ToolCall {
+            name: "symbols_diagnose".into(),
+            arguments: json!({
+                "session_id": args.session,
+                "name": args.name,
+                "address": args.address,
+            }),
+        },
         output,
     )
+    .await
 }
 
-async fn symbol_module_scope(
-    client: &DaemonClient,
-    args: &SymbolDiagnoseArgs,
-) -> anyhow::Result<Value> {
-    if args.name.is_none() && args.address.is_none() {
-        let modules = call_status_value(
-            client
-                .call_tool(session_call(
-                    "ttd_list_modules",
-                    SessionArgs {
-                        session: args.session,
-                    },
-                ))
-                .await,
-        );
-        let pe_diagnostics = modules["value"]["modules"]
-            .as_array()
-            .map(|modules| session_pe_diagnostics(modules))
-            .unwrap_or_else(|| {
-                json!({
-                    "ok": false,
-                    "error": "module list is unavailable"
-                })
-            });
-        return Ok(json!({
-            "kind": "session",
-            "modules": modules,
-            "pe_diagnostics": pe_diagnostics
-        }));
-    }
-
-    let mut object = session_object(args.session);
-    insert_option(&mut object, "name", args.name.clone().map(Value::String));
-    insert_option(
-        &mut object,
-        "address",
-        args.address
-            .as_deref()
-            .map(parse_u64_argument)
-            .transpose()?
-            .map(Value::from),
-    );
-    let module = call_status_value(
-        client
-            .call_tool(ToolCall {
-                name: "ttd_module_info".to_string(),
-                arguments: Value::Object(object),
-            })
-            .await,
-    );
-    let pe_diagnostics = module["value"]["module"]
-        .as_object()
-        .map(|_| module_pe_diagnostics(&module["value"]["module"]))
-        .unwrap_or_else(|| {
-            json!({
-                "ok": false,
-                "error": "module info is unavailable"
-            })
-        });
-    Ok(json!({
-        "kind": if args.name.is_some() { "module_name" } else { "module_address" },
-        "module": module,
-        "pe_diagnostics": pe_diagnostics
-    }))
+fn symbols_inspect_and_print(
+    args: SymbolInspectArgs,
+    output: &OutputOptions,
+) -> anyhow::Result<()> {
+    print_value(
+        windbg_ttd::analysis::pe_inspect(windbg_ttd::analysis::PeInspectRequest {
+            path: args.path,
+        })?,
+        output,
+    )
 }
 
 fn symbols_exports_and_print(
     args: SymbolExportsArgs,
     output: &OutputOptions,
 ) -> anyhow::Result<()> {
-    ensure!(
-        args.max <= 10_000,
-        "symbols exports --max must not exceed 10000"
-    );
-    let exports = read_export_symbols(&args.path)?;
-    let filter = args.filter.as_ref().map(|value| value.to_ascii_lowercase());
-    let filtered = filter_exports(&exports, filter.as_deref());
-    let values = filtered
-        .iter()
-        .take(args.max)
-        .map(|export| export_symbol_value(export))
-        .collect::<Vec<_>>();
     print_value(
-        json!({
-            "path": args.path,
-            "total_exports": exports.len(),
-            "filtered_exports": filtered.len(),
-            "max": args.max,
-            "returned": values.len(),
-            "limit": args.max,
-            "truncated": filtered.len() > args.max,
-            "exports": values,
-        }),
+        windbg_ttd::analysis::pe_exports(windbg_ttd::analysis::PeExportsRequest {
+            path: args.path,
+            filter: args.filter,
+            max: args.max,
+        })?,
         output,
     )
 }
@@ -3166,586 +2678,29 @@ async fn symbols_nearest_and_print(
     args: SymbolNearestArgs,
     output: &OutputOptions,
 ) -> anyhow::Result<()> {
-    let client = DaemonClient::new(pipe);
-    print_value(nearest_symbol_value(&client, &args).await?, output)
-}
-
-async fn nearest_symbol_value(
-    client: &DaemonClient,
-    args: &SymbolNearestArgs,
-) -> anyhow::Result<Value> {
-    let address_info = client
-        .call_tool(address_info_call(AddressInfoArgs {
-            session: args.session,
-            cursor: args.cursor,
-            address: args.address.clone(),
-        }))
-        .await?;
-    let Some(module) = address_info["module"].as_object() else {
-        return Ok(json!({
-            "session_id": args.session,
-            "cursor_id": args.cursor,
-            "address": parse_u64_argument(&args.address)?,
-            "address_info": address_info,
-            "symbol": null,
-            "reason": "address did not resolve to a loaded module"
-        }));
-    };
-    let Some(path) = module.get("path").and_then(Value::as_str) else {
-        return Ok(json!({
-            "session_id": args.session,
-            "cursor_id": args.cursor,
-            "address_info": address_info,
-            "symbol": null,
-            "reason": "module path is not available"
-        }));
-    };
-    let rva = module
-        .get("rva")
-        .and_then(Value::as_u64)
-        .context("address_info module did not include an RVA")?;
-    let path = PathBuf::from(path);
-    let exports = read_export_symbols(&path)?;
-    let nearest = nearest_export(&exports, rva as u32);
-    let export_sample = args.include_exports.then(|| {
-        exports
-            .iter()
-            .take(64)
-            .map(export_symbol_value)
-            .collect::<Vec<_>>()
-    });
-    let nearest_value = nearest.map(|export| {
-        let displacement = rva.saturating_sub(export.rva as u64);
-        json!({
-            "export": export_symbol_value(export),
-            "displacement": displacement,
-            "displacement_hex": format!("{displacement:X}"),
-            "display": export_display_name(export, displacement),
-            "confidence": if export.forwarder.is_some() { "forwarder" } else { "export_nearest" }
-        })
-    });
-
-    Ok(json!({
-        "session_id": args.session,
-        "cursor_id": args.cursor,
-        "address": parse_u64_argument(&args.address)?,
-        "address_info": address_info,
-        "module_path": path,
-        "rva": rva,
-        "rva_hex": format!("{rva:X}"),
-        "symbol": nearest_value,
-        "exports": {
-            "count": exports.len(),
-            "sample": export_sample,
-            "sample_limit": if args.include_exports { 64 } else { 0 },
-            "sample_truncated": args.include_exports && exports.len() > 64
+    call_and_print(
+        pipe,
+        ToolCall {
+            name: "ttd_symbols_nearest".into(),
+            arguments: json!({
+                "session_id": args.session,
+                "cursor_id": args.cursor,
+                "address": args.address,
+                "include_exports": args.include_exports,
+            }),
         },
-        "notes": [
-            "Nearest export is not the same as private PDB symbol lookup.",
-            "Use this as a low-fidelity fallback when private symbols are unavailable."
-        ]
-    }))
-}
-
-fn session_pe_diagnostics(modules: &[Value]) -> Value {
-    const MAX_PARSED_MODULES: usize = 32;
-
-    let mut with_path_count = 0usize;
-    let mut local_file_count = 0usize;
-    let mut parsed_count = 0usize;
-    let mut samples = Vec::new();
-
-    for module in modules {
-        let Some(path) = module_path(module) else {
-            continue;
-        };
-        with_path_count += 1;
-        let path = PathBuf::from(path);
-        if !path.exists() {
-            continue;
-        }
-        local_file_count += 1;
-        if samples.len() >= MAX_PARSED_MODULES {
-            continue;
-        }
-        let diagnostic = module_pe_diagnostics(module);
-        if diagnostic["ok"].as_bool() == Some(true) {
-            parsed_count += 1;
-        }
-        samples.push(diagnostic);
-    }
-
-    json!({
-        "ok": true,
-        "total_modules": modules.len(),
-        "modules_with_path": with_path_count,
-        "local_files": local_file_count,
-        "parsed_count": parsed_count,
-        "sample_limit": MAX_PARSED_MODULES,
-        "truncated": local_file_count > MAX_PARSED_MODULES,
-        "samples": samples,
-        "hint": "Use symbols diagnose --name <module> or --address <addr> for a single-module PE/PDB identity."
-    })
-}
-
-fn module_pe_diagnostics(module: &Value) -> Value {
-    let name = module["name"].as_str().unwrap_or_default();
-    let Some(path) = module_path(module) else {
-        return json!({
-            "ok": false,
-            "module": name,
-            "reason": "module path is not available"
-        });
-    };
-    let path = PathBuf::from(path);
-    if !path.exists() {
-        return json!({
-            "ok": false,
-            "module": name,
-            "path": path,
-            "reason": "module binary is not available at this path"
-        });
-    }
-
-    match diagnose_pe(&path) {
-        Ok(pe) => json!({
-            "ok": true,
-            "module": name,
-            "path": path,
-            "pe": pe
-        }),
-        Err(error) => json!({
-            "ok": false,
-            "module": name,
-            "path": path,
-            "error": error.to_string()
-        }),
-    }
-}
-
-fn module_path(module: &Value) -> Option<&str> {
-    module["path"].as_str().filter(|path| !path.is_empty())
-}
-
-fn audit_modules(modules: &[Value], max_suspicious: usize) -> Value {
-    let mut missing_path = 0usize;
-    let mut local_file_missing = 0usize;
-    let mut user_writable_path = 0usize;
-    let mut temp_path = 0usize;
-    let mut network_path = 0usize;
-    let mut outside_windows_dir = 0usize;
-    let mut suspicious = Vec::new();
-    let mut names: std::collections::BTreeMap<String, Vec<Value>> =
-        std::collections::BTreeMap::new();
-    let windows_dir = std::env::var("WINDIR")
-        .or_else(|_| std::env::var("SystemRoot"))
-        .unwrap_or_else(|_| String::from(r"C:\Windows"))
-        .to_ascii_lowercase();
-
-    for module in modules {
-        let name = module["name"].as_str().unwrap_or_default();
-        names
-            .entry(name.to_ascii_lowercase())
-            .or_default()
-            .push(json!({
-                "name": name,
-                "path": module_path(module),
-                "base_address": module["base_address"],
-                "size": module["size"],
-            }));
-
-        let mut reasons = Vec::new();
-        let Some(path) = module_path(module) else {
-            missing_path += 1;
-            reasons.push("missing_module_path");
-            push_suspicious_module(&mut suspicious, module, reasons, max_suspicious);
-            continue;
-        };
-        let lower = path.to_ascii_lowercase();
-        let path_buf = PathBuf::from(path);
-        if lower.starts_with(r"\\") {
-            network_path += 1;
-            reasons.push("network_path");
-        }
-        if lower.contains(r"\users\") || lower.contains(r"\programdata\") {
-            user_writable_path += 1;
-            reasons.push("user_or_programdata_path");
-        }
-        if lower.contains(r"\temp\")
-            || lower.contains(r"\tmp\")
-            || lower.contains(r"\appdata\local\temp\")
-            || lower.contains(r"\downloads\")
-        {
-            temp_path += 1;
-            reasons.push("temp_or_download_path");
-        }
-        if path_buf.is_absolute() && !lower.starts_with(&windows_dir) {
-            outside_windows_dir += 1;
-            reasons.push("outside_windows_directory");
-        }
-        if !path_buf.exists() {
-            local_file_missing += 1;
-            reasons.push("binary_not_available_locally");
-        }
-        if !reasons.is_empty() {
-            push_suspicious_module(&mut suspicious, module, reasons, max_suspicious);
-        }
-    }
-
-    let duplicates = names
-        .into_iter()
-        .filter_map(|(name, instances)| {
-            let distinct_paths = instances
-                .iter()
-                .filter_map(|instance| instance["path"].as_str())
-                .map(|path| path.to_ascii_lowercase())
-                .collect::<std::collections::BTreeSet<_>>();
-            (instances.len() > 1 && distinct_paths.len() > 1).then(|| {
-                json!({
-                    "name": name,
-                    "instances": instances,
-                    "distinct_path_count": distinct_paths.len(),
-                    "reason": "same module basename loaded from multiple paths"
-                })
-            })
-        })
-        .collect::<Vec<_>>();
-
-    json!({
-        "summary": {
-            "missing_path": missing_path,
-            "binary_not_available_locally": local_file_missing,
-            "network_path": network_path,
-            "user_or_programdata_path": user_writable_path,
-            "temp_or_download_path": temp_path,
-            "outside_windows_directory": outside_windows_dir,
-            "duplicate_name_groups": duplicates.len(),
-        },
-        "suspicious_modules": suspicious,
-        "suspicious_truncated": suspicious.len() >= max_suspicious,
-        "duplicate_name_groups": duplicates,
-        "safe_next_steps": [
-            "Run symbols diagnose for suspicious module paths that are available locally.",
-            "Use memory range/classify around unexpected executable addresses.",
-            "Use TTD watchpoints to identify writes to suspicious dispatch tables or return addresses."
-        ]
-    })
-}
-
-fn push_suspicious_module(
-    suspicious: &mut Vec<Value>,
-    module: &Value,
-    reasons: Vec<&'static str>,
-    max_suspicious: usize,
-) {
-    if suspicious.len() >= max_suspicious {
-        return;
-    }
-    suspicious.push(json!({
-        "name": module["name"],
-        "path": module["path"],
-        "base_address": module["base_address"],
-        "size": module["size"],
-        "load_position": module["load_position"],
-        "unload_position": module["unload_position"],
-        "reasons": reasons,
-    }));
-}
-
-fn collect_timeline_events(events: &mut Vec<Value>, kind: &str, source: &Value, array_key: &str) {
-    let Some(items) = timeline_source_items(source, array_key) else {
-        return;
-    };
-    for item in items {
-        let position = item
-            .get("position")
-            .cloned()
-            .or_else(|| {
-                item.get("module")
-                    .and_then(|module| module.get("load_position"))
-                    .cloned()
-            })
-            .unwrap_or(Value::Null);
-        events.push(json!({
-            "kind": kind,
-            "event_kind": item.get("kind").cloned().unwrap_or(Value::Null),
-            "position": position,
-            "sequence": position.get("sequence").cloned().unwrap_or(Value::Null),
-            "payload": item,
-        }));
-    }
-}
-
-fn collect_keyframe_events(events: &mut Vec<Value>, source: &Value) {
-    let Some(items) = timeline_source_items(source, "keyframes") else {
-        return;
-    };
-    for position in items {
-        events.push(json!({
-            "kind": "keyframe",
-            "event_kind": "keyframe",
-            "position": position,
-            "sequence": position.get("sequence").cloned().unwrap_or(Value::Null),
-            "payload": position,
-        }));
-    }
-}
-
-fn timeline_source_items<'a>(source: &'a Value, array_key: &str) -> Option<&'a Vec<Value>> {
-    let value = source.get("value")?;
-    value
-        .get(array_key)
-        .and_then(Value::as_array)
-        .or_else(|| value.as_array())
-}
-
-fn timeline_source_summary(source: &Value, array_key: &str) -> Value {
-    if source["ok"].as_bool() != Some(true) {
-        return source.clone();
-    }
-
-    let item_count = timeline_source_items(source, array_key).map_or(0, Vec::len);
-    json!({
-        "ok": true,
-        "item_count": item_count,
-        "items_omitted": true
-    })
-}
-
-fn timeline_sequence(event: &Value) -> u64 {
-    event["sequence"].as_u64().unwrap_or(u64::MAX)
-}
-
-fn normalize_dll_name(name: &str) -> anyhow::Result<String> {
-    let trimmed = name.trim();
-    ensure!(!trimmed.is_empty(), "DLL name must not be empty");
-    ensure!(
-        !trimmed.contains('\\') && !trimmed.contains('/'),
-        "DLL search-order diagnostics require a basename, not a path"
-    );
-    if Path::new(trimmed).extension().is_some() {
-        Ok(trimmed.to_string())
-    } else {
-        Ok(format!("{trimmed}.dll"))
-    }
-}
-
-fn search_candidate(order: usize, kind: &str, directory: &Path, dll: &str) -> Value {
-    let candidate = directory.join(dll);
-    let risk = directory_risk(directory);
-    json!({
-        "order": order,
-        "kind": kind,
-        "directory": directory,
-        "candidate": candidate,
-        "exists": candidate.exists(),
-        "risk": risk,
-    })
-}
-
-fn directory_risk(directory: &Path) -> &'static str {
-    let lower = directory.to_string_lossy().to_ascii_lowercase();
-    let windows_dir = std::env::var("WINDIR")
-        .or_else(|_| std::env::var("SystemRoot"))
-        .unwrap_or_else(|_| String::from(r"C:\Windows"))
-        .to_ascii_lowercase();
-    if lower.starts_with(&windows_dir) {
-        "system_controlled"
-    } else if lower.starts_with(r"\\") {
-        "network_path"
-    } else if lower.contains(r"\temp\")
-        || lower.contains(r"\tmp\")
-        || lower.contains(r"\downloads\")
-        || lower.contains(r"\appdata\local\temp\")
-    {
-        "temp_or_download_path"
-    } else if lower.contains(r"\users\") || lower.contains(r"\programdata\") {
-        "user_or_programdata_path"
-    } else {
-        "review_path_acl"
-    }
-}
-
-fn filter_exports<'a>(exports: &'a [ExportSymbol], filter: Option<&str>) -> Vec<&'a ExportSymbol> {
-    exports
-        .iter()
-        .filter(|export| {
-            let Some(filter) = filter else {
-                return true;
-            };
-            export
-                .name
-                .as_deref()
-                .is_some_and(|name| name.to_ascii_lowercase().contains(filter))
-                || export
-                    .forwarder
-                    .as_deref()
-                    .is_some_and(|name| name.to_ascii_lowercase().contains(filter))
-                || export.ordinal.to_string().contains(filter)
-        })
-        .collect()
-}
-
-fn nearest_export(exports: &[ExportSymbol], rva: u32) -> Option<&ExportSymbol> {
-    exports
-        .iter()
-        .filter(|export| export.forwarder.is_none() && export.rva <= rva)
-        .max_by_key(|export| export.rva)
-}
-
-fn export_display_name(export: &ExportSymbol, displacement: u64) -> String {
-    let name = export
-        .name
-        .clone()
-        .unwrap_or_else(|| format!("#{}", export.ordinal));
-    if displacement == 0 {
-        name
-    } else {
-        format!("{name}+0x{displacement:x}")
-    }
-}
-
-fn symbol_diagnostic_checks(capabilities: Option<&Value>, module_scope: &Value) -> Value {
-    let symbols = capabilities.and_then(|value| value.get("symbols"));
-    let native = capabilities
-        .and_then(|value| value.get("native"))
-        .and_then(Value::as_bool);
-    let symbol_path = symbols
-        .and_then(|value| value.get("symbol_path"))
-        .and_then(Value::as_str)
-        .unwrap_or_default();
-    let image_path = symbols
-        .and_then(|value| value.get("image_path"))
-        .and_then(Value::as_str)
-        .unwrap_or_default();
-    let public_symbols = symbols
-        .and_then(|value| value.get("microsoft_public_symbols"))
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    let binary_path_count = symbols
-        .and_then(|value| value.get("binary_path_count"))
-        .and_then(Value::as_u64)
-        .unwrap_or_default();
-    let module_data_available = module_scope["modules"]["ok"].as_bool() == Some(true)
-        || module_scope["module"]["ok"].as_bool() == Some(true);
-    let pe_diagnostics = &module_scope["pe_diagnostics"];
-    let pe_identity_available = pe_diagnostics["ok"].as_bool() == Some(true)
-        && (pe_diagnostics["parsed_count"].as_u64().unwrap_or_default() > 0
-            || pe_diagnostics["pe"].is_object());
-    let pdb_identity_available = pe_diagnostics["pe"]["codeview"].is_object()
-        || pe_diagnostics["samples"].as_array().is_some_and(|samples| {
-            samples
-                .iter()
-                .any(|sample| sample["pe"]["codeview"].is_object())
-        });
-
-    json!([
-        {
-            "id": "native-replay",
-            "status": if native == Some(true) { "pass" } else { "warn" },
-            "evidence": native,
-            "why_it_matters": "Native replay is required for real module inventories and cursor-backed symbol context."
-        },
-        {
-            "id": "symbol-path",
-            "status": if symbol_path.is_empty() { "warn" } else { "pass" },
-            "evidence": symbol_path,
-            "why_it_matters": "DbgHelp/SymSrv need a symbol path before public or private PDBs can be found."
-        },
-        {
-            "id": "microsoft-public-symbols",
-            "status": if public_symbols { "pass" } else { "info" },
-            "evidence": public_symbols,
-            "why_it_matters": "Public Microsoft symbols are enough for many Windows module/function names."
-        },
-        {
-            "id": "binary-path",
-            "status": if !image_path.is_empty() || binary_path_count > 0 { "pass" } else { "info" },
-            "evidence": {
-                "image_path": image_path,
-                "binary_path_count": binary_path_count
-            },
-            "why_it_matters": "Local binaries improve stack walking, disassembly, and symbol-server binary fallback workflows."
-        },
-        {
-            "id": "module-data",
-            "status": if module_data_available { "pass" } else { "warn" },
-            "evidence": module_scope,
-            "why_it_matters": "Module identity is the anchor for timestamp/size/PDB/source diagnostics."
-        },
-        {
-            "id": "pe-image-identity",
-            "status": if pe_identity_available { "pass" } else { "info" },
-            "evidence": pe_diagnostics,
-            "why_it_matters": "PE timestamp and SizeOfImage form the symbol-server key for image/binary lookup."
-        },
-        {
-            "id": "pdb-codeview-identity",
-            "status": if pdb_identity_available { "pass" } else { "info" },
-            "evidence": pe_diagnostics,
-            "why_it_matters": "RSDS GUID plus age form the symbol-server key for PDB lookup."
-        },
-        {
-            "id": "source-fidelity",
-            "status": "future",
-            "evidence": "PDB source-file and checksum inspection is not implemented yet.",
-            "why_it_matters": "Source paths should be resolved with trailing-component matching and verified with hashes where available."
-        }
-    ])
+        output,
+    )
+    .await
 }
 
 fn source_resolve(args: SourceResolveArgs) -> anyhow::Result<Value> {
-    let recorded_components = normalized_components(&PathBuf::from(&args.recorded_path));
-    if recorded_components.is_empty() {
-        bail!("recorded source path has no usable path components")
-    }
-    let search_paths = if args.search_paths.is_empty() {
-        vec![std::env::current_dir().context("resolving current directory")?]
-    } else {
-        args.search_paths
-    };
-
-    let mut matches = Vec::new();
-    let recorded_path = PathBuf::from(&args.recorded_path);
-    if recorded_path.exists() {
-        matches.push(source_match_value(
-            &recorded_path,
-            &recorded_components,
-            true,
-        ));
-    }
-
-    for root in &search_paths {
-        collect_source_matches(
-            root,
-            &recorded_components,
-            args.max_candidates,
-            args.max_depth,
-            0,
-            &mut matches,
-        )?;
-    }
-    matches.sort_by(|left, right| {
-        right["matched_components"]
-            .as_u64()
-            .cmp(&left["matched_components"].as_u64())
-            .then_with(|| left["path"].as_str().cmp(&right["path"].as_str()))
-    });
-    matches.dedup_by(|left, right| left["path"] == right["path"]);
-    if matches.len() > args.max_candidates {
-        matches.truncate(args.max_candidates);
-    }
-    let best = matches.first().cloned();
-
-    Ok(json!({
-        "recorded_path": args.recorded_path,
-        "recorded_components": recorded_components,
-        "search_paths": search_paths,
-        "best": best,
-        "matches": matches,
-        "strategy": "Trailing path-component match, preferring the candidate with the longest matching suffix.",
-        "source_hash_verification": "future"
-    }))
+    shared_source_resolve(SourceResolveRequest {
+        recorded_path: args.recorded_path,
+        search_paths: args.search_paths,
+        max_candidates: args.max_candidates,
+        max_depth: args.max_depth,
+    })
 }
 
 async fn architecture_state_and_print(
@@ -3753,215 +2708,19 @@ async fn architecture_state_and_print(
     args: ArchitectureStateArgs,
     output: &OutputOptions,
 ) -> anyhow::Result<()> {
-    let client = DaemonClient::new(pipe);
-    print_value(architecture_state_value(&client, args).await?, output)
-}
-
-async fn architecture_state_value(
-    client: &DaemonClient,
-    args: ArchitectureStateArgs,
-) -> anyhow::Result<Value> {
-    let capabilities = call_status_value(
-        client
-            .call_tool(session_call(
-                "ttd_capabilities",
-                SessionArgs {
-                    session: args.session,
-                },
-            ))
-            .await,
-    );
-    let registers = call_status_value(
-        client
-            .call_tool(cursor_call(
-                "ttd_registers",
-                CursorArgs {
-                    session: args.session,
-                    cursor: args.cursor,
-                },
-            ))
-            .await,
-    );
-    let context = call_status_value(
-        client
-            .call_tool(register_context_call(RegisterContextArgs {
-                session: args.session,
-                cursor: args.cursor,
-                thread_id: args.thread_id,
-            }))
-            .await,
-    );
-    let architecture = context["value"]["architecture"]
-        .as_str()
-        .or_else(|| capabilities["value"]["architecture"].as_str())
-        .unwrap_or("unknown");
-    let x64 = architecture.eq_ignore_ascii_case("x64")
-        || context["value"]["registers"]["rip"].is_u64()
-        || registers["value"]["program_counter"].is_u64();
-
-    Ok(json!({
-        "session_id": args.session,
-        "cursor_id": args.cursor,
-        "thread_id": args.thread_id,
-        "architecture": architecture,
-        "detected": {
-            "x64": x64,
-            "source": if context["ok"].as_bool() == Some(true) { "register_context" } else { "capabilities_or_fallback" }
+    call_and_print(
+        pipe,
+        ToolCall {
+            name: "ttd_architecture_state".into(),
+            arguments: json!({
+                "session_id": args.session,
+                "cursor_id": args.cursor,
+                "thread_id": args.thread_id,
+            }),
         },
-        "supported_helpers": {
-            "compact_registers": registers["ok"],
-            "x64_register_context": x64 && context["ok"].as_bool() == Some(true),
-            "x64_disassembly": x64,
-            "stack_info": true,
-            "peb_teb_helpers": x64
-        },
-        "unsupported_or_partial": [
-            {
-                "architecture": "x86",
-                "status": "not_yet_exposed",
-                "note": "TTD headers can represent multiple architectures, but the current Rust register/disassembly model is x64-first."
-            },
-            {
-                "architecture": "arm64",
-                "status": "not_yet_exposed",
-                "note": "ARM64 register and disassembly models need a separate decoder and typed register schema."
-            }
-        ],
-        "capabilities": capabilities,
-        "registers": registers,
-        "register_context": context,
-        "next_steps": [
-            "Use register-context for full x64 scalar/SIMD state when available.",
-            "Use disasm only when x64_disassembly is true.",
-            "Treat unsupported architectures as explicit gaps instead of retrying x64-only commands."
-        ]
-    }))
-}
-
-fn collect_source_matches(
-    root: &PathBuf,
-    recorded_components: &[String],
-    max_candidates: usize,
-    max_depth: usize,
-    depth: usize,
-    matches: &mut Vec<Value>,
-) -> anyhow::Result<()> {
-    if matches.len() >= max_candidates || depth > max_depth || !root.exists() {
-        return Ok(());
-    }
-    let metadata = match fs::metadata(root) {
-        Ok(metadata) => metadata,
-        Err(error) => {
-            matches.push(json!({
-                "path": root,
-                "error": error.to_string()
-            }));
-            return Ok(());
-        }
-    };
-    if metadata.is_file() {
-        let matched = matching_suffix_len(&normalized_components(root), recorded_components);
-        if matched > 0 {
-            matches.push(source_match_value(root, recorded_components, false));
-        }
-        return Ok(());
-    }
-    if !metadata.is_dir() {
-        return Ok(());
-    }
-
-    let entries = match fs::read_dir(root) {
-        Ok(entries) => entries,
-        Err(error) => {
-            matches.push(json!({
-                "path": root,
-                "error": error.to_string()
-            }));
-            return Ok(());
-        }
-    };
-    for entry in entries {
-        if matches.len() >= max_candidates {
-            break;
-        }
-        let entry = match entry {
-            Ok(entry) => entry,
-            Err(error) => {
-                matches.push(json!({ "error": error.to_string() }));
-                continue;
-            }
-        };
-        collect_source_matches(
-            &entry.path(),
-            recorded_components,
-            max_candidates,
-            max_depth,
-            depth + 1,
-            matches,
-        )?;
-    }
-    Ok(())
-}
-
-fn source_match_value(path: &PathBuf, recorded_components: &[String], direct: bool) -> Value {
-    let candidate_components = normalized_components(path);
-    let matched_components = matching_suffix_len(&candidate_components, recorded_components);
-    json!({
-        "path": path,
-        "direct": direct,
-        "matched_components": matched_components,
-        "candidate_components": candidate_components,
-    })
-}
-
-fn matching_suffix_len(candidate: &[String], recorded: &[String]) -> usize {
-    candidate
-        .iter()
-        .rev()
-        .zip(recorded.iter().rev())
-        .take_while(|(candidate, recorded)| candidate == recorded)
-        .count()
-}
-
-fn normalized_components(path: &Path) -> Vec<String> {
-    path.components()
-        .filter_map(|component| match component {
-            std::path::Component::Normal(value) => {
-                Some(value.to_string_lossy().to_ascii_lowercase())
-            }
-            _ => None,
-        })
-        .collect()
-}
-
-fn select_snapshot_handles(sessions: &Value, args: ContextSnapshotArgs) -> anyhow::Result<Value> {
-    if args.cursor.is_some() && args.session.is_none() {
-        bail!("context snapshot requires --session when --cursor is supplied")
-    }
-    let session_id = args.session.or_else(|| {
-        sessions["sessions"]
-            .as_array()
-            .and_then(|items| items.first())
-            .and_then(|session| session["session_id"].as_u64())
-    });
-    let cursor_id = args.cursor.or_else(|| {
-        let session_id = session_id?;
-        sessions["sessions"].as_array()?.iter().find_map(|session| {
-            (session["session_id"].as_u64() == Some(session_id))
-                .then(|| {
-                    session["cursors"]
-                        .as_array()
-                        .and_then(|cursors| cursors.first())
-                        .and_then(|cursor| cursor["cursor_id"].as_u64())
-                })
-                .flatten()
-        })
-    });
-    Ok(json!({
-        "session_id": session_id,
-        "cursor_id": cursor_id,
-        "selection": if args.session.is_some() || args.cursor.is_some() { "explicit" } else { "first_available" }
-    }))
+        output,
+    )
+    .await
 }
 
 fn call_status_value(result: anyhow::Result<Value>) -> Value {
@@ -3971,12 +2730,14 @@ fn call_status_value(result: anyhow::Result<Value>) -> Value {
     }
 }
 
-#[derive(Debug, Clone)]
+#[cfg(test)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum DebugSubject {
     Ttd { session: u64, cursor: Option<u64> },
     Target { target: u64 },
 }
 
+#[cfg(test)]
 fn resolve_debug_subject(
     args: &DebugSubjectArgs,
     require_cursor: bool,
@@ -4002,411 +2763,19 @@ fn resolve_debug_subject(
     }
 }
 
-fn debug_subject_value(subject: &DebugSubject) -> Value {
-    match subject {
-        DebugSubject::Ttd { session, cursor } => json!({
-            "kind": if cursor.is_some() { "ttd_cursor" } else { "ttd_session" },
-            "backend": "ttd_replay",
-            "ids": {
-                "session_id": session,
-                "cursor_id": cursor
-            },
-            "stability": "replayable"
-        }),
-        DebugSubject::Target { target } => json!({
-            "kind": "target",
-            "backend": "dbgeng_target",
-            "ids": {
-                "target_id": target
-            },
-            "stability": "target_state"
-        }),
-    }
-}
-
-pub(super) fn fix_item(
-    description: impl Into<String>,
-    command: Option<impl Into<String>>,
-) -> Value {
-    json!({
-        "description": description.into(),
-        "command": command.map(Into::into)
-    })
-}
-
-pub(super) fn diagnostic_item(
-    id: impl Into<String>,
-    severity: impl Into<String>,
-    summary: impl Into<String>,
-    detail: impl Into<String>,
-    confidence: impl Into<String>,
-    fix: Option<Value>,
-) -> Value {
-    json!({
-        "id": id.into(),
-        "severity": severity.into(),
-        "summary": summary.into(),
-        "detail": detail.into(),
-        "confidence": confidence.into(),
-        "fix": fix
-    })
-}
-
-fn composite_section(
-    started: Instant,
-    result: Value,
-    command: Option<&str>,
-    limit: Option<usize>,
-) -> Value {
-    let ok = result["ok"].as_bool().unwrap_or(false);
-    let value = result.get("value").cloned().unwrap_or(Value::Null);
-    let returned = estimate_returned(&value);
-    let diagnostics = if ok {
-        Vec::new()
-    } else {
-        vec![diagnostic_item(
-            "debug.section.error",
-            "warning",
-            "Snapshot section failed.",
-            result["error"].as_str().unwrap_or("unknown error"),
-            "high",
-            None,
-        )]
-    };
-    json!({
-        "status": if ok { "ok" } else { "error" },
-        "duration_ms": started.elapsed().as_millis(),
-        "truncated": limit.zip(returned).is_some_and(|(limit, returned)| returned >= limit),
-        "returned": returned,
-        "limit": limit,
-        "value": if ok { value } else { Value::Null },
-        "error": if ok { Value::Null } else { result["error"].clone() },
-        "diagnostics": diagnostics,
-        "command": command
-    })
-}
-
-fn add_legacy_section(
-    sections: &mut Map<String, Value>,
-    name: &str,
-    legacy: &Value,
-    command: &str,
-) {
-    if let Some(value) = legacy.get(name) {
-        let ok = value["ok"].as_bool().unwrap_or(!value.is_null());
-        sections.insert(
-            name.to_string(),
-            json!({
-                "status": if ok { "ok" } else { "error" },
-                "duration_ms": Value::Null,
-                "truncated": value["value"]["truncated"].as_bool().unwrap_or(false),
-                "returned": estimate_returned(value.get("value").unwrap_or(value)),
-                "limit": Value::Null,
-                "value": value.get("value").cloned().unwrap_or_else(|| value.clone()),
-                "error": if ok { Value::Null } else { value["error"].clone() },
-                "diagnostics": [],
-                "command": command
-            }),
-        );
-    }
-}
-
-fn estimate_returned(value: &Value) -> Option<usize> {
-    if let Some(returned) = value.get("returned").and_then(Value::as_u64) {
-        return Some(returned as usize);
-    }
-    if let Some(array) = value.as_array() {
-        return Some(array.len());
-    }
-    if let Some(object) = value.as_object() {
-        for key in [
-            "frames",
-            "modules",
-            "threads",
-            "breakpoints",
-            "events",
-            "instructions",
-            "exports",
-            "strings",
-        ] {
-            if let Some(array) = object.get(key).and_then(Value::as_array) {
-                return Some(array.len());
-            }
-        }
-    }
-    None
-}
-
-fn snapshot_section_enabled(args: &DebugSnapshotArgs, name: &str) -> bool {
-    (args.include.is_empty() || args.include.iter().any(|item| item == name))
-        && !args.exclude.iter().any(|item| item == name)
-}
-
-fn filter_sections(sections: &mut Map<String, Value>, include: &[String], exclude: &[String]) {
-    if !include.is_empty() {
-        sections.retain(|name, _| include.iter().any(|item| item == name));
-    }
-    if !exclude.is_empty() {
-        sections.retain(|name, _| !exclude.iter().any(|item| item == name));
-    }
-}
-
-fn safe_command_taxonomy() -> Value {
-    json!({
-        "safe": "Read-only commands that inspect local state, debugger state, or generate command lines.",
-        "mutating": "Commands that alter cursor position, target execution, breakpoints, or write dumps.",
-        "destructive": "Commands that terminate, close, cancel, or otherwise end target/debugger resources."
-    })
-}
-
-async fn symbol_source_doctor_value(
-    client: &DaemonClient,
-    subject: &DebugSubject,
-    address: Option<u64>,
-) -> Value {
-    match subject {
-        DebugSubject::Ttd { session, cursor } => {
-            let nearest = if let (Some(cursor), Some(address)) = (cursor, address) {
-                call_status_value(
-                    nearest_symbol_value(
-                        client,
-                        &SymbolNearestArgs {
-                            session: *session,
-                            cursor: *cursor,
-                            address: format!("0x{address:X}"),
-                            include_exports: false,
-                        },
-                    )
-                    .await,
-                )
-            } else {
-                json!({
-                    "ok": false,
-                    "error": "Pass --cursor and --address for nearest-symbol/source quality checks."
-                })
-            };
-            json!({
-                "status": "ok",
-                "duration_ms": Value::Null,
-                "truncated": false,
-                "value": {
-                    "trace_info": call_status_value(client.call_tool(session_call("ttd_trace_info", SessionArgs { session: *session })).await),
-                    "nearest_symbol": nearest
-                },
-                "diagnostics": [
-                    diagnostic_item(
-                        "symbols.source.follow_up",
-                        "info",
-                        "Use focused symbol/source commands for deeper diagnosis.",
-                        "This doctor composes currently available trace and nearest-symbol checks.",
-                        "high",
-                        Some(fix_item(
-                            "Run symbols diagnose or symbols nearest with the current address.",
-                            Some("windbg-tool symbols diagnose --session <id>")
-                        ))
-                    )
-                ],
-                "command": "symbols doctor"
-            })
-        }
-        DebugSubject::Target { target } => {
-            let symbol = if let Some(address) = address {
-                call_status_value(
-                    client
-                        .call_tool(
-                            target_address_call(
-                                "target_symbol_by_offset",
-                                TargetAddressArgs {
-                                    target: *target,
-                                    address: format!("0x{address:X}"),
-                                },
-                            )
-                            .expect("address was formatted as hex"),
-                        )
-                        .await,
-                )
-            } else {
-                json!({ "ok": false, "error": "Pass --address for target symbol/source checks." })
-            };
-            let source = if let Some(address) = address {
-                call_status_value(
-                    client
-                        .call_tool(
-                            target_address_call(
-                                "target_source_by_offset",
-                                TargetAddressArgs {
-                                    target: *target,
-                                    address: format!("0x{address:X}"),
-                                },
-                            )
-                            .expect("address was formatted as hex"),
-                        )
-                        .await,
-                )
-            } else {
-                json!({ "ok": false, "error": "Pass --address for target source checks." })
-            };
-            json!({
-                "status": "ok",
-                "duration_ms": Value::Null,
-                "truncated": false,
-                "value": {
-                    "symbol": symbol,
-                    "source": source
-                },
-                "diagnostics": [
-                    diagnostic_item(
-                        "symbols.source.address_optional",
-                        "info",
-                        "Current-PC symbol/source checks need an address when registers do not expose one.",
-                        "Pass --address or use debug snapshot disassembly to identify a program counter.",
-                        "medium",
-                        Some(fix_item(
-                            "Run target registers or target disasm, then pass --address.",
-                            Some("windbg-tool symbols doctor --target <id> --address <pc>")
-                        ))
-                    )
-                ],
-                "command": "symbols doctor"
-            })
-        }
-    }
-}
-
-fn triage_value(kind: &'static str, snapshot: Value) -> Value {
-    let mut hypotheses = Vec::new();
-    let diagnostics = snapshot["diagnostics"].clone();
-    match kind {
-        "symbol_health" => hypotheses.push(json!({
-            "id": "symbol_health.requires_review",
-            "confidence": "medium",
-            "summary": "Review symbol_source and nearest_symbol evidence before trusting names or source paths.",
-            "supporting_sections": ["symbol_source", "nearest_symbol"]
-        })),
-        "loader" => hypotheses.push(json!({
-            "id": "loader.module_review",
-            "confidence": "medium",
-            "summary": "Review module paths, duplicate module names, and recently loaded modules for loader anomalies.",
-            "supporting_sections": ["modules", "timeline_summary"]
-        })),
-        "deadlock" | "hang" => hypotheses.push(json!({
-            "id": "hang.stack_threads_review",
-            "confidence": "low",
-            "summary": "Thread and stack evidence can identify waits, but this command does not yet prove lock ownership.",
-            "supporting_sections": ["threads", "stack"]
-        })),
-        "access_violation" | "crash" => hypotheses.push(json!({
-            "id": "crash.exception_stack_review",
-            "confidence": "medium",
-            "summary": "Inspect exception/timeline, current disassembly, stack, and symbol quality before assigning root cause.",
-            "supporting_sections": ["timeline_summary", "current_disassembly", "stack", "symbol_source"]
-        })),
-        "memory_corruption" => hypotheses.push(json!({
-            "id": "memory_corruption.needs_watchpoint",
-            "confidence": "low",
-            "summary": "Snapshot evidence can identify suspicious pointers or stacks; use watchpoint planning before replaying or mutating.",
-            "supporting_sections": ["stack", "modules", "disassembly"]
-        })),
-        _ => {}
-    }
-    json!({
-        "schema_version": 1,
-        "kind": kind,
-        "evidence": {
-            "snapshot": snapshot
-        },
-        "hypotheses": hypotheses,
-        "diagnostics": diagnostics,
-        "next_actions": [
-            { "safety": "safe", "command": "windbg-tool debug snapshot", "reason": "Refresh bounded evidence." },
-            { "safety": "safe", "command": "windbg-tool symbols doctor", "reason": "Validate symbol/source quality." },
-            { "safety": "safe", "command": "windbg-tool breakpoint plan", "reason": "Plan breakpoints/watchpoints before mutating the target." }
-        ],
-        "limitations": [
-            "Triage commands report evidence and hypotheses, not final root-cause verdicts.",
-            "Backend support varies; inspect debug capabilities for unsupported operations."
-        ]
-    })
-}
-
 fn breakpoint_plan_value(args: BreakpointPlanArgs) -> anyhow::Result<Value> {
-    let subject = resolve_debug_subject(&args.subject, false)?
-        .context("breakpoint plan requires --target or --session/--cursor")?;
-    if args.address.is_none() && args.symbol.is_none() {
-        bail!("breakpoint plan requires --address or --symbol");
-    }
-    let address = args
-        .address
-        .as_deref()
-        .map(parse_u64_argument)
-        .transpose()?;
-    let kind = args.kind.as_str();
-    let subject_value = debug_subject_value(&subject);
-    let (supported, command, reason, safety) = match (&subject, kind) {
-        (DebugSubject::Target { target }, "code") => (
-            args.address.is_some(),
-            json!(["windbg-tool", "breakpoint", "set", "--target", target, "--address", args.address.clone().unwrap_or_else(|| "<address>".to_string())]),
-            if args.symbol.is_some() {
-                "Symbol breakpoint setting is not first-class yet; resolve the symbol to an address first."
-            } else {
-                "DbgEng live targets support code breakpoints by address."
-            },
-            "mutating",
-        ),
-        (DebugSubject::Target { .. }, _) => (
-            false,
-            Value::Null,
-            "Data watchpoints are not currently exposed for daemon-owned live targets.",
-            "unsupported",
-        ),
-        (DebugSubject::Ttd { session, cursor }, "write" | "read" | "read_write") => (
-            args.address.is_some() && cursor.is_some(),
-            json!(["windbg-tool", "replay", "watch-memory", "--session", session, "--cursor", cursor, "--address", args.address.clone().unwrap_or_else(|| "<address>".to_string()), "--size", args.size.unwrap_or(1), "--access", kind, "--direction", args.direction.clone().unwrap_or_else(|| "previous".to_string())]),
-            "TTD memory watchpoints replay to the next or previous matching access.",
-            "bounded_replay",
-        ),
-        (DebugSubject::Ttd { .. }, "code" | "execute") => (
-            false,
-            Value::Null,
-            "TTD code breakpoints are not exposed as persistent breakpoints; use position/disassembly/replay commands instead.",
-            "unsupported",
-        ),
-        _ => (
-            false,
-            Value::Null,
-            "Requested breakpoint/watchpoint kind is not supported on this subject.",
-            "unsupported",
-        ),
-    };
-    Ok(json!({
-        "schema_version": 1,
-        "subject": subject_value,
-        "request": {
-            "address": address.map(|value| format!("0x{value:X}")),
-            "symbol": args.symbol,
-            "module": args.module,
-            "kind": kind,
-            "size": args.size,
-            "direction": args.direction,
-            "thread_unique_id": args.thread_unique_id
-        },
-        "supported": supported,
-        "safety": safety,
-        "reason": reason,
-        "command": command,
-        "diagnostics": if supported {
-            Vec::<Value>::new()
-        } else {
-            vec![diagnostic_item(
-                "breakpoint.plan.unsupported",
-                "warning",
-                "Requested plan is not directly supported.",
-                reason,
-                "high",
-                None,
-            )]
-        }
-    }))
+    shared_breakpoint_plan(BreakpointPlanRequest {
+        session_id: args.subject.session,
+        cursor_id: args.subject.cursor,
+        target_id: args.subject.target,
+        address: args.address,
+        symbol: args.symbol,
+        module: args.module,
+        kind: args.kind,
+        size: args.size,
+        direction: args.direction,
+        thread_unique_id: args.thread_unique_id,
+    })
 }
 
 fn action_log_path_from_env() -> Option<PathBuf> {
@@ -4537,43 +2906,10 @@ fn option_takes_value(arg: &str) -> bool {
 }
 
 fn debug_log_summary_value(args: DebugLogSummarizeArgs) -> anyhow::Result<Value> {
-    let path = args
-        .path
-        .or_else(action_log_path_from_env)
-        .context("debug log summarize requires --path or WINDBG_TOOL_ACTION_LOG")?;
-    let file =
-        fs::File::open(&path).with_context(|| format!("opening action log {}", path.display()))?;
-    let reader = BufReader::new(file);
-    let mut entries = Vec::new();
-    let mut malformed = 0_usize;
-    for line in reader.lines() {
-        let line = line.with_context(|| format!("reading action log {}", path.display()))?;
-        if line.trim().is_empty() {
-            continue;
-        }
-        match serde_json::from_str::<Value>(&line) {
-            Ok(value) => entries.push(value),
-            Err(_) => malformed += 1,
-        }
-    }
-    let total = entries.len();
-    let failed = entries
-        .iter()
-        .filter(|entry| !entry["ok"].as_bool().unwrap_or(false))
-        .count();
-    let mut recent = entries.into_iter().rev().take(args.max).collect::<Vec<_>>();
-    recent.reverse();
-    Ok(json!({
-        "schema_version": 1,
-        "path": path,
-        "total_entries": total,
-        "malformed_entries": malformed,
-        "failed_entries": failed,
-        "returned": recent.len(),
-        "limit": args.max,
-        "truncated": total > recent.len(),
-        "recent": recent
-    }))
+    shared_debug_log_summarize(DebugLogSummarizeRequest {
+        path: args.path,
+        max: args.max,
+    })
 }
 
 async fn call_and_print(
@@ -5092,36 +3428,11 @@ fn discover_manifest() -> Value {
 }
 
 fn recipes_value(args: RecipeArgs) -> anyhow::Result<Value> {
-    let recipes = recipes_manifest();
-    let Some(topic) = args.topic else {
-        return Ok(json!({
-            "recipes": recipes,
-            "usage": "windbg-tool recipes <id-or-tag>",
-        }));
-    };
-    let topic = topic.to_ascii_lowercase();
-    let matches = recipes
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter(|recipe| recipe_matches_topic(recipe, &topic))
-        .cloned()
-        .collect::<Vec<_>>();
-    if matches.is_empty() {
-        bail!("unknown recipe topic: {topic}")
+    let mut value = shared_recipes_value(args.topic.as_deref())?;
+    if args.topic.is_none() {
+        value["usage"] = json!("windbg-tool recipes <id-or-tag>");
     }
-    Ok(json!({ "recipes": matches }))
-}
-
-fn recipe_matches_topic(recipe: &Value, topic: &str) -> bool {
-    recipe["id"]
-        .as_str()
-        .is_some_and(|id| id.eq_ignore_ascii_case(topic))
-        || recipe["tags"].as_array().is_some_and(|tags| {
-            tags.iter()
-                .filter_map(Value::as_str)
-                .any(|tag| tag.eq_ignore_ascii_case(topic))
-        })
+    Ok(value)
 }
 
 fn diagnostic_guidance() -> Value {
@@ -5152,181 +3463,20 @@ fn diagnostic_guidance() -> Value {
     })
 }
 
-fn recipes_manifest() -> Value {
-    json!([
-        {
-            "id": "diagnostic-technique",
-            "title": "Choose the lightest diagnostic technique that can answer the question",
-            "source_posts": ["why-you-should-printf", "first-post"],
-            "tags": ["advisor", "logs", "tracing", "dump", "ttd", "live-debugging"],
-            "problem": "The user has a symptom but has not chosen whether to use logs, dumps, live debugging, TTD, or remote debugging.",
-            "guidance": [
-                "Use logs or tracing first when they already contain enough temporal context.",
-                "Use dumps when there is a crash/hang anchor point and state-at-time matters most.",
-                "Use TTD when the important question is what changed before the anchor point.",
-                "Use live or remote debugging when the process must be controlled interactively."
-            ],
-            "commands": ["windbg-tool discover", "windbg-tool context snapshot", "windbg-tool recipes crash-triage"]
-        },
-        {
-            "id": "remote-debugging",
-            "title": "Pick NTSD/CDB remote debugging vs DbgSrv process server",
-            "source_posts": ["remote-debugging"],
-            "tags": ["remote", "dbgeng", "dbgsrv", "ntsd", "cdb", "windbg"],
-            "problem": "An agent needs to debug a target on another machine or in a sensitive desktop/session.",
-            "guidance": [
-                "Use NTSD/CDB -server when debugger brains, symbols, and extensions should live on the target and latency matters.",
-                "Use DbgSrv when the target should stay minimal and symbols/extensions should stay on the host.",
-                "Use WinDbg -remote for an existing NTSD/CDB remote session.",
-                "Use WinDbg -premote for a DbgSrv process server that will launch or attach from the host side."
-            ],
-            "commands": [
-                "windbg-tool dbgeng server --transport tcp:port=5005",
-                "windbg-tool windbg run -- -premote tcp:port=5005,server=<target>",
-                "windbg-tool recipes remote-debugging"
-            ]
-        },
-        {
-            "id": "crash-triage",
-            "title": "Summarize a crash or end-of-trace state",
-            "source_posts": ["writing-a-debugger-from-scratch-part-1", "writing-a-debugger-from-scratch-part-2", "debugger-lies-part-1"],
-            "tags": ["crash", "triage", "exception", "stack", "registers"],
-            "problem": "A trace/session is loaded and the agent needs the first actionable summary.",
-            "guidance": [
-                "Capture trace info, capabilities, current position, active thread state, registers, stack info, modules, and exceptions.",
-                "Treat stack output as evidence, not truth; corrupted stacks can hide callers.",
-                "If native replay is unavailable, stop before requesting native-only register/memory commands."
-            ],
-            "commands": [
-                "windbg-tool context snapshot --session <id> --cursor <id>",
-                "windbg-tool exceptions --session <id>",
-                "windbg-tool registers --session <id> --cursor <id>",
-                "windbg-tool stack info --session <id> --cursor <id>"
-            ]
-        },
-        {
-            "id": "stack-corruption",
-            "title": "Find what overwrote a return address in TTD",
-            "source_posts": ["debugger-lies-part-1", "writing-a-debugger-from-scratch-part-5", "writing-a-debugger-from-scratch-part-6"],
-            "tags": ["ttd", "stack", "corruption", "watchpoint", "memory"],
-            "problem": "The stack looks truncated, impossible, or corrupted near a crash.",
-            "guidance": [
-                "At the crashing position, identify the suspicious frame and return-address slot.",
-                "Seek backward to the function entry if possible.",
-                "Use a write watchpoint on the return-address slot to find the overwrite.",
-                "Record stop position, thread, instruction, and stack bytes around the write."
-            ],
-            "commands": [
-                "windbg-tool stack recover --session <id> --cursor <id> --target-info",
-                "windbg-tool stack backtrace --session <id> --cursor <id> --target-info",
-                "windbg-tool stack read --session <id> --cursor <id> --decode-pointers",
-                "windbg-tool memory watchpoint --session <id> --cursor <id> --address <rsp> --size 8 --access write --direction next",
-                "windbg-tool sweep watch-memory --session <id> --cursor <id> --address <rsp> --size 8 --access write --direction next --max-hits 8"
-            ]
-        },
-        {
-            "id": "symbol-health",
-            "title": "Diagnose symbol and binary availability",
-            "source_posts": ["symbol-indexing", "writing-a-debugger-from-scratch-part-4", "writing-a-debugger-from-scratch-part-8"],
-            "tags": ["symbols", "pdb", "source", "binary", "modules"],
-            "problem": "Names, stacks, source, or disassembly are missing or low fidelity.",
-            "guidance": [
-                "Check module timestamp/checksum/size and CodeView RSDS PDB identity when available.",
-                "Remember symbol servers can serve binaries as well as PDBs; missing binaries can break stack walking.",
-                "Use source path search and source hashes to avoid opening the wrong file."
-            ],
-            "commands": [
-                "windbg-tool symbols diagnose --session <id>",
-                "windbg-tool symbols inspect <path-to-exe-or-dll>",
-                "windbg-tool symbols exports <path-to-exe-or-dll> --filter <name>",
-                "windbg-tool symbols nearest --session <id> --cursor <id> --address <addr>",
-                "windbg-tool source resolve <recorded-path> --search-path <checkout-root>",
-                "windbg-tool modules --session <id>",
-                "windbg-tool module info --session <id> --address <addr>",
-                "windbg-tool schema ttd_module_info"
-            ]
-        },
-        {
-            "id": "memory-provenance",
-            "title": "Classify unknown memory and find where it came from",
-            "source_posts": ["writing-a-debugger-from-scratch-part-3", "recognizing-patterns", "useless-x86-trivia"],
-            "tags": ["memory", "pointers", "strings", "code", "patterns"],
-            "problem": "A byte range is suspicious and needs interpretation.",
-            "guidance": [
-                "Check whether values look like aligned integers, pointers, UTF-16/ASCII strings, code bytes, or high-entropy data.",
-                "Use address classification before assuming a 64-bit value is a pointer, or use memory chase for bounded pointer-chain inspection.",
-                "Use TTD memory provenance and watchpoints to connect a suspicious range to writes over time."
-            ],
-            "commands": [
-                "windbg-tool address --session <id> --cursor <id> --address <addr>",
-                "windbg-tool memory read --session <id> --cursor <id> --address <addr> --size 128",
-                "windbg-tool memory dump --session <id> --cursor <id> --address <addr> --size 128 --format dq",
-                "windbg-tool memory classify --session <id> --cursor <id> --address <addr> --size 128",
-                "windbg-tool memory chase --session <id> --cursor <id> --address <addr> --depth 8 --target-info",
-                "windbg-tool memory range --session <id> --cursor <id> --address <addr>",
-                "windbg-tool memory buffer --session <id> --cursor <id> --address <addr> --size <n>"
-            ]
-        },
-        {
-            "id": "assembly-or-source",
-            "title": "Move between instruction bytes, symbols, and source",
-            "source_posts": ["fakers-guide-to-assembly", "writing-a-debugger-from-scratch-part-7", "writing-a-debugger-from-scratch-part-8"],
-            "tags": ["assembly", "disassembly", "source", "instructions"],
-            "problem": "Source is unavailable, misleading, or insufficient and the agent needs instruction-level truth.",
-            "guidance": [
-                "Prefer Intel syntax for Windows debugger workflows.",
-                "Show instruction bytes, current address, decoded instruction, and nearest symbol together.",
-                "When source exists, map both address-to-source and source-to-address; line mappings are not one-to-one."
-            ],
-            "commands": [
-                "windbg-tool disasm --session <id> --cursor <id>",
-                "windbg-tool u --session <id> --cursor <id> --address <rip> --count 16",
-                "windbg-tool registers --session <id> --cursor <id>",
-                "windbg-tool memory read --session <id> --cursor <id> --address <rip> --size 64"
-            ]
-        },
-        {
-            "id": "com-vtable",
-            "title": "Investigate impossible calls through vtables or COM interfaces",
-            "source_posts": ["vtables"],
-            "tags": ["com", "vtable", "object", "dynamic-type"],
-            "problem": "A call stack or source line appears to call the wrong method.",
-            "guidance": [
-                "Read the object pointer, then read the first pointer-sized field as the vtable pointer.",
-                "Resolve vtable entries to symbols and confirm they live in an expected loaded image.",
-                "Suspect interface layout mismatches when method ordinals point to unrelated symbols."
-            ],
-            "commands": [
-                "windbg-tool object vtable --session <id> --cursor <id> --address <object>",
-                "windbg-tool memory read --session <id> --cursor <id> --address <object> --size 8",
-                "windbg-tool address --session <id> --cursor <id> --address <vtable>",
-                "windbg-tool memory read --session <id> --cursor <id> --address <vtable> --size 64"
-            ]
-        },
-        {
-            "id": "injection-analysis",
-            "title": "Analyze injection-like symptoms without automating injection",
-            "source_posts": ["run-my-code"],
-            "tags": ["injection", "modules", "memory-protection", "safety"],
-            "problem": "A process may have unexpected code, DLLs, hooks, or executable memory.",
-            "guidance": [
-                "Do not use windbg-tool to inject arbitrary code.",
-                "Inventory modules, DLL search-order clues, and executable memory regions.",
-                "Classify unbacked executable memory and unexpected loaded modules as evidence for further review."
-            ],
-            "commands": [
-                "windbg-tool modules --session <id>",
-                "windbg-tool module audit --session <id>",
-                "windbg-tool module search-order suspicious.dll --app-dir <app-dir>",
-                "windbg-tool memory range --session <id> --cursor <id> --address <addr>",
-                "windbg-tool address --session <id> --cursor <id> --address <addr>"
-            ]
-        }
-    ])
-}
-
 fn tool_command_map() -> Value {
     json!([
+        { "tool": "discover", "commands": ["discover"] },
+        { "tool": "recipes_list", "commands": ["recipes"] },
+        { "tool": "recipes_get", "commands": ["recipes <topic>"] },
+        { "tool": "debug_capabilities", "commands": ["debug capabilities"] },
+        { "tool": "daemon_health", "commands": ["daemon status"] },
+        { "tool": "session_list", "commands": ["sessions"] },
+        { "tool": "ttd_open", "commands": ["open"] },
+        { "tool": "ttd_context_snapshot", "commands": ["context snapshot"] },
+        { "tool": "debug_snapshot", "commands": ["debug snapshot"] },
+        { "tool": "triage_run", "commands": ["triage crash", "triage hang", "triage access-violation", "triage memory-corruption", "triage loader", "triage symbol-health", "triage deadlock"] },
+        { "tool": "daemon_health", "commands": ["daemon status", "daemon ensure"] },
+        { "tool": "session_list", "commands": ["sessions"] },
         { "tool": "ttd_load_trace", "commands": ["load", "open"] },
         { "tool": "ttd_trace_list", "commands": ["trace list", "trace-list"] },
         { "tool": "ttd_close_trace", "commands": ["close"] },
@@ -5353,11 +3503,32 @@ fn tool_command_map() -> Value {
         { "tool": "ttd_register_context", "commands": ["register-context", "ctx"] },
         { "tool": "ttd_stack_info", "commands": ["stack info"] },
         { "tool": "ttd_stack_read", "commands": ["stack read"] },
-        { "tool": "ttd_command_line", "commands": ["command-line", "cmdline"] },
-        { "tool": "ttd_read_memory", "commands": ["memory read", "memory dump", "memory strings", "memory dps", "memory classify", "memory chase"] },
-        { "tool": "ttd_memory_range", "commands": ["memory range"] },
-        { "tool": "ttd_memory_buffer", "commands": ["memory buffer"] },
-        { "tool": "ttd_memory_watchpoint", "commands": ["memory watchpoint", "watchpoint"] },
+                { "tool": "ttd_stack_recover", "commands": ["stack recover"] },
+                { "tool": "ttd_stack_backtrace", "commands": ["stack backtrace"] },
+                { "tool": "ttd_command_line", "commands": ["command-line", "cmdline"] },
+                { "tool": "ttd_read_memory", "commands": ["memory read"] },
+                { "tool": "ttd_memory_dump", "commands": ["memory dump"] },
+                { "tool": "ttd_memory_classify", "commands": ["memory classify"] },
+                { "tool": "ttd_memory_strings", "commands": ["memory strings"] },
+                { "tool": "ttd_memory_dps", "commands": ["memory dps"] },
+                { "tool": "ttd_memory_chase", "commands": ["memory chase"] },
+                { "tool": "ttd_disassemble", "commands": ["disasm", "u"] },
+                { "tool": "ttd_timeline_events", "commands": ["timeline events"] },
+                { "tool": "ttd_exception_focus", "commands": ["exception focus"] },
+                { "tool": "ttd_architecture_state", "commands": ["architecture state"] },
+                { "tool": "ttd_module_audit", "commands": ["module audit"] },
+                { "tool": "ttd_object_vtable", "commands": ["object vtable"] },
+                { "tool": "module_search_order", "commands": ["module search-order"] },
+                { "tool": "source_resolve", "commands": ["source resolve"] },
+                { "tool": "breakpoint_plan", "commands": ["breakpoint plan"] },
+                { "tool": "pe_inspect", "commands": ["symbols inspect"] },
+                { "tool": "pe_exports", "commands": ["symbols exports"] },
+                { "tool": "ttd_symbols_nearest", "commands": ["symbols nearest"] },
+                { "tool": "symbols_diagnose", "commands": ["symbols diagnose"] },
+                { "tool": "symbols_doctor", "commands": ["symbols doctor"] },
+                { "tool": "ttd_memory_range", "commands": ["memory range"] },
+                { "tool": "ttd_memory_buffer", "commands": ["memory buffer"] },
+                { "tool": "ttd_memory_watchpoint", "commands": ["memory watchpoint", "watchpoint"] },
         { "tool": "live_launch_session", "commands": ["live start"] },
         { "tool": "live_attach_process", "commands": ["live attach"] },
         { "tool": "dump_open_session", "commands": ["dump open"] },
@@ -5391,7 +3562,26 @@ fn tool_command_map() -> Value {
         { "tool": "target_set_breakpoint_enabled", "commands": ["breakpoint enable", "breakpoint disable"] },
         { "tool": "target_remove_breakpoint", "commands": ["breakpoint remove"] },
         { "tool": "target_evaluate_expression", "commands": ["datamodel eval"] },
+        { "tool": "ttd_watch_memory_sweep", "commands": ["sweep watch-memory"] },
         { "tool": "job_start_watch_memory_sweep", "commands": ["sweep watch-memory --background"] },
+        { "tool": "ttd_replay_to", "commands": ["replay to"] },
+        { "tool": "dump_inspect", "commands": ["dump inspect"] },
+        { "tool": "dump_triage", "commands": ["dump triage"] },
+        { "tool": "dump_pool_triage", "commands": ["dump pool-triage"] },
+        { "tool": "remote_explain", "commands": ["remote explain"] },
+        { "tool": "remote_server_command", "commands": ["remote server-command"] },
+        { "tool": "remote_connect_command", "commands": ["remote connect-command"] },
+        { "tool": "remote_doctor", "commands": ["remote doctor"] },
+        { "tool": "remote_status", "commands": ["remote status"] },
+        { "tool": "remote_plan", "commands": ["remote plan"] },
+        { "tool": "debug_log_summarize", "commands": ["debug log summarize"] },
+        { "tool": "target_disassemble_analysis", "commands": ["target analysis disasm"] },
+        { "tool": "target_memory_dump", "commands": ["target analysis memory-dump"] },
+        { "tool": "target_memory_classify", "commands": ["target analysis memory-classify"] },
+        { "tool": "target_memory_strings", "commands": ["target analysis memory-strings"] },
+        { "tool": "target_memory_dps", "commands": ["target analysis memory-dps"] },
+        { "tool": "target_memory_chase", "commands": ["target analysis memory-chase"] },
+        { "tool": "target_stack_recover", "commands": ["target analysis stack-recover"] },
         { "tool": "job_list", "commands": ["job list"] },
         { "tool": "job_status", "commands": ["job status"] },
         { "tool": "job_result", "commands": ["job result"] },
@@ -6249,49 +4439,19 @@ async fn module_audit_and_print(
     args: ModuleAuditArgs,
     output: &OutputOptions,
 ) -> anyhow::Result<()> {
-    ensure!(
-        args.max_suspicious <= 10_000,
-        "module audit --max-suspicious must not exceed 10000"
-    );
-    let client = DaemonClient::new(pipe);
-    let modules = if let Some(cursor) = args.cursor {
-        client
-            .call_tool(cursor_call(
-                "ttd_cursor_modules",
-                CursorArgs {
-                    session: args.session,
-                    cursor,
-                },
-            ))
-            .await?
-    } else {
-        client
-            .call_tool(session_call(
-                "ttd_list_modules",
-                SessionArgs {
-                    session: args.session,
-                },
-            ))
-            .await?
-    };
-    let module_items = modules["modules"]
-        .as_array()
-        .context("module list response did not include modules")?;
-    print_value(
-        json!({
-            "session_id": args.session,
-            "cursor_id": args.cursor,
-            "source": if args.cursor.is_some() { "cursor_modules" } else { "trace_modules" },
-            "module_count": module_items.len(),
-            "audit": audit_modules(module_items, args.max_suspicious),
-            "modules": modules,
-            "notes": [
-                "This is read-only triage based on module paths and load inventory.",
-                "Suspicious paths are evidence for review, not proof of injection."
-            ]
-        }),
+    call_and_print(
+        pipe,
+        ToolCall {
+            name: "ttd_module_audit".into(),
+            arguments: json!({
+                "session_id": args.session,
+                "cursor_id": args.cursor,
+                "max_suspicious": args.max_suspicious,
+            }),
+        },
         output,
     )
+    .await
 }
 
 async fn timeline_events_and_print(
@@ -6299,212 +4459,39 @@ async fn timeline_events_and_print(
     args: TimelineEventsArgs,
     output: &OutputOptions,
 ) -> anyhow::Result<()> {
-    let client = DaemonClient::new(pipe);
-    print_value(timeline_events_value(&client, &args).await?, output)
+    print_value(
+        timeline_events_value(&DaemonClient::new(pipe), &args).await?,
+        output,
+    )
 }
 
 async fn timeline_events_value(
     client: &DaemonClient,
     args: &TimelineEventsArgs,
 ) -> anyhow::Result<Value> {
-    ensure!(
-        args.max_events <= 100_000,
-        "timeline events --max-events must not exceed 100000"
-    );
-    let include = |kind: &str| args.kind == "all" || args.kind == kind;
-    let mut events = Vec::new();
-    let mut sources = Map::new();
-
-    if include("modules") {
-        let value = call_status_value(
-            client
-                .call_tool(session_call(
-                    "ttd_module_events",
-                    SessionArgs {
-                        session: args.session,
-                    },
-                ))
-                .await,
-        );
-        collect_timeline_events(&mut events, "module", &value, "events");
-        sources.insert(
-            "modules".to_string(),
-            timeline_source_summary(&value, "events"),
-        );
-    }
-    if include("threads") {
-        let value = call_status_value(
-            client
-                .call_tool(session_call(
-                    "ttd_thread_events",
-                    SessionArgs {
-                        session: args.session,
-                    },
-                ))
-                .await,
-        );
-        collect_timeline_events(&mut events, "thread", &value, "events");
-        sources.insert(
-            "threads".to_string(),
-            timeline_source_summary(&value, "events"),
-        );
-    }
-    if include("exceptions") {
-        let value = call_status_value(
-            client
-                .call_tool(session_call(
-                    "ttd_list_exceptions",
-                    SessionArgs {
-                        session: args.session,
-                    },
-                ))
-                .await,
-        );
-        collect_timeline_events(&mut events, "exception", &value, "exceptions");
-        sources.insert(
-            "exceptions".to_string(),
-            timeline_source_summary(&value, "exceptions"),
-        );
-    }
-    if include("keyframes") {
-        let value = call_status_value(
-            client
-                .call_tool(session_call(
-                    "ttd_list_keyframes",
-                    SessionArgs {
-                        session: args.session,
-                    },
-                ))
-                .await,
-        );
-        collect_keyframe_events(&mut events, &value);
-        sources.insert(
-            "keyframes".to_string(),
-            timeline_source_summary(&value, "keyframes"),
-        );
-    }
-
-    events.sort_by(|left, right| {
-        timeline_sequence(left)
-            .cmp(&timeline_sequence(right))
-            .then_with(|| left["kind"].as_str().cmp(&right["kind"].as_str()))
-    });
-    let total_events = events.len();
-    let mut event_counts = Map::new();
-    for event in &events {
-        if let Some(kind) = event["kind"].as_str() {
-            let count = event_counts
-                .entry(kind.to_string())
-                .or_insert_with(|| Value::from(0_u64));
-            *count = Value::from(count.as_u64().unwrap_or(0) + 1);
-        }
-    }
-    if events.len() > args.max_events {
-        events.truncate(args.max_events);
-    }
-    Ok(json!({
-        "session_id": args.session,
-        "kind": args.kind,
-        "total_events": total_events,
-        "event_counts": event_counts,
-        "max_events": args.max_events,
-        "returned": events.len(),
-        "limit": args.max_events,
-        "truncated": total_events > args.max_events,
-        "events": events,
-        "sources": Value::Object(sources),
-        "unsupported_recording_metadata": [
-            "record clients",
-            "custom events",
-            "activities",
-            "islands",
-            "bounded user-data payload extraction"
-        ],
-        "notes": [
-            "This timeline merges currently exposed trace metadata.",
-            "Sources include only status and item counts; use the corresponding metadata command for full source data.",
-            "Recording-client/custom-event/activity/island metadata requires additional native TTD bridge coverage."
-        ]
-    }))
+    client
+        .call_tool(ToolCall {
+            name: "ttd_timeline_events".into(),
+            arguments: json!({
+                "session_id": args.session,
+                "kind": args.kind,
+                "max_events": args.max_events,
+            }),
+        })
+        .await
 }
 
 fn module_search_order_and_print(
     args: ModuleSearchOrderArgs,
     output: &OutputOptions,
 ) -> anyhow::Result<()> {
-    let dll = normalize_dll_name(&args.dll)?;
-    let current_dir = args
-        .current_dir
-        .unwrap_or(std::env::current_dir().context("resolving current directory")?);
-    let windows_dir = PathBuf::from(
-        std::env::var("WINDIR")
-            .or_else(|_| std::env::var("SystemRoot"))
-            .unwrap_or_else(|_| String::from(r"C:\Windows")),
-    );
-    let system32 = windows_dir.join("System32");
-    let system = windows_dir.join("System");
-    let max_path_dirs = args.max_path_dirs.unwrap_or(64);
-
-    let mut candidates = Vec::new();
-    candidates.push(json!({
-        "order": 0,
-        "kind": "known_dlls",
-        "directory": null,
-        "candidate": null,
-        "exists": null,
-        "risk": "system_controlled",
-        "notes": "KnownDLLs are resolved by the loader before filesystem probing when the name is registered."
-    }));
-    let mut order = 1usize;
-    if let Some(app_dir) = args.app_dir {
-        candidates.push(search_candidate(
-            order,
-            "application_directory",
-            &app_dir,
-            &dll,
-        ));
-        order += 1;
-    }
-    for (kind, directory) in [
-        ("system32", system32.as_path()),
-        ("system", system.as_path()),
-        ("windows", windows_dir.as_path()),
-        ("current_directory", current_dir.as_path()),
-    ] {
-        candidates.push(search_candidate(order, kind, directory, &dll));
-        order += 1;
-    }
-    let path_dirs = std::env::var_os("PATH")
-        .map(|value| {
-            std::env::split_paths(&value)
-                .take(max_path_dirs)
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-    for directory in &path_dirs {
-        candidates.push(search_candidate(order, "path_directory", directory, &dll));
-        order += 1;
-    }
-    let risky_candidates = candidates
-        .iter()
-        .filter(|candidate| candidate["risk"] != "system_controlled")
-        .count();
     print_value(
-        json!({
-            "dll": dll,
-            "candidate_count": candidates.len(),
-            "path_dirs_included": path_dirs.len(),
-            "path_dirs_truncated": std::env::var_os("PATH")
-                .map(|value| std::env::split_paths(&value).count() > path_dirs.len())
-                .unwrap_or(false),
-            "risky_candidate_count": risky_candidates,
-            "candidates": candidates,
-            "notes": [
-                "This is a diagnostic model for common user-mode DLL search-order reasoning, not a loader trace.",
-                "SafeDllSearchMode, package identity, API sets, manifests, KnownDLLs, SetDllDirectory/AddDllDirectory, and LoadLibrary flags can change real behavior.",
-                "Prefer absolute paths or application-local signed dependencies when diagnosing DLL search-order issues."
-            ]
-        }),
+        shared_module_search_order(ModuleSearchOrderRequest {
+            dll: args.dll,
+            app_dir: args.app_dir,
+            current_dir: args.current_dir,
+            max_path_dirs: args.max_path_dirs,
+        })?,
         output,
     )
 }
@@ -6609,38 +4596,20 @@ async fn replay_to_and_print(
     args: ReplayToArgs,
     output: &OutputOptions,
 ) -> anyhow::Result<()> {
-    let client = DaemonClient::new(pipe);
-    let before = call_status_value(
-        client
-            .call_tool(cursor_call(
-                "ttd_position_get",
-                CursorArgs {
-                    session: args.session,
-                    cursor: args.cursor,
-                },
-            ))
-            .await,
-    );
-    let after = client
-        .call_tool(position_set_call(PositionSetArgs {
-            session: args.session,
-            cursor: args.cursor,
-            position: args.position.clone(),
-            thread_unique_id: args.thread_unique_id,
-        })?)
-        .await?;
-    print_value(
-        json!({
-            "session_id": args.session,
-            "cursor_id": args.cursor,
-            "requested_position": args.position,
-            "thread_unique_id": args.thread_unique_id,
-            "before": before,
-            "after": after,
-            "method": if args.thread_unique_id.is_some() { "set_position_on_thread" } else { "set_position" }
-        }),
+    call_and_print(
+        pipe,
+        ToolCall {
+            name: "ttd_replay_to".into(),
+            arguments: json!({
+                "session_id": args.session,
+                "cursor_id": args.cursor,
+                "position": parse_position_argument(&args.position)?,
+                "thread_unique_id": args.thread_unique_id,
+            }),
+        },
         output,
     )
+    .await
 }
 
 async fn exception_focus_and_print(
@@ -6648,84 +4617,19 @@ async fn exception_focus_and_print(
     args: ExceptionFocusArgs,
     output: &OutputOptions,
 ) -> anyhow::Result<()> {
-    let client = DaemonClient::new(pipe);
-    let exceptions = client
-        .call_tool(session_call(
-            "ttd_list_exceptions",
-            SessionArgs {
-                session: args.session,
-            },
-        ))
-        .await?;
-    let exception_items = exceptions
-        .as_array()
-        .context("ttd_list_exceptions response did not include an exception array")?;
-    let exception = exception_items.get(args.index).cloned().with_context(|| {
-        format!(
-            "exception index {} is outside the {} recorded exception events",
-            args.index,
-            exception_items.len()
-        )
-    })?;
-    let requested_position = exception["position"].clone();
-    let requested_position_hex = position_hex_text(&requested_position)?;
-    let thread_unique_id = exception["thread_unique_id"].as_u64();
-    let after = client
-        .call_tool(exception_focus_call(args.session, args.cursor, &exception)?)
-        .await?;
-    let exception_code_hex = exception["code"]
-        .as_u64()
-        .map(|code| format!("0x{code:08X}"));
-
-    print_value(
-        json!({
-            "session_id": args.session,
-            "cursor_id": args.cursor,
-            "exception_index": args.index,
-            "exception": exception,
-            "exception_code_hex": exception_code_hex,
-            "requested_position": requested_position,
-            "requested_position_hex": requested_position_hex,
-            "thread_unique_id": thread_unique_id,
-            "position": after,
-            "notes": [
-                "This command uses the exception's JSON position directly, avoiding decimal/hexadecimal transcription errors.",
-                "When the trace records an owning thread, the cursor seeks on that TTD thread."
-            ],
-            "next_recommended_safe_commands": [
-                format!("windbg-tool registers --session {} --cursor {}", args.session, args.cursor),
-                format!("windbg-tool stack backtrace --session {} --cursor {}", args.session, args.cursor),
-                format!("windbg-tool disasm --session {} --cursor {}", args.session, args.cursor)
-            ]
-        }),
+    call_and_print(
+        pipe,
+        ToolCall {
+            name: "ttd_exception_focus".into(),
+            arguments: json!({
+                "session_id": args.session,
+                "cursor_id": args.cursor,
+                "index": args.index,
+            }),
+        },
         output,
     )
-}
-
-fn exception_focus_call(session: u64, cursor: u64, exception: &Value) -> anyhow::Result<ToolCall> {
-    let position = exception["position"].clone();
-    position_hex_text(&position)?;
-    let mut arguments = cursor_object(session, cursor);
-    arguments.insert("position".to_string(), position);
-    insert_option(
-        &mut arguments,
-        "thread_unique_id",
-        exception["thread_unique_id"].as_u64().map(Value::from),
-    );
-    Ok(ToolCall {
-        name: "ttd_position_set".to_string(),
-        arguments: Value::Object(arguments),
-    })
-}
-
-fn position_hex_text(position: &Value) -> anyhow::Result<String> {
-    let sequence = position["sequence"]
-        .as_u64()
-        .context("position did not include a numeric sequence")?;
-    let steps = position["steps"]
-        .as_u64()
-        .context("position did not include numeric steps")?;
-    Ok(format!("{sequence:X}:{steps:X}"))
+    .await
 }
 
 async fn sweep_watch_memory_and_print(
@@ -6733,80 +4637,24 @@ async fn sweep_watch_memory_and_print(
     args: SweepWatchMemoryArgs,
     output: &OutputOptions,
 ) -> anyhow::Result<()> {
-    ensure!(
-        args.max_hits > 0,
-        "sweep watch-memory max-hits must be greater than zero"
-    );
-    ensure!(
-        args.max_hits <= 1024,
-        "sweep watch-memory max-hits must not exceed 1024"
-    );
-    let client = DaemonClient::new(pipe);
-    let mut hits = Vec::new();
-    let mut seen_positions = std::collections::BTreeSet::new();
-    let mut stop_reason = "max_hits";
-
-    for _ in 0..args.max_hits {
-        let hit = client
-            .call_tool(watchpoint_call(WatchpointArgs {
-                session: args.session,
-                cursor: args.cursor,
-                address: args.address.clone(),
-                size: args.size,
-                access: args.access.clone(),
-                direction: args.direction.clone(),
-                thread_unique_id: args.thread_unique_id,
-            })?)
-            .await?;
-        if hit["found"].as_bool() != Some(true) {
-            stop_reason = "not_found";
-            hits.push(hit);
-            break;
-        }
-        let sequence = hit["position"]["sequence"].as_u64();
-        if let Some(sequence) = sequence {
-            if !seen_positions.insert(sequence) {
-                stop_reason = "duplicate_position";
-                hits.push(hit);
-                break;
-            }
-        }
-        hits.push(hit);
-        client
-            .call_tool(step_call(StepArgs {
-                session: args.session,
-                cursor: args.cursor,
-                direction: Some(match args.direction.as_str() {
-                    "previous" => "backward".to_string(),
-                    _ => "forward".to_string(),
-                }),
-                kind: Some("step".to_string()),
-                count: Some(1),
-            }))
-            .await?;
-    }
-
-    print_value(
-        json!({
-            "session_id": args.session,
-            "cursor_id": args.cursor,
-            "address": parse_u64_argument(&args.address)?,
-            "size": args.size,
-            "access": args.access,
-            "direction": args.direction,
-            "thread_unique_id": args.thread_unique_id,
-            "max_hits": args.max_hits,
-            "hit_count": hits.iter().filter(|hit| hit["found"].as_bool() == Some(true)).count(),
-            "stop_reason": stop_reason,
-            "hits": hits,
-            "notes": [
-                "This is a bounded client-side sweep over first-hit TTD watchpoints.",
-                "The command advances one step after each hit to avoid reporting the same position repeatedly.",
-                "Use --background to run the same bounded sweep as a daemon-owned job with status, result retrieval, and cancellation."
-            ]
-        }),
+    call_and_print(
+        pipe,
+        ToolCall {
+            name: "ttd_watch_memory_sweep".into(),
+            arguments: json!({
+                "session_id": args.session,
+                "cursor_id": args.cursor,
+                "address": parse_u64_argument(&args.address)?,
+                "size": args.size,
+                "access": args.access,
+                "direction": args.direction,
+                "thread_unique_id": args.thread_unique_id,
+                "max_hits": args.max_hits,
+            }),
+        },
         output,
     )
+    .await
 }
 
 fn register_context_call(args: RegisterContextArgs) -> ToolCall {
@@ -6840,53 +4688,23 @@ async fn stack_recover_and_print(
     args: StackRecoverArgs,
     output: &OutputOptions,
 ) -> anyhow::Result<()> {
-    ensure!(
-        (0.0..=1.0).contains(&args.min_confidence),
-        "min-confidence must be between 0.0 and 1.0"
-    );
-    ensure!(
-        args.max_candidates > 0,
-        "max-candidates must be greater than zero"
-    );
-    ensure!(
-        args.max_candidates <= 512,
-        "max-candidates must be 512 or less"
-    );
-
-    let client = DaemonClient::new(pipe);
-    let stack_read = client
-        .call_tool(stack_read_call(StackReadArgs {
-            session: args.session,
-            cursor: args.cursor,
-            size: args.size.or(Some(4096)),
-            offset_from_sp: args.offset_from_sp,
-            decode_pointers: true,
-        }))
-        .await?;
-    let mut candidates =
-        recover_stack_candidates(&stack_read, args.max_candidates, args.min_confidence);
-    if args.target_info {
-        enrich_stack_candidates(&client, args.session, args.cursor, &mut candidates).await;
-    }
-
-    print_value(
-        json!({
-            "session_id": args.session,
-            "cursor_id": args.cursor,
-            "stack": stack_read,
-            "candidates": candidates,
-            "heuristics": [
-                "Pointer-sized stack values that land inside a loaded module are likely return-address candidates.",
-                "Confidence is higher for module hits, aligned stack slots, and values that look like canonical x64 pointers.",
-                "This is recovery evidence, not a trusted unwind; validate candidates with symbols, disassembly, and call-site context."
-            ],
-            "follow_up": [
-                "Use disasm --address <candidate> to inspect code near a candidate.",
-                "Use memory watchpoint on a corrupted return-address slot to find writes in TTD."
-            ]
-        }),
+    call_and_print(
+        pipe,
+        ToolCall {
+            name: "ttd_stack_recover".into(),
+            arguments: json!({
+                "session_id": args.session,
+                "cursor_id": args.cursor,
+                "size": args.size,
+                "offset_from_sp": args.offset_from_sp,
+                "max_candidates": args.max_candidates,
+                "min_confidence": args.min_confidence,
+                "target_info": args.target_info,
+            }),
+        },
         output,
     )
+    .await
 }
 
 async fn stack_backtrace_and_print(
@@ -6894,194 +4712,23 @@ async fn stack_backtrace_and_print(
     args: StackBacktraceArgs,
     output: &OutputOptions,
 ) -> anyhow::Result<()> {
-    ensure!(
-        args.max_frames > 0,
-        "stack backtrace max-frames must be greater than zero"
-    );
-    ensure!(
-        args.max_frames <= 1024,
-        "stack backtrace max-frames must not exceed 1024"
-    );
-    let client = DaemonClient::new(pipe);
-    let registers = client
-        .call_tool(cursor_call(
-            "ttd_registers",
-            CursorArgs {
-                session: args.session,
-                cursor: args.cursor,
-            },
-        ))
-        .await?;
-    let stack_read = client
-        .call_tool(stack_read_call(StackReadArgs {
-            session: args.session,
-            cursor: args.cursor,
-            size: Some(args.size),
-            offset_from_sp: args.offset_from_sp,
-            decode_pointers: true,
-        }))
-        .await?;
-    let candidate_budget = args.max_frames.saturating_sub(1);
-    let mut candidates =
-        recover_stack_candidates(&stack_read, candidate_budget, args.min_confidence);
-    if args.target_info {
-        enrich_stack_candidates(&client, args.session, args.cursor, &mut candidates).await;
-    }
-    let mut frames = Vec::new();
-    if let Some(pc) = registers["program_counter"].as_u64() {
-        let mut current = json!({
-            "index": 0,
-            "kind": "current_instruction",
-            "address": pc,
-            "address_hex": format!("0x{pc:016x}"),
-            "confidence": 1.0,
-            "reasons": ["current_program_counter"],
-        });
-        if args.target_info {
-            current["target_info"] = client
-                .call_tool(address_info_call(AddressInfoArgs {
-                    session: args.session,
-                    cursor: args.cursor,
-                    address: pc.to_string(),
-                }))
-                .await?;
-        }
-        frames.push(current);
-    }
-    for (index, candidate) in candidates.into_iter().enumerate() {
-        frames.push(json!({
-            "index": frames.len(),
-            "kind": "recovered_return_address",
-            "address": candidate["target"],
-            "address_hex": candidate["target_hex"],
-            "stack_slot": candidate["slot_address"],
-            "stack_slot_hex": candidate["slot_address_hex"],
-            "module": candidate["module"],
-            "confidence": candidate["confidence"],
-            "reasons": candidate["reasons"],
-            "target_info": candidate.get("target_info").cloned().unwrap_or(Value::Null),
-            "candidate_rank": index,
-        }));
-    }
-    print_value(
-        json!({
-            "session_id": args.session,
-            "cursor_id": args.cursor,
-            "position": registers["position"],
-            "thread": registers["thread"],
-            "method": "heuristic_stack_scan",
-            "trusted_unwind": false,
-            "frames": frames,
-            "stack_read": stack_read,
-            "warnings": [
-                "This is not a DbgHelp/DbgEng unwind and may include false positives.",
-                "Use stack recover output, disassembly, symbols, and TTD watchpoints to validate suspicious return-address candidates."
-            ]
-        }),
+    call_and_print(
+        pipe,
+        ToolCall {
+            name: "ttd_stack_backtrace".into(),
+            arguments: json!({
+                "session_id": args.session,
+                "cursor_id": args.cursor,
+                "size": args.size,
+                "offset_from_sp": args.offset_from_sp,
+                "max_frames": args.max_frames,
+                "min_confidence": args.min_confidence,
+                "target_info": args.target_info,
+            }),
+        },
         output,
     )
-}
-
-fn recover_stack_candidates(
-    stack_read: &Value,
-    max_candidates: usize,
-    min_confidence: f64,
-) -> Vec<Value> {
-    let mut candidates = stack_read["pointers"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(|pointer| {
-            let value = pointer["value"].as_u64()?;
-            let slot_address = pointer["address"].as_u64()?;
-            let module = pointer["module"].as_str();
-            let confidence = stack_candidate_confidence(value, slot_address, module.is_some());
-            (confidence >= min_confidence).then(|| {
-                json!({
-                    "slot_address": slot_address,
-                    "slot_address_hex": format!("0x{slot_address:X}"),
-                    "offset": pointer["offset"].as_u64().unwrap_or_default(),
-                    "target": value,
-                    "target_hex": format!("0x{value:X}"),
-                    "module": module,
-                    "confidence": confidence,
-                    "reasons": stack_candidate_reasons(value, slot_address, module.is_some()),
-                })
-            })
-        })
-        .collect::<Vec<_>>();
-    candidates.sort_by(|left, right| {
-        right["confidence"]
-            .as_f64()
-            .partial_cmp(&left["confidence"].as_f64())
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| {
-                left["slot_address"]
-                    .as_u64()
-                    .cmp(&right["slot_address"].as_u64())
-            })
-    });
-    candidates.truncate(max_candidates);
-    candidates
-}
-
-fn stack_candidate_confidence(value: u64, slot_address: u64, in_module: bool) -> f64 {
-    let mut confidence = 0.15;
-    if in_module {
-        confidence += 0.55;
-    }
-    if slot_address.is_multiple_of(8) {
-        confidence += 0.10;
-    }
-    if plausible_x64_pointer(value) {
-        confidence += 0.15;
-    }
-    if value.is_multiple_of(16) {
-        confidence += 0.05;
-    }
-    f64::min(confidence, 1.0)
-}
-
-fn stack_candidate_reasons(value: u64, slot_address: u64, in_module: bool) -> Vec<&'static str> {
-    let mut reasons = Vec::new();
-    if in_module {
-        reasons.push("target_in_loaded_module");
-    }
-    if slot_address.is_multiple_of(8) {
-        reasons.push("aligned_stack_slot");
-    }
-    if plausible_x64_pointer(value) {
-        reasons.push("canonical_aligned_x64_pointer");
-    }
-    if value.is_multiple_of(16) {
-        reasons.push("target_16_byte_aligned");
-    }
-    reasons
-}
-
-async fn enrich_stack_candidates(
-    client: &DaemonClient,
-    session: u64,
-    cursor: u64,
-    candidates: &mut [Value],
-) {
-    for candidate in candidates {
-        let Some(target) = candidate["target"].as_u64() else {
-            continue;
-        };
-        candidate["target_info"] = call_status_value(
-            client
-                .call_tool(ToolCall {
-                    name: "ttd_address_info".to_string(),
-                    arguments: json!({
-                        "session_id": session,
-                        "cursor_id": cursor,
-                        "address": target,
-                    }),
-                })
-                .await,
-        );
-    }
+    .await
 }
 
 fn memory_read_call(args: MemoryReadArgs) -> anyhow::Result<ToolCall> {
@@ -7147,40 +4794,24 @@ async fn disasm_and_print(
     args: DisasmArgs,
     output: &OutputOptions,
 ) -> anyhow::Result<()> {
-    let client = DaemonClient::new(pipe);
-    print_value(disasm_value(&client, &args).await?, output)
+    print_value(disasm_value(&DaemonClient::new(pipe), &args).await?, output)
 }
 
 async fn disasm_value(client: &DaemonClient, args: &DisasmArgs) -> anyhow::Result<Value> {
-    ensure!(args.count > 0, "count must be greater than zero");
-    ensure!(args.count <= 256, "count must be 256 instructions or less");
-    ensure!(args.bytes > 0, "bytes must be greater than zero");
-    ensure!(args.bytes <= 4096, "bytes must be 4096 or less");
-
-    let (address, context) = disasm_address(client, args).await?;
-    let read = client
-        .call_tool(memory_read_call(MemoryReadArgs {
-            session: args.session,
-            cursor: args.cursor,
-            address: format!("0x{address:X}"),
-            size: args.bytes,
-            policy: args.policy.clone(),
-        })?)
-        .await?;
-    let data = read["data"]
-        .as_str()
-        .context("ttd_read_memory response did not include hex data")?;
-    let bytes = hex_to_bytes(data)?;
-    Ok(json!({
-        "session_id": args.session,
-        "cursor_id": args.cursor,
-        "architecture": "x64",
-        "address": address,
-        "address_hex": format!("0x{address:X}"),
-        "context": context,
-        "read": read,
-        "instructions": disassemble_x64(address, &bytes, args.count as usize),
-    }))
+    client
+        .call_tool(ToolCall {
+            name: "ttd_disassemble".into(),
+            arguments: json!({
+                "session_id": args.session,
+                "cursor_id": args.cursor,
+                "address": args.address,
+                "count": args.count,
+                "bytes": args.bytes,
+                "policy": args.policy,
+                "thread_id": args.thread_id,
+            }),
+        })
+        .await
 }
 
 async fn object_vtable_and_print(
@@ -7188,251 +4819,21 @@ async fn object_vtable_and_print(
     args: ObjectVtableArgs,
     output: &OutputOptions,
 ) -> anyhow::Result<()> {
-    ensure!(args.entries > 0, "entries must be greater than zero");
-    ensure!(args.entries <= 256, "entries must be 256 or less");
-    let object_address = parse_u64_argument(&args.address)?;
-    let client = DaemonClient::new(pipe);
-    let object_read = client
-        .call_tool(memory_read_call(MemoryReadArgs {
-            session: args.session,
-            cursor: args.cursor,
-            address: format!("0x{object_address:X}"),
-            size: 8,
-            policy: args.policy.clone(),
-        })?)
-        .await?;
-    let object_bytes = hex_to_bytes(
-        object_read["data"]
-            .as_str()
-            .context("object pointer read did not include hex data")?,
-    )?;
-    ensure!(
-        object_bytes.len() >= 8,
-        "object pointer read returned fewer than 8 bytes"
-    );
-    let vtable_address = u64::from_le_bytes(object_bytes[..8].try_into()?);
-    ensure!(vtable_address != 0, "object vtable pointer is null");
-
-    let table_size = args.entries.saturating_mul(8);
-    let vtable_read = client
-        .call_tool(memory_read_call(MemoryReadArgs {
-            session: args.session,
-            cursor: args.cursor,
-            address: format!("0x{vtable_address:X}"),
-            size: table_size,
-            policy: args.policy,
-        })?)
-        .await?;
-    let vtable_bytes = hex_to_bytes(
-        vtable_read["data"]
-            .as_str()
-            .context("vtable read did not include hex data")?,
-    )?;
-    let mut entries = Vec::new();
-    for (index, chunk) in vtable_bytes.chunks_exact(8).enumerate() {
-        let target = u64::from_le_bytes(chunk.try_into()?);
-        let target_info = if target == 0 {
-            json!({ "ok": false, "error": "null vtable entry" })
-        } else {
-            call_status_value(
-                client
-                    .call_tool(ToolCall {
-                        name: "ttd_address_info".to_string(),
-                        arguments: json!({
-                            "session_id": args.session,
-                            "cursor_id": args.cursor,
-                            "address": target,
-                        }),
-                    })
-                    .await,
-            )
-        };
-        entries.push(json!({
-            "index": index,
-            "slot_address": vtable_address + (index as u64 * 8),
-            "slot_address_hex": format!("0x{:X}", vtable_address + (index as u64 * 8)),
-            "target": target,
-            "target_hex": format!("0x{target:X}"),
-            "plausible_x64_pointer": plausible_x64_pointer(target),
-            "target_info": target_info,
-        }));
-    }
-
-    let vtable_info = call_status_value(
-        client
-            .call_tool(ToolCall {
-                name: "ttd_address_info".to_string(),
-                arguments: json!({
-                    "session_id": args.session,
-                    "cursor_id": args.cursor,
-                    "address": vtable_address,
-                }),
-            })
-            .await,
-    );
-    print_value(
-        json!({
-            "session_id": args.session,
-            "cursor_id": args.cursor,
-            "object_address": object_address,
-            "object_address_hex": format!("0x{object_address:X}"),
-            "vtable_address": vtable_address,
-            "vtable_address_hex": format!("0x{vtable_address:X}"),
-            "object_read": object_read,
-            "vtable_read": vtable_read,
-            "vtable_info": vtable_info,
-            "entries": entries,
-            "safety": "read_only_analysis"
-        }),
+    call_and_print(
+        pipe,
+        ToolCall {
+            name: "ttd_object_vtable".into(),
+            arguments: json!({
+                "session_id": args.session,
+                "cursor_id": args.cursor,
+                "address": args.address,
+                "entries": args.entries,
+                "policy": args.policy,
+            }),
+        },
         output,
     )
-}
-
-async fn disasm_address(client: &DaemonClient, args: &DisasmArgs) -> anyhow::Result<(u64, Value)> {
-    if let Some(address) = args.address.as_deref() {
-        return Ok((
-            parse_u64_argument(address)?,
-            json!({ "source": "explicit" }),
-        ));
-    }
-
-    let context = client
-        .call_tool(register_context_call(RegisterContextArgs {
-            session: args.session,
-            cursor: args.cursor,
-            thread_id: args.thread_id,
-        }))
-        .await
-        .context("resolving current RIP with ttd_register_context")?;
-    let rip = context["registers"]["rip"]
-        .as_u64()
-        .or_else(|| context["rip"].as_u64())
-        .context("ttd_register_context response did not include registers.rip")?;
-    Ok((
-        rip,
-        json!({ "source": "cursor_rip", "register_context": context }),
-    ))
-}
-
-fn disassemble_x64(address: u64, bytes: &[u8], count: usize) -> Vec<Value> {
-    let mut decoder = Decoder::with_ip(64, bytes, address, DecoderOptions::NONE);
-    let mut formatter = NasmFormatter::new();
-    let mut instructions = Vec::new();
-    while decoder.can_decode() && instructions.len() < count {
-        let instruction = decoder.decode();
-        let mut text = String::new();
-        formatter.format(&instruction, &mut text);
-        let len = instruction.len();
-        let offset = instruction.ip().saturating_sub(address) as usize;
-        let end = offset.saturating_add(len).min(bytes.len());
-        let instruction_bytes = if offset < bytes.len() {
-            bytes[offset..end]
-                .iter()
-                .map(|byte| format!("{byte:02X}"))
-                .collect::<Vec<_>>()
-        } else {
-            Vec::new()
-        };
-        instructions.push(json!({
-            "address": instruction.ip(),
-            "address_hex": format!("0x{:X}", instruction.ip()),
-            "length": len,
-            "bytes": instruction_bytes,
-            "text": text,
-            "mnemonic": format!("{:?}", instruction.mnemonic()).to_ascii_lowercase(),
-            "flow_control": format!("{:?}", instruction.flow_control()).to_ascii_lowercase(),
-            "classification": instruction_classification(&instruction, &text),
-            "operands": instruction_operands(&instruction),
-        }));
-    }
-    instructions
-}
-
-fn instruction_classification(instruction: &Instruction, text: &str) -> Value {
-    let lower = text.to_ascii_lowercase();
-    let mut tags = Vec::new();
-    match instruction.flow_control() {
-        FlowControl::Next => {}
-        FlowControl::Call | FlowControl::IndirectCall => tags.push("call"),
-        FlowControl::Return => tags.push("return"),
-        FlowControl::UnconditionalBranch | FlowControl::IndirectBranch => tags.push("jump"),
-        FlowControl::ConditionalBranch => tags.push("conditional_jump"),
-        FlowControl::Interrupt | FlowControl::XbeginXabortXend => tags.push("control_transfer"),
-        _ => tags.push("control_transfer"),
-    }
-    if has_memory_operand(instruction) {
-        tags.push("memory_access");
-    }
-    if lower.contains("rsp")
-        || lower.contains("rbp")
-        || lower.contains("esp")
-        || lower.contains("ebp")
-    {
-        tags.push("stack_related");
-    }
-    if instruction.memory_segment() == Register::FS || instruction.memory_segment() == Register::GS
-    {
-        tags.push("teb_tls_segment");
-    }
-    if lower.contains("int3") || lower == "db 0cch" {
-        tags.push("breakpoint");
-    }
-    if lower.starts_with("syscall") || lower.starts_with("sysenter") {
-        tags.push("system_call");
-    }
-    json!({
-        "tags": tags,
-        "is_control_flow": instruction.flow_control() != FlowControl::Next,
-        "has_memory_operand": has_memory_operand(instruction),
-        "is_stack_related": lower.contains("rsp") || lower.contains("rbp") || lower.contains("esp") || lower.contains("ebp"),
-    })
-}
-
-fn instruction_operands(instruction: &Instruction) -> Vec<Value> {
-    (0..instruction.op_count())
-        .map(|index| {
-            let op_kind = instruction.op_kind(index);
-            let mut operand = json!({
-                "index": index,
-                "kind": format!("{op_kind:?}").to_ascii_lowercase(),
-            });
-            if is_memory_op_kind(op_kind) {
-                operand["memory"] = json!({
-                    "segment": register_name(instruction.memory_segment()),
-                    "base": register_name(instruction.memory_base()),
-                    "index": register_name(instruction.memory_index()),
-                    "scale": instruction.memory_index_scale(),
-                    "displacement": instruction.memory_displacement64(),
-                    "displacement_hex": format!("0x{:X}", instruction.memory_displacement64()),
-                });
-            }
-            operand
-        })
-        .collect()
-}
-
-fn has_memory_operand(instruction: &Instruction) -> bool {
-    (0..instruction.op_count()).any(|index| is_memory_op_kind(instruction.op_kind(index)))
-}
-
-fn is_memory_op_kind(op_kind: OpKind) -> bool {
-    matches!(
-        op_kind,
-        OpKind::Memory
-            | OpKind::MemorySegSI
-            | OpKind::MemorySegESI
-            | OpKind::MemorySegRSI
-            | OpKind::MemorySegDI
-            | OpKind::MemorySegEDI
-            | OpKind::MemorySegRDI
-            | OpKind::MemoryESDI
-            | OpKind::MemoryESEDI
-            | OpKind::MemoryESRDI
-    )
-}
-
-fn register_name(register: Register) -> Option<String> {
-    (register != Register::None).then(|| format!("{register:?}").to_ascii_lowercase())
+    .await
 }
 
 async fn memory_dump_and_print(
@@ -7440,29 +4841,22 @@ async fn memory_dump_and_print(
     args: MemoryDumpArgs,
     output: &OutputOptions,
 ) -> anyhow::Result<()> {
-    let client = DaemonClient::new(pipe);
-    let format = args.format.clone();
-    let read = client
-        .call_tool(memory_read_call(MemoryReadArgs {
-            session: args.session,
-            cursor: args.cursor,
-            address: args.address,
-            size: args.size,
-            policy: args.policy,
-        })?)
-        .await?;
-    let data = read["data"]
-        .as_str()
-        .context("ttd_read_memory response did not include hex data")?;
-    let bytes = hex_to_bytes(data)?;
-    let address = read["address"].as_u64().unwrap_or_default();
-    print_value(
-        json!({
-            "read": read,
-            "dump": memory_dump(address, &bytes, &format)?,
-        }),
+    call_and_print(
+        pipe,
+        ToolCall {
+            name: "ttd_memory_dump".into(),
+            arguments: json!({
+                "session_id": args.session,
+                "cursor_id": args.cursor,
+                "address": args.address,
+                "size": args.size,
+                "policy": args.policy,
+                "format": args.format,
+            }),
+        },
         output,
     )
+    .await
 }
 
 async fn memory_classify_and_print(
@@ -7470,28 +4864,21 @@ async fn memory_classify_and_print(
     args: MemoryClassifyArgs,
     output: &OutputOptions,
 ) -> anyhow::Result<()> {
-    let client = DaemonClient::new(pipe);
-    let read = client
-        .call_tool(memory_read_call(MemoryReadArgs {
-            session: args.session,
-            cursor: args.cursor,
-            address: args.address,
-            size: args.size,
-            policy: args.policy,
-        })?)
-        .await?;
-    let data = read["data"]
-        .as_str()
-        .context("ttd_read_memory response did not include hex data")?;
-    let bytes = hex_to_bytes(data)?;
-    let address = read["address"].as_u64().unwrap_or_default();
-    print_value(
-        json!({
-            "read": read,
-            "classification": classify_memory(address, &bytes),
-        }),
+    call_and_print(
+        pipe,
+        ToolCall {
+            name: "ttd_memory_classify".into(),
+            arguments: json!({
+                "session_id": args.session,
+                "cursor_id": args.cursor,
+                "address": args.address,
+                "size": args.size,
+                "policy": args.policy,
+            }),
+        },
         output,
     )
+    .await
 }
 
 async fn memory_strings_and_print(
@@ -7499,76 +4886,24 @@ async fn memory_strings_and_print(
     args: MemoryStringsArgs,
     output: &OutputOptions,
 ) -> anyhow::Result<()> {
-    ensure!(
-        args.max_strings <= 10_000,
-        "memory strings --max-strings must not exceed 10000"
-    );
-    let client = DaemonClient::new(pipe);
-    let read = client
-        .call_tool(memory_read_call(MemoryReadArgs {
-            session: args.session,
-            cursor: args.cursor,
-            address: args.address,
-            size: args.size,
-            policy: args.policy,
-        })?)
-        .await?;
-    let data = read["data"]
-        .as_str()
-        .context("ttd_read_memory response did not include hex data")?;
-    let bytes = hex_to_bytes(data)?;
-    let address = read["address"].as_u64().unwrap_or_default();
-    let mut strings = Vec::new();
-    if args.encoding == "ascii" || args.encoding == "both" {
-        strings.extend(
-            ascii_strings(address, &bytes)
-                .into_iter()
-                .filter(|item| {
-                    item["text"]
-                        .as_str()
-                        .is_some_and(|text| text.len() >= args.min_len)
-                })
-                .map(|mut item| {
-                    item["encoding"] = Value::String("ascii".to_string());
-                    item
-                }),
-        );
-    }
-    if args.encoding == "utf16" || args.encoding == "both" {
-        strings.extend(
-            utf16le_strings(address, &bytes)
-                .into_iter()
-                .filter(|item| {
-                    item["text"]
-                        .as_str()
-                        .is_some_and(|text| text.len() >= args.min_len)
-                })
-                .map(|mut item| {
-                    item["encoding"] = Value::String("utf16".to_string());
-                    item
-                }),
-        );
-    }
-    strings.sort_by_key(|item| item["address"].as_u64().unwrap_or(u64::MAX));
-    let total_strings = strings.len();
-    if strings.len() > args.max_strings {
-        strings.truncate(args.max_strings);
-    }
-    print_value(
-        json!({
-            "read": read,
-            "encoding": args.encoding,
-            "min_len": args.min_len,
-            "total_strings": total_strings,
-            "max_strings": args.max_strings,
-            "returned": strings.len(),
-            "limit": args.max_strings,
-            "truncated": total_strings > args.max_strings,
-            "strings": strings,
-            "unavailable_bytes": if read["complete"].as_bool() == Some(false) { read["requested_size"].as_u64().unwrap_or_default().saturating_sub(read["bytes_read"].as_u64().unwrap_or_default()) } else { 0 }
-        }),
+    call_and_print(
+        pipe,
+        ToolCall {
+            name: "ttd_memory_strings".into(),
+            arguments: json!({
+                "session_id": args.session,
+                "cursor_id": args.cursor,
+                "address": args.address,
+                "size": args.size,
+                "policy": args.policy,
+                "encoding": args.encoding,
+                "min_len": args.min_len,
+                "max_strings": args.max_strings,
+            }),
+        },
         output,
     )
+    .await
 }
 
 async fn memory_dps_and_print(
@@ -7576,62 +4911,23 @@ async fn memory_dps_and_print(
     args: MemoryDpsArgs,
     output: &OutputOptions,
 ) -> anyhow::Result<()> {
-    ensure!(
-        matches!(args.pointer_size, 4 | 8),
-        "memory dps pointer size must be 4 or 8"
-    );
-    let client = DaemonClient::new(pipe);
-    let read = client
-        .call_tool(memory_read_call(MemoryReadArgs {
-            session: args.session,
-            cursor: args.cursor,
-            address: args.address,
-            size: args.size,
-            policy: args.policy,
-        })?)
-        .await?;
-    let data = read["data"]
-        .as_str()
-        .context("ttd_read_memory response did not include hex data")?;
-    let bytes = hex_to_bytes(data)?;
-    let base = read["address"].as_u64().unwrap_or_default();
-    let mut rows = Vec::new();
-    for (index, chunk) in bytes.chunks(args.pointer_size as usize).enumerate() {
-        if chunk.len() < args.pointer_size as usize {
-            break;
-        }
-        let slot = base + (index as u64 * args.pointer_size as u64);
-        let target = read_pointer_value(chunk, args.pointer_size)?;
-        let mut row = json!({
-            "slot": slot,
-            "slot_hex": format!("0x{slot:016x}"),
-            "value": target,
-            "value_hex": format!("0x{target:016x}"),
-            "plausible_x64_pointer": plausible_x64_pointer(target),
-            "null": target == 0
-        });
-        if args.target_info && target != 0 {
-            row["target_info"] = call_status_value(
-                client
-                    .call_tool(address_info_call(AddressInfoArgs {
-                        session: args.session,
-                        cursor: args.cursor,
-                        address: target.to_string(),
-                    }))
-                    .await,
-            );
-        }
-        rows.push(row);
-    }
-    print_value(
-        json!({
-            "read": read,
-            "pointer_size": args.pointer_size,
-            "row_count": rows.len(),
-            "rows": rows
-        }),
+    call_and_print(
+        pipe,
+        ToolCall {
+            name: "ttd_memory_dps".into(),
+            arguments: json!({
+                "session_id": args.session,
+                "cursor_id": args.cursor,
+                "address": args.address,
+                "size": args.size,
+                "policy": args.policy,
+                "pointer_size": args.pointer_size,
+                "target_info": args.target_info,
+            }),
+        },
         output,
     )
+    .await
 }
 
 async fn memory_chase_and_print(
@@ -7639,393 +4935,24 @@ async fn memory_chase_and_print(
     args: MemoryChaseArgs,
     output: &OutputOptions,
 ) -> anyhow::Result<()> {
-    ensure!(
-        args.depth > 0,
-        "memory chase depth must be greater than zero"
-    );
-    ensure!(args.depth <= 256, "memory chase depth must not exceed 256");
-    ensure!(
-        matches!(args.pointer_size, 4 | 8),
-        "memory chase pointer size must be 4 or 8"
-    );
-
-    let client = DaemonClient::new(pipe);
-    let root_address = parse_u64_argument(&args.address)?;
-    let mut current = root_address;
-    let mut hops = Vec::new();
-    let mut stop_reason = "max_depth";
-
-    for depth in 0..args.depth {
-        let read_address = current
-            .checked_add(args.offset)
-            .context("pointer read address overflowed")?;
-        let read = client
-            .call_tool(memory_read_call(MemoryReadArgs {
-                session: args.session,
-                cursor: args.cursor,
-                address: read_address.to_string(),
-                size: args.pointer_size,
-                policy: args.policy.clone(),
-            })?)
-            .await?;
-        let data = read["data"]
-            .as_str()
-            .context("ttd_read_memory response did not include hex data")?;
-        let bytes = hex_to_bytes(data)?;
-        let target = read_pointer_value(&bytes, args.pointer_size)?;
-        let mut hop = json!({
-            "index": depth,
-            "base_address": current,
-            "read_address": read_address,
-            "offset": args.offset,
-            "pointer_size": args.pointer_size,
-            "bytes": data,
-            "target": target,
-            "target_hex": format!("0x{target:016x}"),
-            "null": target == 0,
-            "read": read,
-        });
-
-        if args.target_info && target != 0 {
-            hop["target_info"] = client
-                .call_tool(address_info_call(AddressInfoArgs {
-                    session: args.session,
-                    cursor: args.cursor,
-                    address: target.to_string(),
-                }))
-                .await?;
-        }
-
-        hops.push(hop);
-        if target == 0 {
-            stop_reason = "null_pointer";
-            break;
-        }
-        current = target;
-    }
-
-    print_value(
-        json!({
-            "session_id": args.session,
-            "cursor_id": args.cursor,
-            "root_address": root_address,
-            "offset": args.offset,
-            "pointer_size": args.pointer_size,
-            "requested_depth": args.depth,
-            "stop_reason": stop_reason,
-            "hops": hops,
-            "notes": [
-                "Reads one pointer at base_address + offset per hop.",
-                "Pointer chains are evidence, not proof of ownership or object type."
-            ]
-        }),
+    call_and_print(
+        pipe,
+        ToolCall {
+            name: "ttd_memory_chase".into(),
+            arguments: json!({
+                "session_id": args.session,
+                "cursor_id": args.cursor,
+                "address": args.address,
+                "offset": args.offset,
+                "depth": args.depth,
+                "pointer_size": args.pointer_size,
+                "policy": args.policy,
+                "target_info": args.target_info,
+            }),
+        },
         output,
     )
-}
-
-fn memory_dump(address: u64, bytes: &[u8], format: &str) -> anyhow::Result<Value> {
-    let rows = match format {
-        "db" => dump_db_rows(address, bytes),
-        "dq" => dump_dq_rows(address, bytes),
-        "ascii" => ascii_strings(address, bytes),
-        "utf16" => utf16le_strings(address, bytes),
-        other => bail!("unsupported memory dump format: {other}"),
-    };
-    Ok(json!({
-        "format": format,
-        "rows": rows,
-    }))
-}
-
-fn dump_db_rows(address: u64, bytes: &[u8]) -> Vec<Value> {
-    bytes
-        .chunks(16)
-        .enumerate()
-        .map(|(row, chunk)| {
-            let offset = row * 16;
-            json!({
-                "address": address + offset as u64,
-                "offset": offset,
-                "bytes": chunk.iter().map(|byte| format!("{byte:02X}")).collect::<Vec<_>>(),
-                "ascii": chunk.iter().map(|byte| if byte.is_ascii_graphic() || *byte == b' ' { *byte as char } else { '.' }).collect::<String>(),
-            })
-        })
-        .collect()
-}
-
-fn dump_dq_rows(address: u64, bytes: &[u8]) -> Vec<Value> {
-    bytes
-        .chunks(16)
-        .enumerate()
-        .map(|(row, chunk)| {
-            let offset = row * 16;
-            let qwords = chunk
-                .chunks(8)
-                .filter(|chunk| chunk.len() == 8)
-                .map(|chunk| {
-                    let value = u64::from_le_bytes(chunk.try_into().expect("chunk length checked"));
-                    json!({
-                        "value": value,
-                        "hex": format!("0x{value:016X}"),
-                        "plausible_x64_pointer": plausible_x64_pointer(value),
-                    })
-                })
-                .collect::<Vec<_>>();
-            json!({
-                "address": address + offset as u64,
-                "offset": offset,
-                "qwords": qwords,
-            })
-        })
-        .collect()
-}
-
-fn classify_memory(address: u64, bytes: &[u8]) -> Value {
-    json!({
-        "address": address,
-        "size": bytes.len(),
-        "byte_histogram": byte_histogram_summary(bytes),
-        "entropy_bits_per_byte": shannon_entropy(bytes),
-        "ascii_strings": ascii_strings(address, bytes),
-        "utf16le_strings": utf16le_strings(address, bytes),
-        "qwords": qword_values(address, bytes),
-        "instruction_hints": instruction_hints(bytes),
-        "summary": memory_summary(bytes),
-    })
-}
-
-fn memory_summary(bytes: &[u8]) -> Vec<&'static str> {
-    let mut summary = Vec::new();
-    if bytes.is_empty() {
-        summary.push("empty");
-        return summary;
-    }
-    let histogram = byte_counts(bytes);
-    let zero_ratio = histogram[0] as f64 / bytes.len() as f64;
-    let ff_ratio = histogram[0xff] as f64 / bytes.len() as f64;
-    let max_ratio = histogram.iter().copied().max().unwrap_or_default() as f64 / bytes.len() as f64;
-    let entropy = shannon_entropy(bytes);
-    if zero_ratio >= 0.90 {
-        summary.push("mostly_zero");
-    }
-    if ff_ratio >= 0.90 {
-        summary.push("mostly_ff");
-    }
-    if max_ratio >= 0.90 {
-        summary.push("repeated_fill_pattern");
-    }
-    if entropy >= 7.5 {
-        summary.push("high_entropy");
-    }
-    if !ascii_strings(0, bytes).is_empty() {
-        summary.push("contains_ascii");
-    }
-    if !utf16le_strings(0, bytes).is_empty() {
-        summary.push("contains_utf16le");
-    }
-    if qword_values(0, bytes).as_array().is_some_and(|items| {
-        items
-            .iter()
-            .any(|item| item["plausible_x64_pointer"] == true)
-    }) {
-        summary.push("contains_plausible_pointer");
-    }
-    if !instruction_hints(bytes).is_empty() {
-        summary.push("instruction_like_prefix");
-    }
-    if summary.is_empty() {
-        summary.push("unclassified");
-    }
-    summary
-}
-
-fn byte_histogram_summary(bytes: &[u8]) -> Value {
-    let histogram = byte_counts(bytes);
-    let mut top = histogram
-        .iter()
-        .enumerate()
-        .filter(|(_, count)| **count > 0)
-        .map(|(byte, count)| {
-            json!({
-                "byte": byte,
-                "hex": format!("{byte:02X}"),
-                "count": count,
-            })
-        })
-        .collect::<Vec<_>>();
-    top.sort_by(|left, right| {
-        right["count"]
-            .as_u64()
-            .cmp(&left["count"].as_u64())
-            .then_with(|| left["byte"].as_u64().cmp(&right["byte"].as_u64()))
-    });
-    top.truncate(8);
-    json!({
-        "unique_bytes": histogram.iter().filter(|count| **count > 0).count(),
-        "top": top,
-    })
-}
-
-fn byte_counts(bytes: &[u8]) -> [usize; 256] {
-    let mut counts = [0usize; 256];
-    for byte in bytes {
-        counts[*byte as usize] += 1;
-    }
-    counts
-}
-
-fn shannon_entropy(bytes: &[u8]) -> f64 {
-    if bytes.is_empty() {
-        return 0.0;
-    }
-    let counts = byte_counts(bytes);
-    counts
-        .iter()
-        .filter(|count| **count > 0)
-        .map(|count| {
-            let probability = *count as f64 / bytes.len() as f64;
-            -probability * probability.log2()
-        })
-        .sum()
-}
-
-fn ascii_strings(address: u64, bytes: &[u8]) -> Vec<Value> {
-    let mut strings = Vec::new();
-    let mut start = None;
-    for (index, byte) in bytes.iter().enumerate() {
-        if byte.is_ascii_graphic() || *byte == b' ' {
-            start.get_or_insert(index);
-        } else if let Some(begin) = start.take() {
-            push_ascii_string(address, bytes, begin, index, &mut strings);
-        }
-    }
-    if let Some(begin) = start {
-        push_ascii_string(address, bytes, begin, bytes.len(), &mut strings);
-    }
-    strings
-}
-
-fn push_ascii_string(
-    address: u64,
-    bytes: &[u8],
-    begin: usize,
-    end: usize,
-    strings: &mut Vec<Value>,
-) {
-    if end.saturating_sub(begin) >= 4 {
-        strings.push(json!({
-            "address": address + begin as u64,
-            "offset": begin,
-            "length": end - begin,
-            "text": String::from_utf8_lossy(&bytes[begin..end]),
-        }));
-    }
-}
-
-fn utf16le_strings(address: u64, bytes: &[u8]) -> Vec<Value> {
-    let mut strings = Vec::new();
-    let mut index = 0usize;
-    while index + 1 < bytes.len() {
-        let begin = index;
-        let mut values = Vec::new();
-        while index + 1 < bytes.len() {
-            let value = u16::from_le_bytes([bytes[index], bytes[index + 1]]);
-            let Some(character) = char::from_u32(value as u32) else {
-                break;
-            };
-            if !(character.is_ascii_graphic() || character == ' ') {
-                break;
-            }
-            values.push(value);
-            index += 2;
-        }
-        if values.len() >= 4 {
-            strings.push(json!({
-                "address": address + begin as u64,
-                "offset": begin,
-                "code_units": values.len(),
-                "text": String::from_utf16_lossy(&values),
-            }));
-        }
-        index = begin + 2;
-    }
-    strings
-}
-
-fn qword_values(address: u64, bytes: &[u8]) -> Value {
-    let qwords = bytes
-        .chunks_exact(8)
-        .take(32)
-        .enumerate()
-        .map(|(index, chunk)| {
-            let value = u64::from_le_bytes(chunk.try_into().expect("chunk size is exact"));
-            json!({
-                "address": address + (index * 8) as u64,
-                "offset": index * 8,
-                "value": value,
-                "hex": format!("0x{value:016X}"),
-                "aligned": value.is_multiple_of(8),
-                "plausible_x64_pointer": plausible_x64_pointer(value),
-            })
-        })
-        .collect::<Vec<_>>();
-    json!(qwords)
-}
-
-fn plausible_x64_pointer(value: u64) -> bool {
-    value != 0
-        && value.is_multiple_of(8)
-        && !(0x0000_8000_0000_0000..0xffff_8000_0000_0000).contains(&value)
-}
-
-fn instruction_hints(bytes: &[u8]) -> Vec<Value> {
-    let mut hints = Vec::new();
-    if let Some(first) = bytes.first() {
-        match *first {
-            0x55 => hints.push(json!({"offset": 0, "kind": "push_rbp_prologue"})),
-            0x48 | 0x4c => hints.push(json!({"offset": 0, "kind": "x64_rex_prefix"})),
-            0xe8 => hints.push(json!({"offset": 0, "kind": "relative_call"})),
-            0xe9 | 0xeb => hints.push(json!({"offset": 0, "kind": "relative_jump"})),
-            0xc3 | 0xc2 => hints.push(json!({"offset": 0, "kind": "return"})),
-            0xcc => hints.push(json!({"offset": 0, "kind": "int3_breakpoint"})),
-            _ => {}
-        }
-    }
-    for (offset, window) in bytes.windows(2).take(32).enumerate() {
-        if window == [0x0f, 0x05] {
-            hints.push(json!({"offset": offset, "kind": "syscall"}));
-        }
-    }
-    hints
-}
-
-fn hex_to_bytes(data: &str) -> anyhow::Result<Vec<u8>> {
-    ensure!(data.len().is_multiple_of(2), "hex data length must be even");
-    (0..data.len())
-        .step_by(2)
-        .map(|index| {
-            u8::from_str_radix(&data[index..index + 2], 16)
-                .with_context(|| format!("parsing hex byte at offset {index}"))
-        })
-        .collect()
-}
-
-fn read_pointer_value(bytes: &[u8], pointer_size: u32) -> anyhow::Result<u64> {
-    match pointer_size {
-        4 => {
-            ensure!(bytes.len() >= 4, "pointer read returned fewer than 4 bytes");
-            let mut value = [0_u8; 4];
-            value.copy_from_slice(&bytes[..4]);
-            Ok(u32::from_le_bytes(value) as u64)
-        }
-        8 => {
-            ensure!(bytes.len() >= 8, "pointer read returned fewer than 8 bytes");
-            let mut value = [0_u8; 8];
-            value.copy_from_slice(&bytes[..8]);
-            Ok(u64::from_le_bytes(value))
-        }
-        other => bail!("unsupported pointer size: {other}"),
-    }
+    .await
 }
 
 fn session_object(session: u64) -> Map<String, Value> {
@@ -8056,17 +4983,6 @@ fn parse_position_argument(value: &str) -> anyhow::Result<Value> {
     Ok(json!(value))
 }
 
-fn parse_u64_argument(value: &str) -> anyhow::Result<u64> {
-    let value = value.trim();
-    if let Some(hex) = value
-        .strip_prefix("0x")
-        .or_else(|| value.strip_prefix("0X"))
-    {
-        return u64::from_str_radix(hex, 16).context("parsing hexadecimal integer");
-    }
-    value.parse::<u64>().context("parsing decimal integer")
-}
-
 fn ensure_json_object(value: Value) -> anyhow::Result<Value> {
     if value.is_object() {
         Ok(value)
@@ -8088,6 +5004,11 @@ fn query_policy_values() -> [&'static str; 5] {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use windbg_ttd::analysis::{audit_modules, normalize_dll_name};
+    use windbg_ttd::analysis::{
+        classify_memory, collect_timeline_events, disassemble_x64, hex_to_bytes, memory_dump,
+        read_pointer_value, recover_stack_candidates, timeline_source_summary,
+    };
 
     #[test]
     fn resolves_debug_subject_exclusively() -> anyhow::Result<()> {
@@ -8099,13 +5020,23 @@ mod tests {
             },
             true,
         )?;
-        assert!(matches!(
+        assert_eq!(
             subject,
             Some(DebugSubject::Ttd {
                 session: 7,
                 cursor: Some(9)
             })
-        ));
+        );
+
+        let target_only = resolve_debug_subject(
+            &DebugSubjectArgs {
+                session: None,
+                cursor: None,
+                target: Some(3),
+            },
+            false,
+        )?;
+        assert_eq!(target_only, Some(DebugSubject::Target { target: 3 }));
 
         let conflict = resolve_debug_subject(
             &DebugSubjectArgs {
@@ -8117,24 +5048,6 @@ mod tests {
         );
         assert!(conflict.is_err());
         Ok(())
-    }
-
-    #[test]
-    fn builds_standard_diagnostic_shape() {
-        let diagnostic = diagnostic_item(
-            "daemon.unavailable",
-            "blocker",
-            "Daemon is unavailable.",
-            "The daemon pipe could not be reached.",
-            "high",
-            Some(fix_item(
-                "Start the daemon.",
-                Some("windbg-tool daemon ensure"),
-            )),
-        );
-        assert_eq!(diagnostic["id"], "daemon.unavailable");
-        assert_eq!(diagnostic["severity"], "blocker");
-        assert_eq!(diagnostic["fix"]["command"], "windbg-tool daemon ensure");
     }
 
     #[test]
@@ -8156,24 +5069,6 @@ mod tests {
         assert_eq!(plan["supported"], true);
         assert_eq!(plan["safety"], "bounded_replay");
         assert_eq!(plan["request"]["address"], "0x1000");
-        Ok(())
-    }
-
-    #[test]
-    fn exception_focus_uses_json_position_and_owning_thread() -> anyhow::Result<()> {
-        let exception = json!({
-            "position": { "sequence": 479966, "steps": 0 },
-            "thread_unique_id": 13,
-            "code": 0xE06D7363u64
-        });
-        let call = exception_focus_call(7, 9, &exception)?;
-
-        assert_eq!(call.name, "ttd_position_set");
-        assert_eq!(call.arguments["session_id"], 7);
-        assert_eq!(call.arguments["cursor_id"], 9);
-        assert_eq!(call.arguments["position"]["sequence"], 479966);
-        assert_eq!(call.arguments["thread_unique_id"], 13);
-        assert_eq!(position_hex_text(&exception["position"])?, "752DE:0");
         Ok(())
     }
 
