@@ -61,6 +61,19 @@ Use `--arch arm64` with `--target aarch64-pc-windows-msvc` for the Windows ARM64
 
 Release packages statically link the MSVC C runtime into Rust code with `RUSTFLAGS=-C target-feature=+crt-static` and into the native bridge with `cargo xtask native-build --static-crt`. WinDbg, DbgEng, symbol, and TTD replay runtime DLLs remain dynamic dependencies and are copied into the package directory.
 
+### Binary version resources
+
+`windbg-tool.exe` and `ttd_replay_bridge.dll` embed Windows `VERSIONINFO` resources (company, product, file description, and version).
+
+- Default values come from the workspace package version in the root `Cargo.toml` (`0.1.0` today) and matching native bridge defaults.
+- For release stamps, set `WINDBG_TOOL_VERSION` (for example `0.2.0`) before `cargo build -p windbg-tool` and `cargo xtask native-build`. The Windows packages workflow does this from the dispatch version input.
+- Inspect a built binary with:
+
+```powershell
+[System.Diagnostics.FileVersionInfo]::GetVersionInfo((Resolve-Path target\release\windbg-tool.exe)) |
+  Select-Object FileName, FileVersion, ProductVersion, ProductName, CompanyName, FileDescription
+```
+
 For a development build that uses architecture-specific staged DbgEng DLLs, set the process-local runtime directory before using a live DbgEng command:
 
 ```powershell

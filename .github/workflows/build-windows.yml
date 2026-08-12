@@ -142,6 +142,8 @@ jobs:
 
       - name: Build native bridge
         shell: pwsh
+        env:
+          WINDBG_TOOL_VERSION: ${{ inputs.version }}
         run: |
           $ErrorActionPreference = 'Stop'
           $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
@@ -154,6 +156,8 @@ jobs:
 
       - name: Build windbg-tool
         shell: pwsh
+        env:
+          WINDBG_TOOL_VERSION: ${{ inputs.version }}
         run: |
           $ErrorActionPreference = 'Stop'
           $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
@@ -198,6 +202,53 @@ jobs:
             if (-not (Test-Path $path)) {
               throw "Package is missing required file: $file"
             }
+          }
+
+          $ownedBinaries = @(
+            @{ Name = 'windbg-tool.exe'; OriginalFilename = 'windbg-tool.exe' },
+            @{ Name = 'ttd_replay_bridge.dll'; OriginalFilename = 'ttd_replay_bridge.dll' }
+          )
+          $expectedVersion = '${{ inputs.version }}'
+          if ([string]::IsNullOrWhiteSpace($expectedVersion)) {
+            $expectedVersion = '0.1.0'
+          }
+          $expectedFileVersion = if ($expectedVersion -match '^(?<core>\d+(?:\.\d+){0,3})') {
+            $parts = @($Matches['core'] -split '\.')
+            while ($parts.Count -lt 4) { $parts += '0' }
+            ($parts[0..3] -join '.')
+          } else {
+            throw "Unable to derive PE file version from '$expectedVersion'"
+          }
+
+          foreach ($binary in $ownedBinaries) {
+            $path = Join-Path $packageDir $binary.Name
+            $info = [System.Diagnostics.FileVersionInfo]::GetVersionInfo($path)
+            if ([string]::IsNullOrWhiteSpace($info.CompanyName) -or $info.CompanyName -ne 'Devolutions') {
+              throw "$($binary.Name) is missing CompanyName=Devolutions (got '$($info.CompanyName)')"
+            }
+            if ([string]::IsNullOrWhiteSpace($info.ProductName) -or $info.ProductName -ne 'WinDbg Tool') {
+              throw "$($binary.Name) is missing ProductName=WinDbg Tool (got '$($info.ProductName)')"
+            }
+            if ([string]::IsNullOrWhiteSpace($info.FileDescription)) {
+              throw "$($binary.Name) is missing FileDescription"
+            }
+            if ([string]::IsNullOrWhiteSpace($info.FileVersion)) {
+              throw "$($binary.Name) is missing FileVersion"
+            }
+            if ($info.FileVersion -ne $expectedFileVersion -and $info.FileVersion -ne $expectedVersion) {
+              throw "$($binary.Name) FileVersion '$($info.FileVersion)' does not match expected '$expectedFileVersion'"
+            }
+            if ([string]::IsNullOrWhiteSpace($info.ProductVersion) -or (
+                $info.ProductVersion -ne $expectedVersion -and
+                $info.ProductVersion -ne $expectedFileVersion
+              )) {
+              throw "$($binary.Name) ProductVersion '$($info.ProductVersion)' does not match expected '$expectedVersion'"
+            }
+            if ($info.OriginalFilename -ne $binary.OriginalFilename) {
+              throw "$($binary.Name) OriginalFilename '$($info.OriginalFilename)' does not match '$($binary.OriginalFilename)'"
+            }
+            Write-Host ("Version OK: {0} FileVersion={1} ProductVersion={2} Company={3}" -f `
+              $binary.Name, $info.FileVersion, $info.ProductVersion, $info.CompanyName)
           }
 
           if ('${{ matrix.can_run }}' -eq 'true') {

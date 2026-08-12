@@ -10,8 +10,13 @@ members = [
 resolver = "2"
 
 [workspace.package]
+version = "0.1.0"
 edition = "2021"
 license = "MIT"
+authors = ["Devolutions"]
+repository = "https://github.com/Devolutions/windbg-tool"
+homepage = "https://github.com/Devolutions/windbg-tool"
+description = "Windows-first CLI and MCP server for WinDbg-oriented debugging workflows"
 
 [workspace.dependencies]
 anyhow = "1.0"
