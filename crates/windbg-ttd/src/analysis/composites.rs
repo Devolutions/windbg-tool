@@ -368,7 +368,9 @@ fn debug_target_snapshot(
     if section_enabled(args, "status") {
         sections.insert(
             "status".into(),
-            section_result(|| state.targets.target_status(TargetRequest { target_id })),
+            status_section_result("target status", || {
+                state.targets.target_status(TargetRequest { target_id })
+            }),
         );
     }
     if section_enabled(args, "capabilities") {
@@ -389,19 +391,23 @@ fn debug_target_snapshot(
     if section_enabled(args, "registers") {
         sections.insert(
             "registers".into(),
-            section_result(|| state.targets.core_registers(TargetRequest { target_id })),
+            status_section_result("target core-registers", || {
+                state.targets.core_registers(TargetRequest { target_id })
+            }),
         );
     }
     if section_enabled(args, "event") {
         sections.insert(
             "event".into(),
-            section_result(|| state.targets.last_event(TargetRequest { target_id })),
+            status_section_result("target last-event", || {
+                state.targets.last_event(TargetRequest { target_id })
+            }),
         );
     }
     if section_enabled(args, "threads") {
         sections.insert(
             "threads".into(),
-            section_result(|| {
+            status_section_result("target list-threads", || {
                 let value =
                     serde_json::to_value(state.targets.list_threads(TargetRequest { target_id })?)?;
                 Ok(bound_array(value, "threads", args.max_threads))
@@ -411,7 +417,7 @@ fn debug_target_snapshot(
     if section_enabled(args, "modules") {
         sections.insert(
             "modules".into(),
-            section_result(|| {
+            status_section_result("target list-modules", || {
                 let value =
                     serde_json::to_value(state.targets.list_modules(TargetRequest { target_id })?)?;
                 Ok(bound_array(value, "modules", args.max_modules))
@@ -421,7 +427,7 @@ fn debug_target_snapshot(
     if section_enabled(args, "stack") {
         sections.insert(
             "stack".into(),
-            section_result(|| {
+            status_section_result("target stack-trace", || {
                 state.targets.stack_trace(TargetStackTraceRequest {
                     target_id,
                     max_frames: args.max_frames,
@@ -432,7 +438,7 @@ fn debug_target_snapshot(
     if section_enabled(args, "disassembly") {
         sections.insert(
             "disassembly".into(),
-            section_result(|| {
+            status_section_result("target disassemble", || {
                 state.targets.disassemble(TargetDisassembleRequest {
                     target_id,
                     address: None,
@@ -444,7 +450,9 @@ fn debug_target_snapshot(
     if section_enabled(args, "breakpoints") {
         sections.insert(
             "breakpoints".into(),
-            section_result(|| state.targets.list_breakpoints(TargetRequest { target_id })),
+            status_section_result("target list-breakpoints", || {
+                state.targets.list_breakpoints(TargetRequest { target_id })
+            }),
         );
     }
     filter_sections(&mut sections, &args.include, &args.exclude);
@@ -616,6 +624,24 @@ fn section_result<T: serde::Serialize>(f: impl FnOnce() -> anyhow::Result<T>) ->
     match f() {
         Ok(value) => json!({ "ok": true, "value": value }),
         Err(error) => json!({ "ok": false, "error": error.to_string() }),
+    }
+}
+
+fn status_section_result<T: serde::Serialize>(
+    command: &str,
+    f: impl FnOnce() -> anyhow::Result<T>,
+) -> Value {
+    match f() {
+        Ok(value) => json!({
+            "status": "ok",
+            "value": value,
+            "command": command
+        }),
+        Err(error) => json!({
+            "status": "error",
+            "error": error.to_string(),
+            "command": command
+        }),
     }
 }
 
