@@ -10,6 +10,7 @@ bytes.workspace = true
 http-body-util.workspace = true
 hyper.workspace = true
 hyper-util.workspace = true
+iced-x86 = "1.21"
 libloading.workspace = true
 schemars.workspace = true
 serde.workspace = true
@@ -20,3 +21,9 @@ tokio.workspace = true
 tracing.workspace = true
 windbg-dbgeng = { path = "..\\windbg-dbgeng" }
 windbg-symbols = { path = "..\\windbg-symbols" }
+
+[target.'cfg(windows)'.dependencies]
+windows = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+] }

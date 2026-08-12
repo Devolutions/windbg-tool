@@ -7,7 +7,6 @@ license.workspace = true
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
-iced-x86 = "1.21"
 rmcp.workspace = true
 serde.workspace = true
 serde_json.workspace = true

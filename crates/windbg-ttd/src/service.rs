@@ -54,6 +54,14 @@ impl ReplayService {
 
     pub async fn call_tool(&self, call: ToolCall) -> anyhow::Result<Value> {
         match call.name.as_str() {
+            "daemon_health" => {
+                return Ok(serde_json::to_value(self.health().await)?);
+            }
+            "session_list" => {
+                return Ok(serde_json::json!({
+                    "sessions": self.sessions().await,
+                }));
+            }
             "job_start_watch_memory_sweep" => {
                 let request: SweepWatchMemoryJobRequest =
                     serde_json::from_value(call.arguments).context("invalid tool arguments")?;

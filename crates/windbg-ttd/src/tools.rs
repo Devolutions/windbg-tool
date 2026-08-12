@@ -1,4 +1,27 @@
-use crate::jobs::{JobRequest, SweepWatchMemoryJobRequest};
+use crate::analysis::{
+    breakpoint_plan, debug_capabilities, debug_log_summarize, debug_snapshot, discover_manifest,
+    dump_triage, module_search_order, pe_exports, pe_inspect, recipes_value,
+    remote_connect_command, remote_doctor, remote_explain, remote_plan, remote_server_command,
+    remote_status, source_resolve, symbols_diagnose, symbols_doctor, target_disassemble,
+    target_memory_chase, target_memory_classify, target_memory_dps, target_memory_dump,
+    target_memory_strings, target_stack_recover, triage_run, ttd_architecture_state,
+    ttd_context_snapshot, ttd_disassemble, ttd_exception_focus, ttd_memory_chase,
+    ttd_memory_classify, ttd_memory_dps, ttd_memory_dump, ttd_memory_strings, ttd_module_audit,
+    ttd_object_vtable, ttd_open, ttd_replay_to, ttd_stack_backtrace, ttd_stack_recover,
+    ttd_symbols_nearest, ttd_timeline_events, ArchitectureStateRequest, BreakpointPlanRequest,
+    ContextSnapshotRequest, DebugCapabilitiesArgs, DebugLogSummarizeRequest, DebugSnapshotRequest,
+    DisassembleRequest, DumpTriageRequest, ExceptionFocusRequest, MemoryAnalysisRequest,
+    MemoryChaseRequest, MemoryDpsRequest, MemoryDumpRequest, MemoryStringsRequest,
+    ModuleAuditRequest, ModuleSearchOrderRequest, ObjectVtableRequest, OpenTraceRequest,
+    PeExportsRequest, PeInspectRequest, RecipesArgs, RemoteConnectCommandRequest,
+    RemoteDoctorRequest, RemoteExplainRequest, RemotePlanRequest, RemoteServerCommandRequest,
+    RemoteStatusRequest, ReplayToRequest, SourceResolveRequest, StackBacktraceRequest,
+    StackRecoverRequest, SymbolsDiagnoseRequest, SymbolsDoctorRequest, SymbolsNearestRequest,
+    TargetDisassembleAnalysisRequest, TargetMemoryAnalysisRequest, TargetMemoryChaseRequest,
+    TargetMemoryDpsRequest, TargetMemoryDumpRequest, TargetMemoryStringsRequest,
+    TargetStackRecoverRequest, TimelineEventsRequest, TriageRunRequest,
+};
+use crate::jobs::{ttd_watch_memory_sweep, JobRequest, SweepWatchMemoryJobRequest};
 use crate::state::ServiceState;
 use crate::targets::{
     DumpOpenRequest, LiveAttachRequest, LiveLaunchRequest, TargetAddressRequest,
@@ -47,6 +70,130 @@ struct EmptyArgs {
 
 pub fn definitions() -> Vec<Tool> {
     vec![
+        tool::<EmptyArgs>(
+            "daemon_health",
+            "Return health, uptime, and active session/target/job counts for the shared windbg-tool daemon (or in-process service).",
+        ),
+        tool::<EmptyArgs>(
+            "session_list",
+            "List daemon-owned TTD trace sessions and cursors shared with the CLI.",
+        ),
+        tool::<EmptyArgs>(
+            "discover",
+            "Catalog preferred MCP entrypoints, recipes, backend capabilities, and daemon session model.",
+        ),
+        tool::<EmptyArgs>(
+            "recipes_list",
+            "List TimDbg-inspired investigation recipes available to agents.",
+        ),
+        tool::<RecipesArgs>(
+            "recipes_get",
+            "Fetch recipes by id or tag such as crash-triage, stack-corruption, or symbol-health.",
+        ),
+        tool::<DebugCapabilitiesArgs>(
+            "debug_capabilities",
+            "Return the cross-backend capability matrix, optionally focused on a TTD session/cursor or live/dump target.",
+        ),
+        tool::<OpenTraceRequest>(
+            "ttd_open",
+            "Load a TTD trace, create a cursor, and optionally seek to a position in one call.",
+        ),
+        tool::<ContextSnapshotRequest>(
+            "ttd_context_snapshot",
+            "Capture a TTD-focused agent context snapshot (position, stack, registers, timeline, disassembly).",
+        ),
+        tool::<DebugSnapshotRequest>(
+            "debug_snapshot",
+            "Capture a section-filterable debug snapshot for a TTD cursor or live/dump target.",
+        ),
+        tool::<TriageRunRequest>(
+            "triage_run",
+            "Run a bounded triage pack (crash/hang/access_violation/memory_corruption/loader/symbol_health/deadlock).",
+        ),
+        tool::<DisassembleRequest>(
+            "ttd_disassemble",
+            "Disassemble x64 instructions at an address or the current cursor RIP with classification tags.",
+        ),
+        tool::<StackRecoverRequest>(
+            "ttd_stack_recover",
+            "Recover return-address candidates from a bounded stack scan (heuristic, not a trusted unwind).",
+        ),
+        tool::<StackBacktraceRequest>(
+            "ttd_stack_backtrace",
+            "Build a heuristic backtrace from the current PC plus recovered stack return-address candidates.",
+        ),
+        tool::<MemoryDumpRequest>(
+            "ttd_memory_dump",
+            "Read guest memory and format it as db/dq/ascii/utf16 dump rows.",
+        ),
+        tool::<MemoryAnalysisRequest>(
+            "ttd_memory_classify",
+            "Classify a memory window (entropy, strings, pointer-like qwords, instruction hints).",
+        ),
+        tool::<MemoryStringsRequest>(
+            "ttd_memory_strings",
+            "Extract bounded ASCII/UTF-16 strings from a guest memory window.",
+        ),
+        tool::<MemoryDpsRequest>(
+            "ttd_memory_dps",
+            "Dump pointer-sized slots (dps-style) with optional address_info enrichment.",
+        ),
+        tool::<MemoryChaseRequest>(
+            "ttd_memory_chase",
+            "Follow a bounded pointer chain (base + offset) through guest memory.",
+        ),
+        tool::<TimelineEventsRequest>(
+            "ttd_timeline_events",
+            "Merge module/thread/exception/keyframe events into a chronological timeline.",
+        ),
+        tool::<ExceptionFocusRequest>(
+            "ttd_exception_focus",
+            "Seek a cursor to a recorded exception by index, preserving exact TTD position and thread.",
+        ),
+        tool::<ArchitectureStateRequest>(
+            "ttd_architecture_state",
+            "Report architecture detection and which x64 helpers are available for a TTD cursor.",
+        ),
+        tool::<ModuleAuditRequest>(
+            "ttd_module_audit",
+            "Audit loaded modules for suspicious paths, missing binaries, and duplicate basenames.",
+        ),
+        tool::<ObjectVtableRequest>(
+            "ttd_object_vtable",
+            "Read a COM/C++ object vtable pointer and classify vtable entries (read-only).",
+        ),
+        tool::<ModuleSearchOrderRequest>(
+            "module_search_order",
+            "Model common user-mode DLL search-order candidates for a basename (host diagnostic).",
+        ),
+        tool::<SourceResolveRequest>(
+            "source_resolve",
+            "Resolve a recorded source path via trailing path-component match under search roots.",
+        ),
+        tool::<BreakpointPlanRequest>(
+            "breakpoint_plan",
+            "Plan a code breakpoint or TTD memory watchpoint for a target or TTD session/cursor.",
+        ),
+        tool::<PeInspectRequest>(
+            "pe_inspect",
+            "Inspect PE image identity (timestamp, SizeOfImage, CodeView/PDB keys, export summary) from a host path.",
+        ),
+        tool::<PeExportsRequest>(
+            "pe_exports",
+            "List and optionally filter PE export symbols from a host path.",
+        ),
+        tool::<SymbolsNearestRequest>(
+            "ttd_symbols_nearest",
+            "Resolve nearest PE export for a TTD address via module path + RVA (low-fidelity fallback).",
+        ),
+        tool::<SymbolsDiagnoseRequest>(
+            "symbols_diagnose",
+            "Diagnose TTD session symbol readiness: paths, PE/PDB identity samples, and capability checks.",
+        ),
+        tool::<SymbolsDoctorRequest>(
+            "symbols_doctor",
+            "Compose a bounded symbol/source doctor pack for a TTD session/cursor or live/dump target.",
+        ),
         tool::<LoadTraceRequest>(
             "ttd_load_trace",
             "Load a .run/.idx/.ttd trace for offline replay.",
@@ -180,6 +327,82 @@ pub fn definitions() -> Vec<Tool> {
             "dump_open_session",
             "Open a dump file as a daemon-owned read-only target session.",
         ),
+        tool::<DumpTriageRequest>(
+            "dump_inspect",
+            "Open a dump offline and return bounded inspect evidence (modules, threads, registers, stack, triage).",
+        ),
+        tool::<DumpTriageRequest>(
+            "dump_triage",
+            "Open a dump offline and return structured bugcheck-context triage without a daemon session.",
+        ),
+        tool::<DumpTriageRequest>(
+            "dump_pool_triage",
+            "Open a dump offline and return bounded pool-corruption triage (pool tracker, address probes).",
+        ),
+        tool::<RemoteExplainRequest>(
+            "remote_explain",
+            "Explain DbgSrv versus NTSD/CDB remote debugging workflows and when to use each.",
+        ),
+        tool::<RemoteServerCommandRequest>(
+            "remote_server_command",
+            "Generate a target-side process-server or ntsd/cdb -server command line.",
+        ),
+        tool::<RemoteConnectCommandRequest>(
+            "remote_connect_command",
+            "Generate a host-side WinDbg/cdb -remote connect command line.",
+        ),
+        tool::<RemoteDoctorRequest>(
+            "remote_doctor",
+            "Diagnose remote debugging setup (transport parse, optional TCP probe, command plan).",
+        ),
+        tool::<RemoteStatusRequest>(
+            "remote_status",
+            "Report remote transport parse status and optional TCP connectivity probe.",
+        ),
+        tool::<RemotePlanRequest>(
+            "remote_plan",
+            "Produce a stepwise remote debugging plan with server and connect commands.",
+        ),
+        tool::<DebugLogSummarizeRequest>(
+            "debug_log_summarize",
+            "Summarize a windbg-tool action JSONL log (path or WINDBG_TOOL_ACTION_LOG).",
+        ),
+        tool::<ReplayToRequest>(
+            "ttd_replay_to",
+            "Seek a TTD cursor to a position/percent and return before/after positions.",
+        ),
+        tool::<SweepWatchMemoryJobRequest>(
+            "ttd_watch_memory_sweep",
+            "Synchronously collect multiple TTD memory-watchpoint hits (bounded; mutates cursor).",
+        ),
+        tool::<TargetDisassembleAnalysisRequest>(
+            "target_disassemble_analysis",
+            "Disassemble x64 instructions from a live/dump target using the shared iced-x86 helper.",
+        ),
+        tool::<TargetMemoryDumpRequest>(
+            "target_memory_dump",
+            "Format a live/dump target memory window (db/dq/ascii/utf16).",
+        ),
+        tool::<TargetMemoryAnalysisRequest>(
+            "target_memory_classify",
+            "Classify a live/dump target memory window (entropy, strings, pointer-like qwords).",
+        ),
+        tool::<TargetMemoryStringsRequest>(
+            "target_memory_strings",
+            "Extract bounded ASCII/UTF-16 strings from a live/dump target memory window.",
+        ),
+        tool::<TargetMemoryDpsRequest>(
+            "target_memory_dps",
+            "Dump pointer-sized slots from a live/dump target memory window.",
+        ),
+        tool::<TargetMemoryChaseRequest>(
+            "target_memory_chase",
+            "Follow a bounded pointer chain through live/dump target memory.",
+        ),
+        tool::<TargetStackRecoverRequest>(
+            "target_stack_recover",
+            "Recover return-address candidates from a live/dump target stack window.",
+        ),
         tool::<EmptyArgs>("target_list", "List daemon-owned live and dump target sessions."),
         tool::<TargetRequest>(
             "target_status",
@@ -303,13 +526,136 @@ pub fn definitions() -> Vec<Tool> {
         ),
         tool::<EmptyArgs>("job_list", "List daemon-owned background replay jobs."),
         tool::<JobRequest>("job_status", "Show the current status of a daemon-owned replay job."),
-        tool::<JobRequest>("job_result", "Fetch the latest result payload for a daemon-owned replay job."),
+        tool::<JobRequest>(
+            "job_result",
+            "Fetch the latest result payload for a daemon-owned replay job.",
+        ),
         tool::<JobRequest>("job_cancel", "Request cancellation for a daemon-owned replay job."),
     ]
 }
 
 pub async fn call(state: &mut ServiceState, call: ToolCall) -> anyhow::Result<Value> {
     match call.name.as_str() {
+        // Handled by ReplayService::call_tool so health/uptime stay accurate.
+        "daemon_health" | "session_list" => {
+            bail!("{} must be dispatched by ReplayService", call.name)
+        }
+        "discover" => {
+            let names = definitions()
+                .into_iter()
+                .map(|tool| tool.name.to_string())
+                .collect::<Vec<_>>();
+            Ok(discover_manifest(&names))
+        }
+        "recipes_list" => Ok(recipes_value(None)?),
+        "recipes_get" => {
+            let request = parse::<RecipesArgs>(call.arguments)?;
+            Ok(recipes_value(request.topic.as_deref())?)
+        }
+        "debug_capabilities" => {
+            let request = parse::<DebugCapabilitiesArgs>(call.arguments)?;
+            debug_capabilities(state, request)
+        }
+        "ttd_open" => {
+            let request = parse::<OpenTraceRequest>(call.arguments)?;
+            ttd_open(state, request)
+        }
+        "ttd_context_snapshot" => {
+            let request = parse::<ContextSnapshotRequest>(call.arguments)?;
+            ttd_context_snapshot(state, request)
+        }
+        "debug_snapshot" => {
+            let request = parse::<DebugSnapshotRequest>(call.arguments)?;
+            debug_snapshot(state, request)
+        }
+        "triage_run" => {
+            let request = parse::<TriageRunRequest>(call.arguments)?;
+            triage_run(state, request)
+        }
+        "ttd_disassemble" => {
+            let request = parse::<DisassembleRequest>(call.arguments)?;
+            ttd_disassemble(state, request)
+        }
+        "ttd_stack_recover" => {
+            let request = parse::<StackRecoverRequest>(call.arguments)?;
+            ttd_stack_recover(state, request)
+        }
+        "ttd_stack_backtrace" => {
+            let request = parse::<StackBacktraceRequest>(call.arguments)?;
+            ttd_stack_backtrace(state, request)
+        }
+        "ttd_memory_dump" => {
+            let request = parse::<MemoryDumpRequest>(call.arguments)?;
+            ttd_memory_dump(state, request)
+        }
+        "ttd_memory_classify" => {
+            let request = parse::<MemoryAnalysisRequest>(call.arguments)?;
+            ttd_memory_classify(state, request)
+        }
+        "ttd_memory_strings" => {
+            let request = parse::<MemoryStringsRequest>(call.arguments)?;
+            ttd_memory_strings(state, request)
+        }
+        "ttd_memory_dps" => {
+            let request = parse::<MemoryDpsRequest>(call.arguments)?;
+            ttd_memory_dps(state, request)
+        }
+        "ttd_memory_chase" => {
+            let request = parse::<MemoryChaseRequest>(call.arguments)?;
+            ttd_memory_chase(state, request)
+        }
+        "ttd_timeline_events" => {
+            let request = parse::<TimelineEventsRequest>(call.arguments)?;
+            ttd_timeline_events(state, request)
+        }
+        "ttd_exception_focus" => {
+            let request = parse::<ExceptionFocusRequest>(call.arguments)?;
+            ttd_exception_focus(state, request)
+        }
+        "ttd_architecture_state" => {
+            let request = parse::<ArchitectureStateRequest>(call.arguments)?;
+            ttd_architecture_state(state, request)
+        }
+        "ttd_module_audit" => {
+            let request = parse::<ModuleAuditRequest>(call.arguments)?;
+            ttd_module_audit(state, request)
+        }
+        "ttd_object_vtable" => {
+            let request = parse::<ObjectVtableRequest>(call.arguments)?;
+            ttd_object_vtable(state, request)
+        }
+        "module_search_order" => {
+            let request = parse::<ModuleSearchOrderRequest>(call.arguments)?;
+            module_search_order(request)
+        }
+        "source_resolve" => {
+            let request = parse::<SourceResolveRequest>(call.arguments)?;
+            source_resolve(request)
+        }
+        "breakpoint_plan" => {
+            let request = parse::<BreakpointPlanRequest>(call.arguments)?;
+            breakpoint_plan(request)
+        }
+        "pe_inspect" => {
+            let request = parse::<PeInspectRequest>(call.arguments)?;
+            pe_inspect(request)
+        }
+        "pe_exports" => {
+            let request = parse::<PeExportsRequest>(call.arguments)?;
+            pe_exports(request)
+        }
+        "ttd_symbols_nearest" => {
+            let request = parse::<SymbolsNearestRequest>(call.arguments)?;
+            ttd_symbols_nearest(state, request)
+        }
+        "symbols_diagnose" => {
+            let request = parse::<SymbolsDiagnoseRequest>(call.arguments)?;
+            symbols_diagnose(state, request)
+        }
+        "symbols_doctor" => {
+            let request = parse::<SymbolsDoctorRequest>(call.arguments)?;
+            symbols_doctor(state, request)
+        }
         "ttd_load_trace" => {
             let request = parse::<LoadTraceRequest>(call.arguments)?;
             Ok(serde_json::to_value(state.ttd.load_trace(request)?)?)
@@ -489,6 +835,91 @@ pub async fn call(state: &mut ServiceState, call: ToolCall) -> anyhow::Result<Va
         "dump_open_session" => {
             let request = parse::<DumpOpenRequest>(call.arguments)?;
             Ok(serde_json::to_value(state.targets.open_dump(request)?)?)
+        }
+        "dump_inspect" => {
+            let mut request = parse::<DumpTriageRequest>(call.arguments)?;
+            if request.profile.is_none() {
+                request.profile = Some("inspect".to_string());
+            }
+            dump_triage(request)
+        }
+        "dump_triage" => {
+            let mut request = parse::<DumpTriageRequest>(call.arguments)?;
+            if request.profile.is_none() {
+                request.profile = Some("triage".to_string());
+            }
+            dump_triage(request)
+        }
+        "dump_pool_triage" => {
+            let mut request = parse::<DumpTriageRequest>(call.arguments)?;
+            if request.profile.is_none() {
+                request.profile = Some("pool_triage".to_string());
+            }
+            dump_triage(request)
+        }
+        "remote_explain" => {
+            let request = parse::<RemoteExplainRequest>(call.arguments)?;
+            remote_explain(request)
+        }
+        "remote_server_command" => {
+            let request = parse::<RemoteServerCommandRequest>(call.arguments)?;
+            remote_server_command(request)
+        }
+        "remote_connect_command" => {
+            let request = parse::<RemoteConnectCommandRequest>(call.arguments)?;
+            remote_connect_command(request)
+        }
+        "remote_doctor" => {
+            let request = parse::<RemoteDoctorRequest>(call.arguments)?;
+            remote_doctor(request)
+        }
+        "remote_status" => {
+            let request = parse::<RemoteStatusRequest>(call.arguments)?;
+            remote_status(request)
+        }
+        "remote_plan" => {
+            let request = parse::<RemotePlanRequest>(call.arguments)?;
+            remote_plan(request)
+        }
+        "debug_log_summarize" => {
+            let request = parse::<DebugLogSummarizeRequest>(call.arguments)?;
+            debug_log_summarize(request)
+        }
+        "ttd_replay_to" => {
+            let request = parse::<ReplayToRequest>(call.arguments)?;
+            ttd_replay_to(state, request)
+        }
+        "ttd_watch_memory_sweep" => {
+            let request = parse::<SweepWatchMemoryJobRequest>(call.arguments)?;
+            ttd_watch_memory_sweep(state, request)
+        }
+        "target_disassemble_analysis" => {
+            let request = parse::<TargetDisassembleAnalysisRequest>(call.arguments)?;
+            target_disassemble(state, request)
+        }
+        "target_memory_dump" => {
+            let request = parse::<TargetMemoryDumpRequest>(call.arguments)?;
+            target_memory_dump(state, request)
+        }
+        "target_memory_classify" => {
+            let request = parse::<TargetMemoryAnalysisRequest>(call.arguments)?;
+            target_memory_classify(state, request)
+        }
+        "target_memory_strings" => {
+            let request = parse::<TargetMemoryStringsRequest>(call.arguments)?;
+            target_memory_strings(state, request)
+        }
+        "target_memory_dps" => {
+            let request = parse::<TargetMemoryDpsRequest>(call.arguments)?;
+            target_memory_dps(state, request)
+        }
+        "target_memory_chase" => {
+            let request = parse::<TargetMemoryChaseRequest>(call.arguments)?;
+            target_memory_chase(state, request)
+        }
+        "target_stack_recover" => {
+            let request = parse::<TargetStackRecoverRequest>(call.arguments)?;
+            target_stack_recover(state, request)
         }
         "target_list" => {
             let _request = parse::<EmptyArgs>(call.arguments)?;
@@ -673,11 +1104,16 @@ fn tool_annotations(name: &str) -> ToolAnnotations {
 fn tool_is_read_only(name: &str) -> bool {
     !matches!(
         name,
-        "ttd_load_trace"
+        "ttd_open"
+            | "ttd_load_trace"
             | "ttd_close_trace"
             | "ttd_index_build"
             | "ttd_position_set"
+            | "ttd_exception_focus"
             | "ttd_step"
+            | "ttd_replay_to"
+            | "ttd_watch_memory_sweep"
+            | "job_start_watch_memory_sweep"
             | "job_cancel"
             | "target_write_dump"
             | "target_close"
@@ -692,7 +1128,6 @@ fn tool_is_read_only(name: &str) -> bool {
             | "live_launch_session"
             | "live_attach_process"
             | "dump_open_session"
-            | "sweep_watch_memory_start"
     )
 }
 
@@ -706,7 +1141,46 @@ fn tool_is_destructive(name: &str) -> bool {
 fn tool_is_idempotent(name: &str) -> bool {
     matches!(
         name,
-        "ttd_trace_info"
+        "daemon_health"
+            | "session_list"
+            | "discover"
+            | "recipes_list"
+            | "recipes_get"
+            | "debug_capabilities"
+            | "ttd_context_snapshot"
+            | "debug_snapshot"
+            | "triage_run"
+            | "dump_inspect"
+            | "dump_triage"
+            | "dump_pool_triage"
+            | "remote_explain"
+            | "remote_server_command"
+            | "remote_connect_command"
+            | "remote_doctor"
+            | "remote_status"
+            | "remote_plan"
+            | "debug_log_summarize"
+            | "ttd_disassemble"
+            | "ttd_stack_recover"
+            | "ttd_stack_backtrace"
+            | "ttd_memory_dump"
+            | "ttd_memory_classify"
+            | "ttd_memory_strings"
+            | "ttd_memory_dps"
+            | "ttd_memory_chase"
+            | "ttd_timeline_events"
+            | "ttd_architecture_state"
+            | "ttd_module_audit"
+            | "ttd_object_vtable"
+            | "module_search_order"
+            | "source_resolve"
+            | "breakpoint_plan"
+            | "pe_inspect"
+            | "pe_exports"
+            | "ttd_symbols_nearest"
+            | "symbols_diagnose"
+            | "symbols_doctor"
+            | "ttd_trace_info"
             | "ttd_capabilities"
             | "ttd_index_status"
             | "ttd_index_stats"
@@ -722,17 +1196,34 @@ fn tool_is_idempotent(name: &str) -> bool {
             | "target_capabilities"
             | "target_list"
             | "target_status"
+            | "target_disassemble_analysis"
+            | "target_memory_dump"
+            | "target_memory_classify"
+            | "target_memory_strings"
+            | "target_memory_dps"
+            | "target_memory_chase"
+            | "target_stack_recover"
     )
 }
 
 fn tool_is_open_world(name: &str) -> bool {
     matches!(
         name,
-        "ttd_load_trace"
+        "ttd_open"
+            | "ttd_load_trace"
             | "ttd_trace_list"
             | "live_launch_session"
             | "live_attach_process"
             | "dump_open_session"
+            | "dump_inspect"
+            | "dump_triage"
+            | "dump_pool_triage"
+            | "debug_log_summarize"
+            | "remote_doctor"
+            | "remote_status"
+            | "pe_inspect"
+            | "pe_exports"
+            | "source_resolve"
             | "target_write_dump"
     )
 }

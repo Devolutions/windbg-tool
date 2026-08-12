@@ -2041,7 +2041,6 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
- "iced-x86",
  "rmcp",
  "serde",
  "serde_json",
@@ -2063,6 +2062,7 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
+ "iced-x86",
  "libloading",
  "rmcp",
  "schemars 0.8.22",
@@ -2073,6 +2073,7 @@ dependencies = [
  "tracing",
  "windbg-dbgeng",
  "windbg-symbols",
+ "windows",
 ]
 
 [[package]]

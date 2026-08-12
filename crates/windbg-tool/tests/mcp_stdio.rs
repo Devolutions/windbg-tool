@@ -6,6 +6,7 @@ use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 #[test]
 fn initialize_ping_and_tools_list_roundtrip_over_stdio() -> anyhow::Result<()> {
@@ -16,6 +17,13 @@ fn initialize_ping_and_tools_list_roundtrip_over_stdio() -> anyhow::Result<()> {
     ensure!(
         initialize["result"]["capabilities"]["tools"].is_object(),
         "initialize result should advertise tools capability: {initialize}"
+    );
+    let instructions = initialize["result"]["instructions"]
+        .as_str()
+        .unwrap_or_default();
+    ensure!(
+        instructions.contains("daemon"),
+        "initialize instructions should describe daemon-backed sessions: {initialize}"
     );
 
     let ping = client.request(json!({
@@ -51,6 +59,52 @@ fn initialize_ping_and_tools_list_roundtrip_over_stdio() -> anyhow::Result<()> {
     for tool in tools {
         assert_tool_schema(tool)?;
     }
+
+    let health = client.call_tool_json(4, "daemon_health", json!({}))?;
+    ensure!(
+        health["ok"].as_bool() == Some(true) || health["pid"].is_number(),
+        "daemon_health should report a live service: {health}"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn mcp_loaded_session_is_visible_to_cli_sessions() -> anyhow::Result<()> {
+    let mut client = McpClient::start()?;
+    client.initialize()?;
+
+    let load = client.call_tool_json(
+        30,
+        "ttd_load_trace",
+        json!({
+            "trace_path": path_string(&std::env::temp_dir().join(format!(
+                "windbg-tool-mcp-placeholder-{}.run",
+                std::process::id()
+            ))),
+        }),
+    )?;
+    let session_id = load["session_id"]
+        .as_u64()
+        .context("ttd_load_trace should return session_id")?;
+
+    let sessions = client.call_tool_json(31, "session_list", json!({}))?;
+    ensure!(
+        sessions["sessions"].as_array().is_some_and(|items| items
+            .iter()
+            .any(|session| session["session_id"] == session_id)),
+        "session_list should include the MCP-loaded session: {sessions}"
+    );
+
+    let cli_sessions = run_cli_json(&client.pipe, ["sessions".to_string()])?;
+    ensure!(
+        cli_sessions["sessions"]
+            .as_array()
+            .is_some_and(|items| items
+                .iter()
+                .any(|session| session["session_id"] == session_id)),
+        "CLI sessions should see the MCP-loaded daemon session: {cli_sessions}"
+    );
 
     Ok(())
 }
@@ -752,6 +806,8 @@ struct McpClient {
     child: Child,
     stdin: ChildStdin,
     stdout: BufReader<ChildStdout>,
+    pipe: String,
+    shutdown_daemon: bool,
 }
 
 impl McpClient {
@@ -764,13 +820,22 @@ impl McpClient {
         I: IntoIterator<Item = S>,
         S: AsRef<std::ffi::OsStr>,
     {
-        let mut child = Command::new(server_binary())
+        let pipe = unique_pipe_name();
+        let mut command = Command::new(server_binary());
+        command
+            .arg("--pipe")
+            .arg(&pipe)
             .args(args)
+            // Keep MCP integration tests hermetic regardless of the developer machine
+            // symbol environment that the daemon process would otherwise inherit.
+            .env_remove("_NT_SYMBOL_PATH")
+            .env_remove("_NT_ALT_SYMBOL_PATH")
+            .env_remove("WINDBG_TOOL_SYMBOL_PATH")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .context("spawning windbg-tool")?;
+            .stderr(Stdio::piped());
+
+        let mut child = command.spawn().context("spawning windbg-tool")?;
         let stdin = child.stdin.take().context("child stdin was not piped")?;
         let stdout = child.stdout.take().context("child stdout was not piped")?;
 
@@ -778,6 +843,8 @@ impl McpClient {
             child,
             stdin,
             stdout: BufReader::new(stdout),
+            pipe,
+            shutdown_daemon: true,
         })
     }
 
@@ -847,6 +914,17 @@ impl Drop for McpClient {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
+        if self.shutdown_daemon {
+            let _ = Command::new(server_binary())
+                .arg("--pipe")
+                .arg(&self.pipe)
+                .arg("daemon")
+                .arg("shutdown")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+        }
     }
 }
 
@@ -862,6 +940,41 @@ fn server_binary() -> PathBuf {
             path.push(format!("windbg-tool{}", std::env::consts::EXE_SUFFIX));
             path
         })
+}
+
+fn unique_pipe_name() -> String {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    format!(
+        r"\\.\pipe\windbg-tool-mcp-test-{}-{nanos}",
+        std::process::id()
+    )
+}
+
+fn run_cli_json(pipe: &str, args: impl IntoIterator<Item = String>) -> anyhow::Result<Value> {
+    let output = Command::new(server_binary())
+        .arg("--pipe")
+        .arg(pipe)
+        .args(args)
+        .env_remove("_NT_SYMBOL_PATH")
+        .env_remove("_NT_ALT_SYMBOL_PATH")
+        .env_remove("WINDBG_TOOL_SYMBOL_PATH")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .context("running windbg-tool CLI helper")?;
+    if !output.status.success() {
+        bail!(
+            "CLI helper failed with status {}\nstdout:\n{}\nstderr:\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    serde_json::from_slice(&output.stdout).context("parsing CLI JSON output")
 }
 
 fn parse_tool_json(response: &Value) -> anyhow::Result<Value> {
@@ -882,6 +995,37 @@ fn ping_load_trace_args(trace_path: &Path) -> Value {
 
 fn expected_tool_names() -> &'static [&'static str] {
     &[
+        "daemon_health",
+        "session_list",
+        "discover",
+        "recipes_list",
+        "recipes_get",
+        "debug_capabilities",
+        "ttd_open",
+        "ttd_context_snapshot",
+        "debug_snapshot",
+        "triage_run",
+        "ttd_disassemble",
+        "ttd_stack_recover",
+        "ttd_stack_backtrace",
+        "ttd_memory_dump",
+        "ttd_memory_classify",
+        "ttd_memory_strings",
+        "ttd_memory_dps",
+        "ttd_memory_chase",
+        "ttd_timeline_events",
+        "ttd_exception_focus",
+        "ttd_architecture_state",
+        "ttd_module_audit",
+        "ttd_object_vtable",
+        "module_search_order",
+        "source_resolve",
+        "breakpoint_plan",
+        "pe_inspect",
+        "pe_exports",
+        "ttd_symbols_nearest",
+        "symbols_diagnose",
+        "symbols_doctor",
         "ttd_load_trace",
         "ttd_trace_list",
         "ttd_close_trace",
@@ -913,6 +1057,25 @@ fn expected_tool_names() -> &'static [&'static str] {
         "ttd_memory_range",
         "ttd_memory_buffer",
         "ttd_memory_watchpoint",
+        "ttd_replay_to",
+        "ttd_watch_memory_sweep",
+        "dump_inspect",
+        "dump_triage",
+        "dump_pool_triage",
+        "remote_explain",
+        "remote_server_command",
+        "remote_connect_command",
+        "remote_doctor",
+        "remote_status",
+        "remote_plan",
+        "debug_log_summarize",
+        "target_disassemble_analysis",
+        "target_memory_dump",
+        "target_memory_classify",
+        "target_memory_strings",
+        "target_memory_dps",
+        "target_memory_chase",
+        "target_stack_recover",
     ]
 }
 
@@ -950,7 +1113,18 @@ fn assert_tool_schema(tool: &Value) -> anyhow::Result<()> {
 
 fn required_args_for_tool(name: &str) -> anyhow::Result<&'static [&'static str]> {
     match name {
-        "ttd_load_trace" | "ttd_trace_list" => Ok(&["trace_path"]),
+        "daemon_health"
+        | "session_list"
+        | "discover"
+        | "recipes_list"
+        | "recipes_get"
+        | "debug_capabilities"
+        | "ttd_context_snapshot"
+        | "debug_snapshot"
+        | "target_list"
+        | "job_list" => Ok(&[]),
+        "ttd_open" | "ttd_load_trace" | "ttd_trace_list" => Ok(&["trace_path"]),
+        "triage_run" => Ok(&["kind"]),
         "ttd_close_trace"
         | "ttd_trace_info"
         | "ttd_capabilities"
@@ -976,12 +1150,55 @@ fn required_args_for_tool(name: &str) -> anyhow::Result<&'static [&'static str]>
         "ttd_position_set" => Ok(&["session_id", "cursor_id", "position"]),
         "ttd_step" => Ok(&["session_id", "cursor_id"]),
         "ttd_stack_read" => Ok(&["session_id", "cursor_id"]),
+        "ttd_disassemble"
+        | "ttd_stack_recover"
+        | "ttd_stack_backtrace"
+        | "ttd_exception_focus"
+        | "ttd_architecture_state" => Ok(&["session_id", "cursor_id"]),
+        "ttd_module_audit" => Ok(&["session_id"]),
+        "ttd_timeline_events" => Ok(&["session_id"]),
+        "ttd_memory_dump"
+        | "ttd_memory_classify"
+        | "ttd_memory_strings"
+        | "ttd_memory_dps"
+        | "ttd_memory_chase"
+        | "ttd_object_vtable" => Ok(&["session_id", "cursor_id", "address"]),
+        "module_search_order" => Ok(&["dll"]),
+        "source_resolve" => Ok(&["recorded_path"]),
+        "breakpoint_plan" => Ok(&[]),
+        "pe_inspect" => Ok(&["path"]),
+        "pe_exports" => Ok(&["path"]),
+        "ttd_symbols_nearest" => Ok(&["session_id", "cursor_id", "address"]),
+        "symbols_diagnose" => Ok(&["session_id"]),
+        "symbols_doctor" => Ok(&[]),
         "ttd_read_memory" => Ok(&["session_id", "cursor_id", "address", "size"]),
         "ttd_memory_range" => Ok(&["session_id", "cursor_id", "address"]),
         "ttd_memory_buffer" => Ok(&["session_id", "cursor_id", "address", "size"]),
         "live_launch_session" => Ok(&["command_line"]),
         "live_attach_process" => Ok(&["process_id"]),
-        "dump_open_session" => Ok(&["path"]),
+        "dump_open_session" | "dump_inspect" | "dump_triage" | "dump_pool_triage" => Ok(&["path"]),
+        "remote_explain"
+        | "remote_doctor"
+        | "remote_status"
+        | "remote_plan"
+        | "remote_server_command"
+        | "debug_log_summarize" => Ok(&[]),
+        "remote_connect_command" => Ok(&["server"]),
+        "ttd_replay_to" => Ok(&["session_id", "cursor_id", "position"]),
+        "ttd_watch_memory_sweep" => Ok(&[
+            "session_id",
+            "cursor_id",
+            "address",
+            "size",
+            "access",
+            "direction",
+        ]),
+        "target_disassemble_analysis" | "target_stack_recover" => Ok(&["target_id"]),
+        "target_memory_dump"
+        | "target_memory_classify"
+        | "target_memory_strings"
+        | "target_memory_dps" => Ok(&["target_id", "address"]),
+        "target_memory_chase" => Ok(&["target_id", "address"]),
         "target_status"
         | "target_close"
         | "target_terminate"
@@ -1018,7 +1235,6 @@ fn required_args_for_tool(name: &str) -> anyhow::Result<&'static [&'static str]>
             "access",
             "direction",
         ]),
-        "job_list" => Ok(&[]),
         "job_status" | "job_result" | "job_cancel" => Ok(&["job_id"]),
         "ttd_memory_watchpoint" => Ok(&[
             "session_id",
@@ -1028,7 +1244,6 @@ fn required_args_for_tool(name: &str) -> anyhow::Result<&'static [&'static str]>
             "access",
             "direction",
         ]),
-        "target_list" => Ok(&[]),
         _ => bail!("unexpected tool listed by server: {name}"),
     }
 }

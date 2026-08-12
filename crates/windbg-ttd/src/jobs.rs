@@ -305,7 +305,7 @@ async fn run_watch_memory_sweep_job(
         if should_cancel {
             let _ = state_guard.jobs.cancel_with_result(
                 job_id,
-                build_sweep_result(&request, &hits, "cancelled", true),
+                build_sweep_result(&request, &hits, "cancelled", true, true),
             );
             return;
         }
@@ -339,7 +339,7 @@ async fn run_watch_memory_sweep_job(
             hits.push(hit_value);
             let _ = state_guard.jobs.complete(
                 job_id,
-                build_sweep_result(&request, &hits, stop_reason, false),
+                build_sweep_result(&request, &hits, stop_reason, false, true),
             );
             return;
         }
@@ -350,7 +350,7 @@ async fn run_watch_memory_sweep_job(
                 hits.push(hit_value);
                 let _ = state_guard.jobs.complete(
                     job_id,
-                    build_sweep_result(&request, &hits, stop_reason, false),
+                    build_sweep_result(&request, &hits, stop_reason, false, true),
                 );
                 return;
             }
@@ -379,8 +379,73 @@ async fn run_watch_memory_sweep_job(
     let mut state_guard = state.lock().await;
     let _ = state_guard.jobs.complete(
         job_id,
-        build_sweep_result(&request, &hits, stop_reason, false),
+        build_sweep_result(&request, &hits, stop_reason, false, true),
     );
+}
+
+/// Synchronous bounded multi-hit memory watchpoint sweep (CLI `sweep watch-memory`).
+pub fn ttd_watch_memory_sweep(
+    state: &mut ServiceState,
+    request: SweepWatchMemoryJobRequest,
+) -> anyhow::Result<Value> {
+    if request.max_hits == 0 {
+        bail!("max_hits must be greater than zero");
+    }
+    if request.max_hits > 1024 {
+        bail!("max_hits must not exceed 1024");
+    }
+
+    let mut hits = Vec::new();
+    let mut seen_positions = BTreeSet::new();
+    let mut stop_reason = "max_hits";
+
+    for _ in 0..request.max_hits {
+        let hit = state.ttd.memory_watchpoint(MemoryWatchpointRequest {
+            session_id: request.session_id,
+            cursor_id: request.cursor_id,
+            address: request.address,
+            size: request.size,
+            access: request.access,
+            direction: request.direction,
+            thread_unique_id: request.thread_unique_id,
+        })?;
+        let hit_value = serde_json::to_value(&hit)?;
+
+        if !hit.found {
+            stop_reason = "not_found";
+            hits.push(hit_value);
+            break;
+        }
+
+        if let Some(sequence) = hit.position.sequence.checked_into() {
+            if !seen_positions.insert(sequence) {
+                stop_reason = "duplicate_position";
+                hits.push(hit_value);
+                break;
+            }
+        }
+
+        hits.push(hit_value);
+        let direction = match request.direction {
+            MemoryAccessDirection::Previous => StepDirection::Backward,
+            _ => StepDirection::Forward,
+        };
+        state.ttd.step(StepRequest {
+            session_id: request.session_id,
+            cursor_id: request.cursor_id,
+            direction,
+            kind: StepKind::Step,
+            count: 1,
+        })?;
+    }
+
+    Ok(build_sweep_result(
+        &request,
+        &hits,
+        stop_reason,
+        false,
+        false,
+    ))
 }
 
 fn build_sweep_result(
@@ -388,6 +453,7 @@ fn build_sweep_result(
     hits: &[Value],
     stop_reason: &str,
     cancelled: bool,
+    background: bool,
 ) -> Value {
     json!({
         "session_id": request.session_id,
@@ -401,8 +467,13 @@ fn build_sweep_result(
         "hit_count": hits.iter().filter(|hit| hit["found"].as_bool() == Some(true)).count(),
         "stop_reason": stop_reason,
         "cancelled": cancelled,
-        "background": true,
+        "background": background,
         "hits": hits,
+        "notes": [
+            "Bounded multi-hit sweep over first-hit TTD memory watchpoints.",
+            "Advances one step after each hit to avoid reporting the same position repeatedly.",
+            "Use job_start_watch_memory_sweep for daemon-owned background execution with cancel/status."
+        ]
     })
 }
 

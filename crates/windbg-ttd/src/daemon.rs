@@ -44,6 +44,7 @@ pub async fn run_daemon(_pipe_name: String) -> anyhow::Result<()> {
 }
 
 #[cfg(windows)]
+#[derive(Clone)]
 pub struct DaemonClient {
     pipe_name: String,
 }
@@ -100,6 +101,7 @@ impl DaemonClient {
 }
 
 #[cfg(not(windows))]
+#[derive(Clone)]
 pub struct DaemonClient {
     pipe_name: String,
 }
