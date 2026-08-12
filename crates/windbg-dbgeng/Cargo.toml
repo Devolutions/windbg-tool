@@ -1,8 +1,12 @@
 [package]
 name = "windbg-dbgeng"
-version = "0.1.0"
+version.workspace = true
 edition.workspace = true
 license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "DbgEng process-server and live-launch helpers for windbg-tool"
 
 [dependencies]
 anyhow.workspace = true

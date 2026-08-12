@@ -343,6 +343,13 @@ fn native_build(options: &XtaskOptions) -> anyhow::Result<()> {
         ))
         .env("Platform", options.arch.msvc_platform());
 
+    if let Ok(version) = env::var("WINDBG_TOOL_VERSION") {
+        let version = version.trim();
+        if !version.is_empty() {
+            configure.arg(format!("-DTTD_BRIDGE_VERSION={version}"));
+        }
+    }
+
     if options.static_crt {
         configure.arg("-DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded$<$<CONFIG:Debug>:Debug>");
     }

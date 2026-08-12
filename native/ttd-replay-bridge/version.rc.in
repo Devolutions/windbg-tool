@@ -1,0 +1,39 @@
+#include <winver.h>
+
+#define VER_FILEVERSION             @TTD_BRIDGE_VERSION_MAJOR@,@TTD_BRIDGE_VERSION_MINOR@,@TTD_BRIDGE_VERSION_PATCH@,@TTD_BRIDGE_VERSION_BUILD@
+#define VER_FILEVERSION_STR         "@TTD_BRIDGE_FILE_VERSION@\0"
+#define VER_PRODUCTVERSION          @TTD_BRIDGE_VERSION_MAJOR@,@TTD_BRIDGE_VERSION_MINOR@,@TTD_BRIDGE_VERSION_PATCH@,@TTD_BRIDGE_VERSION_BUILD@
+#define VER_PRODUCTVERSION_STR      "@TTD_BRIDGE_PRODUCT_VERSION@\0"
+
+VS_VERSION_INFO VERSIONINFO
+ FILEVERSION VER_FILEVERSION
+ PRODUCTVERSION VER_PRODUCTVERSION
+ FILEFLAGSMASK VS_FFI_FILEFLAGSMASK
+#ifdef _DEBUG
+ FILEFLAGS VS_FF_DEBUG
+#else
+ FILEFLAGS 0x0L
+#endif
+ FILEOS VOS_NT_WINDOWS32
+ FILETYPE VFT_DLL
+ FILESUBTYPE VFT2_UNKNOWN
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904B0"
+        BEGIN
+            VALUE "CompanyName",      "Devolutions\0"
+            VALUE "FileDescription",  "TTD Replay API bridge for windbg-tool\0"
+            VALUE "FileVersion",      VER_FILEVERSION_STR
+            VALUE "InternalName",     "ttd_replay_bridge\0"
+            VALUE "LegalCopyright",   "Copyright (c) Devolutions\0"
+            VALUE "OriginalFilename", "ttd_replay_bridge.dll\0"
+            VALUE "ProductName",      "WinDbg Tool\0"
+            VALUE "ProductVersion",   VER_PRODUCTVERSION_STR
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x0409, 1200
+    END
+END

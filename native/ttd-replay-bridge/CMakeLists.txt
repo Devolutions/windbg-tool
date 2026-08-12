@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.16)
 
-project(ttd_replay_bridge LANGUAGES CXX)
+project(ttd_replay_bridge LANGUAGES CXX RC)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -10,6 +10,46 @@ if(NOT DEFINED TTD_APIS_PACKAGE_DIR)
     set(TTD_APIS_PACKAGE_DIR "${CMAKE_CURRENT_LIST_DIR}/../../target/nuget/Microsoft.TimeTravelDebugging.Apis.0.9.5")
 endif()
 
+if(NOT DEFINED TTD_BRIDGE_VERSION OR TTD_BRIDGE_VERSION STREQUAL "")
+    set(TTD_BRIDGE_VERSION "0.1.0")
+endif()
+
+# Strip pre-release/build metadata for the PE numeric version fields.
+string(REGEX REPLACE "[-+].*$" "" TTD_BRIDGE_VERSION_CORE "${TTD_BRIDGE_VERSION}")
+string(REPLACE "." ";" TTD_BRIDGE_VERSION_LIST "${TTD_BRIDGE_VERSION_CORE}")
+list(LENGTH TTD_BRIDGE_VERSION_LIST TTD_BRIDGE_VERSION_LEN)
+if(TTD_BRIDGE_VERSION_LEN GREATER_EQUAL 1)
+    list(GET TTD_BRIDGE_VERSION_LIST 0 TTD_BRIDGE_VERSION_MAJOR)
+else()
+    set(TTD_BRIDGE_VERSION_MAJOR 0)
+endif()
+if(TTD_BRIDGE_VERSION_LEN GREATER_EQUAL 2)
+    list(GET TTD_BRIDGE_VERSION_LIST 1 TTD_BRIDGE_VERSION_MINOR)
+else()
+    set(TTD_BRIDGE_VERSION_MINOR 0)
+endif()
+if(TTD_BRIDGE_VERSION_LEN GREATER_EQUAL 3)
+    list(GET TTD_BRIDGE_VERSION_LIST 2 TTD_BRIDGE_VERSION_PATCH)
+else()
+    set(TTD_BRIDGE_VERSION_PATCH 0)
+endif()
+if(TTD_BRIDGE_VERSION_LEN GREATER_EQUAL 4)
+    list(GET TTD_BRIDGE_VERSION_LIST 3 TTD_BRIDGE_VERSION_BUILD)
+else()
+    set(TTD_BRIDGE_VERSION_BUILD 0)
+endif()
+
+set(TTD_BRIDGE_FILE_VERSION
+    "${TTD_BRIDGE_VERSION_MAJOR}.${TTD_BRIDGE_VERSION_MINOR}.${TTD_BRIDGE_VERSION_PATCH}.${TTD_BRIDGE_VERSION_BUILD}"
+)
+set(TTD_BRIDGE_PRODUCT_VERSION "${TTD_BRIDGE_VERSION}")
+
+configure_file(
+    "${CMAKE_CURRENT_LIST_DIR}/version.rc.in"
+    "${CMAKE_CURRENT_BINARY_DIR}/version.rc"
+    @ONLY
+)
+
 find_package(
     Microsoft.TimeTravelDebugging.Apis
     CONFIG
@@ -18,7 +58,10 @@ find_package(
     NO_DEFAULT_PATH
 )
 
-add_library(ttd_replay_bridge SHARED ttd_replay_bridge.cpp)
+add_library(ttd_replay_bridge SHARED
+    ttd_replay_bridge.cpp
+    "${CMAKE_CURRENT_BINARY_DIR}/version.rc"
+)
 
 target_compile_definitions(ttd_replay_bridge
     PRIVATE
@@ -36,4 +79,5 @@ set_target_properties(ttd_replay_bridge PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
     LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
     ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib"
+    VERSION "${TTD_BRIDGE_VERSION_MAJOR}.${TTD_BRIDGE_VERSION_MINOR}.${TTD_BRIDGE_VERSION_PATCH}"
 )
