@@ -10,7 +10,9 @@ use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
-use windbg_dbgeng::{open_dump_session, DebuggerSession, DumpOpenOptions, ModuleInfo};
+use windbg_dbgeng::{
+    open_dump_session, DebuggerSession, DumpOpenOptions, KernelDumpHeaderInventory, ModuleInfo,
+};
 use windbg_symbols::{
     image_matches, inspect_pe_image_identity, prefetch_image, prefetch_pdb, NativeImageStatus,
     NativeSymbolStatus, PeImageIdentity,
@@ -83,6 +85,7 @@ pub fn dump_triage(request: DumpTriageRequest) -> anyhow::Result<Value> {
     let dump_metadata = fs::metadata(&request.path)
         .with_context(|| format!("reading dump metadata for {}", request.path.display()))?;
     let minidump_directory = windbg_dbgeng::inspect_minidump_directory(&request.path);
+    let kernel_dump_header = windbg_dbgeng::inspect_kernel_dump_header(&request.path);
     let operation_started = Instant::now();
     let opened_at = Instant::now();
     let session = open_dump_session(DumpOpenOptions {
@@ -122,6 +125,7 @@ pub fn dump_triage(request: DumpTriageRequest) -> anyhow::Result<Value> {
             target: &target,
             modules: &modules,
             bugcheck: &bugcheck,
+            kernel_dump_header: &kernel_dump_header,
             current_stack: &stack,
             max_frames: request.max_frames,
             refresh_symbols: request.refresh_symbols,
@@ -135,6 +139,7 @@ pub fn dump_triage(request: DumpTriageRequest) -> anyhow::Result<Value> {
         "triage_profile": triage_profile_label(request.profile.as_deref()),
         "target": target,
         "minidump_directory": minidump_directory,
+        "kernel_dump_header": kernel_dump_header,
         "modules": modules,
         "threads": threads,
         "registers": registers,
@@ -417,6 +422,7 @@ struct DumpTriageInput<'a> {
     target: &'a windbg_dbgeng::DebuggerSessionSummary,
     modules: &'a [ModuleInfo],
     bugcheck: &'a windbg_dbgeng::BugCheckDataResult,
+    kernel_dump_header: &'a KernelDumpHeaderInventory,
     current_stack: &'a windbg_dbgeng::StackTraceResult,
     max_frames: u32,
     refresh_symbols: bool,
@@ -431,7 +437,10 @@ fn dump_triage_value(session: &DebuggerSession, input: DumpTriageInput<'_>) -> V
     let fault = fault_address.map(|address| dump_address_observation(session, address, 8));
     let exception_context =
         dump_exception_context(session, input.target, bugcheck_data, input.max_frames);
+    let exception_record = dump_exception_record(session, bugcheck_data, input.current_stack);
     let snapshot_event = dump_snapshot_event_observation(session, input.bugcheck);
+    let debugger_context = dump_debugger_context(session);
+    let verifier = dump_verifier_observation(session);
     let symbol_modules = dump_symbol_modules(session, fault_address, &exception_context);
     let symbol_readiness = dump_symbol_readiness(session, &symbol_modules, input.refresh_symbols);
     let driver_evidence = dump_driver_evidence(
@@ -455,9 +464,16 @@ fn dump_triage_value(session: &DebuggerSession, input: DumpTriageInput<'_>) -> V
 
     json!({
         "bugcheck": dump_bugcheck_value(input.bugcheck),
+        "bugcheck_reconciliation": dump_bugcheck_reconciliation(
+            input.bugcheck,
+            input.kernel_dump_header,
+        ),
         "fault": fault,
         "exception_context": exception_context,
+        "exception_record": exception_record,
         "snapshot_event": snapshot_event,
+        "debugger_context": debugger_context,
+        "driver_verifier": verifier,
         "current_stack": input.current_stack,
         "symbol_readiness": symbol_readiness,
         "native_symbol_prefetch": input.native_symbols,
@@ -587,6 +603,271 @@ fn dump_bugcheck_value(bugcheck: &windbg_dbgeng::BugCheckDataResult) -> Value {
         "parameters": data.parameters,
         "parameter_roles": parameter_roles,
         "detail": bugcheck.detail,
+    })
+}
+
+fn dump_exception_record(
+    session: &DebuggerSession,
+    bugcheck: Option<&windbg_dbgeng::BugCheckData>,
+    stack: &windbg_dbgeng::StackTraceResult,
+) -> Option<Value> {
+    const MAX_STACK_SCAN_BYTES: u64 = 64 * 1024;
+    let data = bugcheck?;
+    if !matches!(data.code, 0x0000_001E | 0x0000_003B) {
+        return None;
+    }
+    let mut stack_addresses = stack
+        .frames
+        .iter()
+        .take(stack.valid_frames as usize)
+        .flat_map(|frame| [frame.stack_offset, frame.frame_offset])
+        .filter(|address| address >> 48 == 0xFFFF);
+    let Some(start) = stack_addresses.next() else {
+        return Some(json!({
+            "status": "unavailable",
+            "detail": "The validated stack has no canonical kernel-stack addresses to scan.",
+        }));
+    };
+    let (start, end) = stack_addresses.fold((start, start), |(minimum, maximum), address| {
+        (minimum.min(address), maximum.max(address))
+    });
+    let requested_size = end
+        .saturating_add(0x200)
+        .saturating_sub(start)
+        .min(MAX_STACK_SCAN_BYTES) as u32;
+    let memory = match session.read_memory(start, requested_size) {
+        Ok(memory) => memory,
+        Err(error) => {
+            return Some(json!({
+                "status": "unavailable",
+                "scan_start": start,
+                "requested_size": requested_size,
+                "detail": format!("DbgEng could not read the bounded kernel-stack window: {error}"),
+            }));
+        }
+    };
+    let Some(bytes) = decode_hex_bytes(&memory.data) else {
+        return Some(json!({
+            "status": "unavailable",
+            "scan_start": start,
+            "requested_size": requested_size,
+            "detail": "DbgEng returned malformed hexadecimal for the bounded kernel-stack window.",
+        }));
+    };
+    let candidates =
+        scan_x64_exception_records(start, &bytes, data.parameters[0] as u32, data.parameters[1]);
+    Some(json!({
+        "status": match candidates.len() {
+            0 => "not_found",
+            1 => "captured",
+            _ => "ambiguous",
+        },
+        "selection": (candidates.len() == 1).then(|| candidates[0].clone()),
+        "candidates": candidates,
+        "scan_start": start,
+        "bytes_read": memory.bytes_read,
+        "requested_size": requested_size,
+        "detail": "Candidates use the documented EXCEPTION_RECORD64 layout and must match both the bugcheck exception code and exact fault address. The kernel-stack scan is bounded to 64 KiB.",
+    }))
+}
+
+fn scan_x64_exception_records(
+    base_address: u64,
+    bytes: &[u8],
+    expected_code: u32,
+    expected_address: u64,
+) -> Vec<Value> {
+    const HEADER_SIZE: usize = 0x20;
+    let mut candidates = Vec::new();
+    for offset in (0..bytes.len().saturating_sub(HEADER_SIZE - 1)).step_by(4) {
+        let Some(code) = stack_u32(bytes, offset) else {
+            continue;
+        };
+        let Some(address) = stack_u64(bytes, offset + 0x10) else {
+            continue;
+        };
+        let Some(parameter_count) = stack_u32(bytes, offset + 0x18) else {
+            continue;
+        };
+        if code != expected_code || address != expected_address || parameter_count > 15 {
+            continue;
+        }
+        let record_size = HEADER_SIZE + parameter_count as usize * 8;
+        if offset + record_size > bytes.len() {
+            continue;
+        }
+        let parameters = (0..parameter_count as usize)
+            .filter_map(|index| stack_u64(bytes, offset + HEADER_SIZE + index * 8))
+            .collect::<Vec<_>>();
+        candidates.push(json!({
+            "record_address": base_address + offset as u64,
+            "exception_code": code,
+            "exception_flags": stack_u32(bytes, offset + 4),
+            "nested_exception_record": stack_u64(bytes, offset + 8),
+            "exception_address": address,
+            "number_parameters": parameter_count,
+            "parameters": parameters,
+        }));
+    }
+    candidates
+}
+
+fn stack_u32(bytes: &[u8], offset: usize) -> Option<u32> {
+    bytes
+        .get(offset..offset + 4)?
+        .try_into()
+        .ok()
+        .map(u32::from_le_bytes)
+}
+
+fn stack_u64(bytes: &[u8], offset: usize) -> Option<u64> {
+    bytes
+        .get(offset..offset + 8)?
+        .try_into()
+        .ok()
+        .map(u64::from_le_bytes)
+}
+
+fn dump_bugcheck_reconciliation(
+    bugcheck: &windbg_dbgeng::BugCheckDataResult,
+    raw_header: &KernelDumpHeaderInventory,
+) -> Value {
+    let dbgeng = bugcheck.data.as_ref();
+    let raw = raw_header.bugcheck_code.zip(raw_header.bugcheck_parameters);
+    let status = match (dbgeng, raw) {
+        (Some(dbgeng), Some((raw_code, raw_parameters)))
+            if dbgeng.code == raw_code && dbgeng.parameters == raw_parameters =>
+        {
+            "exact_match"
+        }
+        (Some(_), Some(_)) => "mismatch",
+        _ => "unavailable",
+    };
+    json!({
+        "status": status,
+        "dbgeng_source": "IDebugControl::ReadBugCheckData",
+        "raw_source": raw_header.source,
+        "raw_header_status": raw_header.status,
+        "detail": match status {
+            "exact_match" => "DbgEng and the independently decoded, signature-gated raw x64 kernel dump header report the same bugcheck code and four parameters.",
+            "mismatch" => "DbgEng and the independently decoded raw x64 kernel dump header disagree. Do not select either tuple without resolving the discrepancy.",
+            _ => "At least one bugcheck source was unavailable, so the tuples could not be reconciled.",
+        },
+    })
+}
+
+fn dump_debugger_context(session: &DebuggerSession) -> Value {
+    let pseudo_registers = ["@$pid", "@$tid", "@$tpid", "@$ttid", "@$proc", "@$thread"]
+        .into_iter()
+        .map(|expression| match session.evaluate(expression) {
+            Ok(value) => json!({
+                "status": "captured",
+                "value": value,
+            }),
+            Err(error) => json!({
+                "status": "unavailable",
+                "expression": expression,
+                "detail": format!("{error:#}"),
+            }),
+        })
+        .collect::<Vec<_>>();
+    let target_executable = match session.current_process_executable_name() {
+        Ok(name) => json!({
+            "status": "captured",
+            "name": name,
+        }),
+        Err(error) => json!({
+            "status": "unavailable",
+            "detail": format!("{error:#}"),
+        }),
+    };
+    json!({
+        "source": "documented_dbgeng_pseudo_registers",
+        "debugger_target_executable": target_executable,
+        "pseudo_registers": pseudo_registers,
+        "detail": "The pseudo-registers identify DbgEng's selected dump process/thread context. The executable-name API can report the kernel target image rather than the selected EPROCESS image in kernel dumps. These observations are not promoted to fault-time identity unless the documented bugcheck context and validated stack independently link them.",
+    })
+}
+
+fn dump_verifier_observation(session: &DebuggerSession) -> Value {
+    let expression = "nt!VerifierLevel";
+    let evaluation = match session.evaluate(expression) {
+        Ok(value) => value,
+        Err(error) => {
+            return json!({
+                "status": "unavailable",
+                "source": "fixed_symbol_and_bounded_memory_read",
+                "expression": expression,
+                "detail": format!("DbgEng could not resolve VerifierLevel: {error:#}"),
+            });
+        }
+    };
+    let Some(address) = evaluation.unsigned_value else {
+        return json!({
+            "status": "unavailable",
+            "source": "fixed_symbol_and_bounded_memory_read",
+            "expression": expression,
+            "evaluation": evaluation,
+            "detail": "DbgEng resolved VerifierLevel without an integer address.",
+        });
+    };
+    let memory = match session.read_memory(address, 4) {
+        Ok(memory) if memory.complete => memory,
+        Ok(memory) => {
+            return json!({
+                "status": "partial",
+                "source": "fixed_symbol_and_bounded_memory_read",
+                "expression": expression,
+                "address": address,
+                "evaluation": evaluation,
+                "memory": memory,
+                "detail": "The bounded four-byte VerifierLevel read was incomplete.",
+            });
+        }
+        Err(error) => {
+            return json!({
+                "status": "unavailable",
+                "source": "fixed_symbol_and_bounded_memory_read",
+                "expression": expression,
+                "address": address,
+                "evaluation": evaluation,
+                "detail": format!("DbgEng could not read VerifierLevel: {error:#}"),
+            });
+        }
+    };
+    let level = decode_hex_bytes(&memory.data)
+        .and_then(|bytes| bytes.get(..4)?.try_into().ok())
+        .map(u32::from_le_bytes);
+    let Some(level) = level else {
+        return json!({
+            "status": "unavailable",
+            "source": "fixed_symbol_and_bounded_memory_read",
+            "expression": expression,
+            "address": address,
+            "evaluation": evaluation,
+            "memory": memory,
+            "detail": "DbgEng returned malformed data for the bounded four-byte VerifierLevel read.",
+        });
+    };
+    let configured_features = [(0x1_u32, "special_pool"), (0x8_u32, "pool_tracking")]
+        .into_iter()
+        .filter_map(|(mask, name)| (level & mask != 0).then_some(name))
+        .collect::<Vec<_>>();
+    json!({
+        "status": "captured",
+        "source": "fixed_symbol_and_bounded_memory_read",
+        "expression": expression,
+        "address": address,
+        "evaluation": evaluation,
+        "memory": memory,
+        "level": level,
+        "active": level != 0,
+        "configured_features": configured_features,
+        "target_driver": {
+            "status": "not_established",
+            "detail": "No private verifier-driver list layout is decoded. A nonzero global level establishes enabled verifier features, not which driver was targeted."
+        },
+        "detail": "VerifierLevel is captured by resolving one fixed symbol and reading exactly four bytes. The feature names report only the documented 0x1 Special Pool and 0x8 Pool Tracking bits; no verifier extension command or private structure traversal is used.",
     })
 }
 
@@ -1458,6 +1739,42 @@ fn dump_driver_evidence(
             }
         }
     }
+    let stack_module_details = modules
+        .iter()
+        .filter(|module| {
+            module
+                .module_name
+                .as_ref()
+                .is_some_and(|name| stack_modules.contains(name))
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let stack_module_parameters = if stack_module_details.is_empty() {
+        json!({
+            "status": "not_applicable",
+            "modules": [],
+            "parameters": [],
+        })
+    } else {
+        let bases = stack_module_details
+            .iter()
+            .map(|module| module.base_address)
+            .collect::<Vec<_>>();
+        match session.module_parameters(&bases) {
+            Ok(parameters) => json!({
+                "status": "captured",
+                "modules": stack_module_details,
+                "parameters": parameters,
+                "detail": "DbgEng module parameters capture image size, timestamp, checksum, flags, and symbol type for validated stack modules. They do not attribute causation.",
+            }),
+            Err(error) => json!({
+                "status": "unavailable",
+                "modules": stack_module_details,
+                "parameters": [],
+                "detail": format!("DbgEng could not query validated stack-module parameters: {error}"),
+            }),
+        }
+    };
     for module in stack_modules {
         observations.push(json!({
             "kind": "validated_stack_module",
@@ -1474,6 +1791,7 @@ fn dump_driver_evidence(
             "no_driver_implicated"
         },
         "observations": observations,
+        "stack_module_parameters": stack_module_parameters,
         "loaded_module_count": modules.len(),
         "inventory_rank": "not_implicated",
         "detail": format!(
@@ -1581,6 +1899,68 @@ mod tests {
             })[0]["priority"],
             "high"
         );
+    }
+
+    #[test]
+    fn reconciles_matching_raw_and_dbgeng_bugcheck_tuples() {
+        let bugcheck = windbg_dbgeng::BugCheckDataResult {
+            status: "captured".to_string(),
+            data: Some(windbg_dbgeng::BugCheckData {
+                code: 0x3b,
+                parameters: [0xC000_0005, 0xFFFF_F800_7166_70B0, 0x1234, 0],
+            }),
+            detail: "fixture".to_string(),
+        };
+        let raw = KernelDumpHeaderInventory {
+            source: "raw_kernel_dump_header".to_string(),
+            status: "captured".to_string(),
+            file_bytes: Some(0x2000),
+            signature: Some("PAGE".to_string()),
+            valid_dump: Some("DU64".to_string()),
+            major_version: Some(15),
+            minor_version: Some(26100),
+            machine_image_type: Some(0x8664),
+            number_processors: Some(24),
+            bugcheck_code: Some(0x3b),
+            bugcheck_parameters: Some([0xC000_0005, 0xFFFF_F800_7166_70B0, 0x1234, 0]),
+            dump_type: Some(5),
+            dump_type_name: Some("bitmap_full".to_string()),
+            required_dump_space: Some(0x2000),
+            detail: "fixture".to_string(),
+        };
+
+        assert_eq!(
+            dump_bugcheck_reconciliation(&bugcheck, &raw)["status"],
+            "exact_match"
+        );
+    }
+
+    #[test]
+    fn exception_record_scan_requires_code_and_fault_address() {
+        let mut bytes = vec![0_u8; 0x120];
+        let offset = 0x40;
+        bytes[offset..offset + 4].copy_from_slice(&0xC000_0005_u32.to_le_bytes());
+        bytes[offset + 0x10..offset + 0x18]
+            .copy_from_slice(&0xFFFF_F800_7166_70B0_u64.to_le_bytes());
+        bytes[offset + 0x18..offset + 0x1c].copy_from_slice(&2_u32.to_le_bytes());
+        bytes[offset + 0x20..offset + 0x28].copy_from_slice(&1_u64.to_le_bytes());
+        bytes[offset + 0x28..offset + 0x30]
+            .copy_from_slice(&0xFFFF_9B81_02B4_9540_u64.to_le_bytes());
+        bytes[0x80..0x84].copy_from_slice(&0xC000_0005_u32.to_le_bytes());
+        bytes[0x90..0x98].copy_from_slice(&0xFFFF_F800_7166_70B1_u64.to_le_bytes());
+
+        let records = scan_x64_exception_records(
+            0xFFFF_8107_9A37_8000,
+            &bytes,
+            0xC000_0005,
+            0xFFFF_F800_7166_70B0,
+        );
+
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0]["record_address"], 0xFFFF_8107_9A37_8040_u64);
+        assert_eq!(records[0]["number_parameters"], 2);
+        assert_eq!(records[0]["parameters"][0], 1);
+        assert_eq!(records[0]["parameters"][1], 0xFFFF_9B81_02B4_9540_u64);
     }
 
     #[test]
