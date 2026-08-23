@@ -1053,6 +1053,25 @@ pub struct MinidumpDirectoryInventory {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct KernelDumpHeaderInventory {
+    pub source: String,
+    pub status: String,
+    pub file_bytes: Option<u64>,
+    pub signature: Option<String>,
+    pub valid_dump: Option<String>,
+    pub major_version: Option<u32>,
+    pub minor_version: Option<u32>,
+    pub machine_image_type: Option<u32>,
+    pub number_processors: Option<u32>,
+    pub bugcheck_code: Option<u32>,
+    pub bugcheck_parameters: Option<[u64; 4]>,
+    pub dump_type: Option<u32>,
+    pub dump_type_name: Option<String>,
+    pub required_dump_space: Option<u64>,
+    pub detail: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct ThreadContext {
     pub thread: ThreadInfo,
     pub registers: CoreRegisterState,
@@ -1090,6 +1109,128 @@ pub fn write_process_dump(options: ProcessDumpOptions) -> anyhow::Result<DumpWri
 const MINIDUMP_HEADER_SIZE: usize = 32;
 const MINIDUMP_DIRECTORY_SIZE: usize = 12;
 const MINIDUMP_SIGNATURE: u32 = 0x504d_444d;
+const KERNEL_DUMP_HEADER_PROBE_SIZE: usize = 0x1000;
+const KERNEL_DUMP_SIGNATURE: u32 = 0x4547_4150;
+const KERNEL_DUMP_VALID_DUMP64: u32 = 0x3436_5544;
+
+pub fn inspect_kernel_dump_header(path: &Path) -> KernelDumpHeaderInventory {
+    let file_bytes = match fs::metadata(path) {
+        Ok(metadata) => metadata.len(),
+        Err(error) => {
+            return unavailable_kernel_dump_header(
+                None,
+                format!("Could not read dump metadata: {error}"),
+            );
+        }
+    };
+    if file_bytes < KERNEL_DUMP_HEADER_PROBE_SIZE as u64 {
+        return unavailable_kernel_dump_header(
+            Some(file_bytes),
+            format!(
+                "File contains {file_bytes} bytes, fewer than the bounded 0x{KERNEL_DUMP_HEADER_PROBE_SIZE:X}-byte kernel dump header probe."
+            ),
+        );
+    }
+
+    let mut file = match fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) => {
+            return unavailable_kernel_dump_header(
+                Some(file_bytes),
+                format!("Could not open the dump for bounded header inspection: {error}"),
+            );
+        }
+    };
+    let mut header = [0_u8; KERNEL_DUMP_HEADER_PROBE_SIZE];
+    if let Err(error) = file.read_exact(&mut header) {
+        return unavailable_kernel_dump_header(
+            Some(file_bytes),
+            format!("Could not read the bounded kernel dump header probe: {error}"),
+        );
+    }
+
+    let signature = minidump_u32(&header, 0);
+    let valid_dump = minidump_u32(&header, 4);
+    if signature != KERNEL_DUMP_SIGNATURE || valid_dump != KERNEL_DUMP_VALID_DUMP64 {
+        return KernelDumpHeaderInventory {
+            source: "raw_kernel_dump_header".to_string(),
+            status: "not_x64_kernel_dump".to_string(),
+            file_bytes: Some(file_bytes),
+            signature: Some(format!("0x{signature:08X}")),
+            valid_dump: Some(format!("0x{valid_dump:08X}")),
+            major_version: None,
+            minor_version: None,
+            machine_image_type: None,
+            number_processors: None,
+            bugcheck_code: None,
+            bugcheck_parameters: None,
+            dump_type: None,
+            dump_type_name: None,
+            required_dump_space: None,
+            detail: "The bounded probe did not have both the PAGE and DU64 signatures, so no x64 kernel dump fields were decoded.".to_string(),
+        };
+    }
+
+    let dump_type = minidump_u32(&header, 0x0f98);
+    KernelDumpHeaderInventory {
+        source: "raw_kernel_dump_header".to_string(),
+        status: "captured".to_string(),
+        file_bytes: Some(file_bytes),
+        signature: Some("PAGE".to_string()),
+        valid_dump: Some("DU64".to_string()),
+        major_version: Some(minidump_u32(&header, 0x08)),
+        minor_version: Some(minidump_u32(&header, 0x0c)),
+        machine_image_type: Some(minidump_u32(&header, 0x30)),
+        number_processors: Some(minidump_u32(&header, 0x34)),
+        bugcheck_code: Some(minidump_u32(&header, 0x38)),
+        bugcheck_parameters: Some([
+            minidump_u64(&header, 0x40),
+            minidump_u64(&header, 0x48),
+            minidump_u64(&header, 0x50),
+            minidump_u64(&header, 0x58),
+        ]),
+        dump_type: Some(dump_type),
+        dump_type_name: Some(kernel_dump_type_name(dump_type).to_string()),
+        required_dump_space: Some(minidump_u64(&header, 0x0fa0)),
+        detail: "Decoded only signature-gated DUMP_HEADER64 fields defined by the Windows SDK mindumpdef.h from a bounded 4 KiB file read. The raw bugcheck tuple is independent of DbgEng ReadBugCheckData; no private target-memory layout was interpreted.".to_string(),
+    }
+}
+
+fn unavailable_kernel_dump_header(
+    file_bytes: Option<u64>,
+    detail: String,
+) -> KernelDumpHeaderInventory {
+    KernelDumpHeaderInventory {
+        source: "raw_kernel_dump_header".to_string(),
+        status: "unavailable".to_string(),
+        file_bytes,
+        signature: None,
+        valid_dump: None,
+        major_version: None,
+        minor_version: None,
+        machine_image_type: None,
+        number_processors: None,
+        bugcheck_code: None,
+        bugcheck_parameters: None,
+        dump_type: None,
+        dump_type_name: None,
+        required_dump_space: None,
+        detail,
+    }
+}
+
+fn kernel_dump_type_name(dump_type: u32) -> &'static str {
+    match dump_type {
+        1 => "full",
+        2 => "summary",
+        3 => "header",
+        4 => "triage",
+        5 => "bitmap_full",
+        6 => "bitmap_kernel",
+        7 => "automatic",
+        _ => "unknown",
+    }
+}
 
 pub fn inspect_minidump_directory(path: &Path) -> MinidumpDirectoryInventory {
     let file_bytes = match fs::metadata(path) {
@@ -3454,6 +3595,28 @@ impl DebuggerSession {
         })
     }
 
+    pub fn current_process_executable_name(&self) -> anyhow::Result<String> {
+        let mut required = 0_u32;
+        unsafe {
+            self.system_objects
+                .GetCurrentProcessExecutableName(None, Some(&mut required))?;
+        }
+        anyhow::ensure!(
+            required > 0 && required <= 32_768,
+            "DbgEng reported an invalid executable-name size of {required} bytes"
+        );
+        let mut buffer = vec![0_u8; required as usize];
+        unsafe {
+            self.system_objects
+                .GetCurrentProcessExecutableName(Some(&mut buffer), Some(&mut required))?;
+        }
+        let length = buffer
+            .iter()
+            .position(|byte| *byte == 0)
+            .unwrap_or(buffer.len());
+        Ok(String::from_utf8_lossy(&buffer[..length]).into_owned())
+    }
+
     fn current_process_system_id(&self) -> anyhow::Result<u32> {
         Ok(unsafe { self.system_objects.GetCurrentProcessSystemId()? })
     }
@@ -3777,6 +3940,10 @@ impl DebuggerSession {
     }
 
     pub fn evaluate(&self, _expression: &str) -> anyhow::Result<EvaluationResult> {
+        anyhow::bail!("DbgEng sessions are only supported on Windows")
+    }
+
+    pub fn current_process_executable_name(&self) -> anyhow::Result<String> {
         anyhow::bail!("DbgEng sessions are only supported on Windows")
     }
 }
@@ -4531,6 +4698,68 @@ mod tests {
         assert_eq!(inventory.status, "not_minidump");
         assert_eq!(inventory.signature.as_deref(), Some("0x45474150"));
         assert!(inventory.entries.is_empty());
+    }
+
+    #[test]
+    fn inspects_signature_gated_x64_kernel_dump_header() {
+        let directory = temporary_runtime_directory("kernel-dump-header");
+        let path = directory.join("fixture.dmp");
+        fs::create_dir_all(&directory).unwrap();
+        let mut bytes = vec![0_u8; KERNEL_DUMP_HEADER_PROBE_SIZE];
+        bytes[..4].copy_from_slice(b"PAGE");
+        bytes[4..8].copy_from_slice(b"DU64");
+        bytes[0x08..0x0c].copy_from_slice(&15_u32.to_le_bytes());
+        bytes[0x0c..0x10].copy_from_slice(&26100_u32.to_le_bytes());
+        bytes[0x30..0x34].copy_from_slice(&0x8664_u32.to_le_bytes());
+        bytes[0x34..0x38].copy_from_slice(&24_u32.to_le_bytes());
+        bytes[0x38..0x3c].copy_from_slice(&0x3b_u32.to_le_bytes());
+        let parameters = [
+            0xC000_0005_u64,
+            0xFFFF_F800_7166_70B0,
+            0xFFFF_8107_9A37_A5B0,
+            0,
+        ];
+        for (index, parameter) in parameters.into_iter().enumerate() {
+            let offset = 0x40 + index * 8;
+            bytes[offset..offset + 8].copy_from_slice(&parameter.to_le_bytes());
+        }
+        bytes[0x0f98..0x0f9c].copy_from_slice(&5_u32.to_le_bytes());
+        bytes[0x0fa0..0x0fa8].copy_from_slice(&0x0000_000F_DE0A_C332_u64.to_le_bytes());
+        fs::write(&path, bytes).unwrap();
+
+        let inventory = inspect_kernel_dump_header(&path);
+
+        let _ = fs::remove_dir_all(&directory);
+        assert_eq!(inventory.status, "captured");
+        assert_eq!(inventory.signature.as_deref(), Some("PAGE"));
+        assert_eq!(inventory.valid_dump.as_deref(), Some("DU64"));
+        assert_eq!(inventory.major_version, Some(15));
+        assert_eq!(inventory.minor_version, Some(26100));
+        assert_eq!(inventory.machine_image_type, Some(0x8664));
+        assert_eq!(inventory.number_processors, Some(24));
+        assert_eq!(inventory.bugcheck_code, Some(0x3b));
+        assert_eq!(inventory.bugcheck_parameters, Some(parameters));
+        assert_eq!(inventory.dump_type, Some(5));
+        assert_eq!(inventory.dump_type_name.as_deref(), Some("bitmap_full"));
+    }
+
+    #[test]
+    fn refuses_to_decode_unsigned_kernel_dump_header() {
+        let directory = temporary_runtime_directory("not-kernel-dump");
+        let path = directory.join("fixture.dmp");
+        fs::create_dir_all(&directory).unwrap();
+        let mut bytes = vec![0_u8; KERNEL_DUMP_HEADER_PROBE_SIZE];
+        bytes[..4].copy_from_slice(b"PAGE");
+        bytes[4..8].copy_from_slice(b"NOPE");
+        bytes[0x38..0x3c].copy_from_slice(&0x3b_u32.to_le_bytes());
+        fs::write(&path, bytes).unwrap();
+
+        let inventory = inspect_kernel_dump_header(&path);
+
+        let _ = fs::remove_dir_all(&directory);
+        assert_eq!(inventory.status, "not_x64_kernel_dump");
+        assert_eq!(inventory.bugcheck_code, None);
+        assert_eq!(inventory.bugcheck_parameters, None);
     }
 
     #[test]
