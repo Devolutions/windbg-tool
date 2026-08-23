@@ -1242,12 +1242,21 @@ fn dump_per_cpu_tracker_topology(
             return json!({"status": "unavailable", "detail": format!("DbgEng could not read the build-gated per-CPU pointer array: {error}")})
         }
     };
-    let entry_index = entry_address
-        .zip(supplied_table_base)
-        .and_then(|(entry, base)| entry.checked_sub(base))
-        .filter(|offset| offset % entry_stride == 0)
-        .map(|offset| offset / entry_stride)
-        .filter(|index| *index < table_size);
+    let fault_entry_slot = entry_address.and_then(|entry| {
+        pointer_bytes
+            .chunks_exact(8)
+            .enumerate()
+            .find_map(|(slot, chunk)| {
+                let base = u64::from_le_bytes(chunk.try_into().expect("exact pointer chunk"));
+                if base != 0 && base % 0x1000 == 0 {
+                    let offset = entry.checked_sub(base)?;
+                    (offset % entry_stride == 0 && offset / entry_stride < table_size)
+                        .then(|| (slot, base, offset / entry_stride))
+                } else {
+                    None
+                }
+            })
+    });
     let table_bytes = match table_size.checked_mul(entry_stride) {
         Some(bytes) => bytes,
         None => {
@@ -1266,10 +1275,20 @@ fn dump_per_cpu_tracker_topology(
         };
         let first = pool_tracker_entry_snapshot(session, base);
         let last = pool_tracker_entry_snapshot(session, end - entry_stride);
-        let fault_index_record = entry_index.and_then(|index| {
-            base.checked_add(index * entry_stride)
-                .map(|address| pool_tracker_entry_snapshot(session, address))
-        });
+        let fault_entry_record =
+            (fault_entry_slot.is_some_and(|(_, fault_base, _)| fault_base == base)).then(|| {
+                pool_tracker_entry_snapshot(session, entry_address.expect("fault slot has entry"))
+            });
+        let supplied_fault_index_record = entry_address
+            .zip(supplied_table_base)
+            .and_then(|(entry, supplied_base)| entry.checked_sub(supplied_base))
+            .filter(|offset| offset % entry_stride == 0)
+            .map(|offset| offset / entry_stride)
+            .filter(|index| *index < table_size)
+            .and_then(|index| {
+                base.checked_add(index * entry_stride)
+                    .map(|address| pool_tracker_entry_snapshot(session, address))
+            });
         let extent_readable = first["status"].as_str() == Some("captured")
             && last["status"].as_str() == Some("captured");
         tables.push(json!({
@@ -1280,8 +1299,8 @@ fn dump_per_cpu_tracker_topology(
             "extent_boundary_readable": extent_readable,
             "first_entry": first,
             "last_entry": last,
-            "fault_index": entry_index,
-            "fault_index_entry": fault_index_record,
+            "fault_entry": fault_entry_record,
+            "supplied_fault_index": supplied_fault_index_record,
         }));
     }
     json!({
@@ -1294,10 +1313,22 @@ fn dump_per_cpu_tracker_topology(
         "table_size": table_size,
         "entry_stride": entry_stride,
         "nonzero_tables": tables,
-        "crash_cpu_correlation": {
-            "status": "unavailable",
-            "detail": "The saved bugcheck CONTEXT and faulting stack do not carry a documented processor-slot identifier exposed by this dump path. Membership in a supplied slot-19 table validates the table relation, not the faulting CPU identity."
-        },
+        "fault_table_match": fault_entry_slot.map(|(slot, base, index)| json!({
+            "slot": slot,
+            "table_base": base,
+            "entry_index": index,
+        })),
+        "crash_cpu_correlation": fault_entry_slot.map_or_else(
+            || json!({
+                "status": "unavailable",
+                "detail": "No bounded per-processor tracker table contains the validated fault record."
+            }),
+            |(slot, _, _)| json!({
+                "status": "code_supported_inference",
+                "processor_number": slot,
+                "detail": "For this exact nt image, private-symbol disassembly of ExpInsertPoolTracker shows ExPoolTagTables[gs:1A4h]; the exact-image _KPCR/_KPRCB types place Prcb at 0x180 and Number at 0x24, so the selected slot is the current processor number. This is stronger than raw slot membership but remains an inference unless an independently saved processor identifier is captured."
+            }),
+        ),
         "detail": "Each nonzero base is checked only for page alignment and bounded first/last/fault-index reads. Matching tags or differing counters are snapshot observations, not allocation lifetime or race evidence."
     })
 }
@@ -1982,6 +2013,46 @@ mod tests {
             "exception_parameter_1_or_build_specific_context_candidate"
         );
         assert_eq!(dump_fault_address(&data), Some(0xFFFF_F800_E439_70B0));
+    }
+
+    #[test]
+    fn per_cpu_tracker_match_derives_slot_and_index_without_caller_base() {
+        let nt_base = 0xFFFF_F802_793F_0000;
+        let table_size = 4097_u64;
+        let stride = 0x50_u64;
+        let slot = 19_usize;
+        let table_base = 0xFFFF_CB81_A0CC_7000_u64;
+        let entry_index = 1219_u64;
+        let entry = table_base + entry_index * stride;
+        let mut pointer_bytes = vec![0_u8; 128 * 8];
+        pointer_bytes[slot * 8..slot * 8 + 8].copy_from_slice(&table_base.to_le_bytes());
+
+        let matched = pointer_bytes
+            .chunks_exact(8)
+            .enumerate()
+            .find_map(|(slot, chunk)| {
+                let base = u64::from_le_bytes(chunk.try_into().expect("exact pointer chunk"));
+                if base != 0 && base % 0x1000 == 0 {
+                    let offset = entry.checked_sub(base)?;
+                    (offset % stride == 0 && offset / stride < table_size)
+                        .then(|| (slot, base, offset / stride))
+                } else {
+                    None
+                }
+            })
+            .expect("pointer-array membership");
+
+        assert_eq!(matched, (slot, table_base, entry_index));
+        assert_eq!(
+            matched.1 % 0x1000,
+            0,
+            "the exact-image tracker tables are page-aligned"
+        );
+        assert_ne!(
+            matched.1,
+            nt_base + 0x00EF_AB00,
+            "a pointer-array base must not be confused with the pointer-array global"
+        );
     }
 
     #[test]
