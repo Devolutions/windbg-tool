@@ -126,7 +126,7 @@ inspect with ttd_trace_info, ttd_registers, ttd_read_memory, ttd_memory_watchpoi
 
 fn tool_text(value: Value) -> CallToolResult {
     CallToolResult {
-        content: vec![Content::text(pretty_json(value.clone()))],
+        content: vec![Content::text(pretty_json(value))],
         structured_content: None,
         is_error: Some(false),
         meta: None,
@@ -135,7 +135,7 @@ fn tool_text(value: Value) -> CallToolResult {
 
 fn tool_error(value: Value) -> CallToolResult {
     CallToolResult {
-        content: vec![Content::text(pretty_json(value.clone()))],
+        content: vec![Content::text(pretty_json(value))],
         structured_content: None,
         is_error: Some(true),
         meta: None,
@@ -158,6 +158,15 @@ mod tests {
         assert_eq!(
             result.content,
             vec![Content::text("{\n  \"address\": 140728946327552\n}")]
+        );
+
+        let error = tool_error(json!({"error": "failed"}));
+
+        assert!(error.structured_content.is_none());
+        assert_eq!(error.is_error, Some(true));
+        assert_eq!(
+            error.content,
+            vec![Content::text("{\n  \"error\": \"failed\"\n}")]
         );
     }
 }
