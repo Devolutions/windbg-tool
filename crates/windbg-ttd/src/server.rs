@@ -127,7 +127,7 @@ inspect with ttd_trace_info, ttd_registers, ttd_read_memory, ttd_memory_watchpoi
 fn tool_text(value: Value) -> CallToolResult {
     CallToolResult {
         content: vec![Content::text(pretty_json(value.clone()))],
-        structured_content: Some(value),
+        structured_content: None,
         is_error: Some(false),
         meta: None,
     }
@@ -136,7 +136,7 @@ fn tool_text(value: Value) -> CallToolResult {
 fn tool_error(value: Value) -> CallToolResult {
     CallToolResult {
         content: vec![Content::text(pretty_json(value.clone()))],
-        structured_content: Some(value),
+        structured_content: None,
         is_error: Some(true),
         meta: None,
     }
@@ -144,4 +144,20 @@ fn tool_error(value: Value) -> CallToolResult {
 
 fn pretty_json(value: Value) -> String {
     serde_json::to_string_pretty(&value).unwrap_or_else(|_| value.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tool_results_use_text_content_without_structured_content() {
+        let result = tool_text(json!({"address": 140_728_946_327_552_u64}));
+
+        assert!(result.structured_content.is_none());
+        assert_eq!(
+            result.content,
+            vec![Content::text("{\n  \"address\": 140728946327552\n}")]
+        );
+    }
 }
