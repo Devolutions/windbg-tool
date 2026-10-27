@@ -11,7 +11,7 @@ if(NOT DEFINED TTD_APIS_PACKAGE_DIR)
 endif()
 
 if(NOT DEFINED TTD_BRIDGE_VERSION OR TTD_BRIDGE_VERSION STREQUAL "")
-    set(TTD_BRIDGE_VERSION "0.1.0")
+    set(TTD_BRIDGE_VERSION "0.3.0")
 endif()
 
 # Strip pre-release/build metadata for the PE numeric version fields.

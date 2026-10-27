@@ -210,7 +210,7 @@ jobs:
           )
           $expectedVersion = '${{ inputs.version }}'
           if ([string]::IsNullOrWhiteSpace($expectedVersion)) {
-            $expectedVersion = '0.1.0'
+            $expectedVersion = '0.3.0'
           }
           $expectedFileVersion = if ($expectedVersion -match '^(?<core>\d+(?:\.\d+){0,3})') {
             $parts = @($Matches['core'] -split '\.')

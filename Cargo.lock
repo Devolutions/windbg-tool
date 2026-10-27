@@ -2058,7 +2058,7 @@ dependencies = [
 
 [[package]]
 name = "windbg-dbgeng"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "libloading",
@@ -2069,7 +2069,7 @@ dependencies = [
 
 [[package]]
 name = "windbg-install"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "reqwest",
@@ -2080,7 +2080,7 @@ dependencies = [
 
 [[package]]
 name = "windbg-symbols"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "reqwest",
@@ -2091,7 +2091,7 @@ dependencies = [
 
 [[package]]
 name = "windbg-tool"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -2110,7 +2110,7 @@ dependencies = [
 
 [[package]]
 name = "windbg-ttd"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "bytes",
@@ -2449,7 +2449,7 @@ checksum = "1ffae5123b2d3fc086436f8834ae3ab053a283cfac8fe0a0b8eaae044768a4c4"
 
 [[package]]
 name = "xtask"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "serde_json",
