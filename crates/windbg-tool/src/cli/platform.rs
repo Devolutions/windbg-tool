@@ -259,7 +259,8 @@ struct StartupProfileEventReference {
     kind: String,
     observed_elapsed_ms: u64,
     resumed_wall_elapsed_ms: u64,
-    thread_system_id: u32,
+    thread_system_id: Option<u32>,
+    thread_engine_id: u32,
     module: Option<StartupProfileModule>,
     description: Option<String>,
     exception_code: Option<String>,
@@ -1796,8 +1797,8 @@ fn startup_profile_no_event_sentinel(event: &windbg_dbgeng::DebuggerEventInfo) -
     // expose this all-default LastEventInformation record instead of S_FALSE.
     event.event_type == 0
         && event.event_name == "unknown"
-        && event.process_system_id == u32::MAX
-        && event.thread_system_id == u32::MAX
+        && event.process_engine_id == u32::MAX
+        && event.thread_engine_id == u32::MAX
         && event.description.is_none()
         && event.extra_information_size == 0
         && event.breakpoint_id.is_none()
@@ -2139,6 +2140,7 @@ fn startup_profile_event_reference(event: &StartupProfileEvent) -> StartupProfil
         observed_elapsed_ms: event.observed_elapsed_ms,
         resumed_wall_elapsed_ms: event.resumed_wall_elapsed_ms,
         thread_system_id: event.event.thread_system_id,
+        thread_engine_id: event.event.thread_engine_id,
         module: event.module.clone(),
         description: event.event.description.clone(),
         exception_code: event
@@ -5196,8 +5198,10 @@ mod tests {
             event: windbg_dbgeng::DebuggerEventInfo {
                 event_type: 0,
                 event_name: kind.to_string(),
-                process_system_id: 1,
-                thread_system_id: 2,
+                process_engine_id: 0,
+                thread_engine_id: 1,
+                process_system_id: Some(1),
+                thread_system_id: Some(2),
                 description: None,
                 extra_information_size: 0,
                 breakpoint_id: None,
@@ -5422,8 +5426,10 @@ mod tests {
         let sentinel = windbg_dbgeng::DebuggerEventInfo {
             event_type: 0,
             event_name: "unknown".to_string(),
-            process_system_id: u32::MAX,
-            thread_system_id: u32::MAX,
+            process_engine_id: u32::MAX,
+            thread_engine_id: u32::MAX,
+            process_system_id: None,
+            thread_system_id: None,
             description: None,
             extra_information_size: 0,
             breakpoint_id: None,

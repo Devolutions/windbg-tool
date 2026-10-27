@@ -26,6 +26,87 @@ unwind, and never treats a loaded driver or `ntoskrnl.exe` fault location as dri
 Add `--refresh-symbols` only when the configured symbol path may be contacted; the report records
 whether DbgEng loaded PDB-backed symbols or only has module-level metadata.
 
+## User-mode dump triage
+
+The same daemon-free `dump triage` command decodes a bounded, documented
+`MINIDUMP_EXCEPTION_STREAM` when the target is a user-mode dump. The
+`triage.exception_record.selection` contains the captured exception code,
+address and parameters; access violations additionally report `access.operation`,
+`access.mode` and `access.address` (including address zero).
+The record also reports `code_name` for well-known NTSTATUS codes,
+`noncontinuable`, the in-page I/O status (`access.io_status`) for
+`STATUS_IN_PAGE_ERROR`, and the `fast_fail` code/name for `__fastfail`.
+For MSVC C++ exceptions (`0xE06D7363`), `cpp_exception` decodes up to 16 thrown
+type names from ThrowInfo and, when the thrown type derives from
+`std::exception`, a bounded `what()` string (at most 256 bytes). CLR exceptions
+(`0xE0434352`/`0xE0434F4D`) are marked with their HRESULT; managed exception
+objects are not decoded. `nested_records` follows the captured
+`ExceptionRecord` chain through guest memory for at most 8 records and reports
+cycles, unreadable records and truncation explicitly.
+
+`triage.exception_context.context` contains fault-time registers for AMD64
+(`registers`), x86/WOW64 (`x86_registers`) or ARM64 (`arm64_registers`),
+plus `instruction_pointer`/`stack_pointer` and a separate `stack` walked with
+the captured base CONTEXT on the verified exception thread (at most 128
+frames). The context location is a **file RVA**, not a guest virtual address.
+`extended_state` summarizes CONTEXT_EX/XSTATE (feature mask and compaction)
+when it is present in the stream; WER dumps often set the XSTATE flag without
+capturing CONTEXT_EX, which is reported as `not_captured`. The unwind copy
+omits XSTATE. Fault-module image/PDB preparation uses the exception address
+rather than the current WER instruction.
+
+`triage.fault_operand` (user dumps only) decodes the faulting AMD64/x86
+instruction from at most 16 bytes of guest memory and relates its memory
+operand to the access-violation address and captured registers. Hints include
+`null_page_access`, `null_base_register`, `non_canonical_address`,
+`debug_fill_pattern`, `no_memory_operand` and `no_operand_matches_fault_address`.
+The status is `architecture_unsupported` on ARM64, `execute_fault` for DEP
+faults and `instruction_bytes_unavailable` when the code page was not captured.
+These are heuristics about the immediate operand; they do not prove why a
+pointer was null or freed.
+
+`triage.fault_origin` (user dumps, AMD64/x86) walks back from the faulting
+instruction to the last earlier instruction in the same function that wrote the
+faulting base register. The function start comes from the image's
+`RUNTIME_FUNCTION` entry (following chained unwind info) or, failing that, the
+nearest symbol; at most 4096 bytes are decoded and at most 4 register copies are
+followed. Each `steps[]` item names the writer and a `kind`: `memory_load`
+(the source slot is re-read from the dump, compared to the loaded value via
+`matches_loaded_register`, and described as an `object_field` or `stack_slot`
+with its memory region, fill pattern, first pointer and any `vftable_class`),
+`register_copy`, `call_result`, `clobbered_by_call`, `self_zeroing`,
+`conditional_write`, `address_computation` or `other`. Limit statuses are
+`architecture_unsupported`, `context_unavailable`, `bytes_unavailable`,
+`function_start_unavailable`, `too_far`, `decode_desynchronized` and
+`writer_not_found`. The walk is linear, not path-sensitive: a branch could
+reach the fault from elsewhere, and a re-read slot shows the value at dump time,
+not who stored it.
+
+`triage.user_dump_streams` decodes bounded auxiliary minidump streams:
+`fault_module` (the ModuleList entry containing the exception address, with
+file/product version, checksum, `TimeDateStamp` and its UTC rendering, which
+can be a reproducible-build hash rather than a date, and the RSDS PDB
+name/GUID/age; or a matching `unloaded_match`), `unloaded_modules`,
+`thread_names` (including the exception thread's name), `memory_info` and
+`handles` (counts by type). `probed_regions` gives the memory state,
+protection and type for the exception address, access address and stack
+pointer. Absent streams are reported as `not_present`; WER dumps often omit
+thread names and unloaded modules. Payload limits are listed under
+`telemetry.auxiliary_stream_limits`.
+
+Top-level `frames`/`registers` and `triage.current_stack` remain the debugger
+snapshot, which can be inside WER or `UnhandledExceptionFilter`. They are never
+substituted for the fault-time stack. Missing, malformed, duplicate or unsupported
+streams/contexts and unwind failures are reported explicitly. No whole-dump scan
+or debugger command is used. The existing kernel bugcheck/context path is
+unchanged.
+
+`crates/windbg-ttd/tests/user_dump_exception.rs` reproduces this end to end
+without private dumps: it launches a helper that dereferences a null pointer,
+writes a full dump at the first-chance access violation and checks the triage
+output. It skips when DbgEng cannot launch the helper unless
+`WINDBG_TOOL_EXPECT_DBGENG=1` is set.
+
 ## Common replay workflow
 
 Start or reuse the local daemon:
@@ -484,6 +565,8 @@ target\debug\windbg-tool.exe --compact target thread --target 1 `
 ```
 
 `debug snapshot --target <id>` now includes a best-effort `event` section by default for live targets. Use `--exclude event` when an event query is not relevant, or `--include event` to request it alone.
+
+Debugger events (`target event`, `debug snapshot`, `live startup-profile`) report `process_engine_id`/`thread_engine_id` as returned by `GetLastEventInformation`; these are DbgEng engine IDs, not OS IDs, and are global across targets in one daemon. `process_system_id`/`thread_system_id` are the OS PID/TID resolved from those engine IDs, or `null` when the process or thread can no longer be enumerated (for example after an exit event). Earlier versions mislabelled the engine IDs as `*_system_id`.
 
 `target memory-map --target <id> --region-limit <1..4096>` and MCP `target_memory_map` query the stopped live user-mode target through `IDebugDataSpaces4::QueryVirtual`; both enforce the same `1..4096` region bound. They do not parse extension output or call `VirtualQueryEx`. The result uses numeric `MEMORY_BASIC_INFORMATION64` fields with `source: "dbgeng_idata_spaces4_query_virtual"`. `status: "bounded"` and `truncated: true` mean the region cap was reached, while `unavailable` or `partial_query_error` explicitly mean that full address-space coverage is not claimed. It is unavailable for dump targets.
 

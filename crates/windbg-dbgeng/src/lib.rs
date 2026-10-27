@@ -1,5 +1,24 @@
 use anyhow::{bail, ensure, Context};
 use serde::Serialize;
+mod minidump_exception;
+pub use minidump_exception::{
+    decode_guest_exception_details, exception_code_name, fast_fail_name, undecorate_type_name,
+    Arm64ExceptionRegisters, ClrExceptionInfo, ContextArchitecture, CppExceptionInfo,
+    CppExceptionType, ExceptionAccess, ExtendedStateSummary, FastFailInfo, GuestMemory,
+    MinidumpException, MinidumpExceptionContext, MinidumpExceptionRecord, NestedExceptionChain,
+    NestedExceptionRecord, X86ExceptionRegisters, MAX_CPP_EXCEPTION_TYPES,
+    MAX_EXCEPTION_STRING_BYTES, MAX_NESTED_EXCEPTION_RECORDS, MAX_USER_EXCEPTION_CONTEXT_BYTES,
+    MAX_USER_EXCEPTION_STACK_FRAMES,
+};
+mod minidump_streams;
+pub use minidump_streams::{
+    inspect_user_dump_streams, protect_name, utc_timestamp, CodeViewIdentity, FaultModule,
+    HandleSummary, HandleTypeCount, MemoryInfoSummary, MemoryRegion, ModuleIdentity, ThreadName,
+    ThreadNames, UnloadedModule, UnloadedModules, UserDumpStreams, MAX_REPORTED_HANDLE_TYPES,
+    MAX_REPORTED_THREAD_NAMES, MAX_REPORTED_UNLOADED_MODULES, MAX_STREAM_HANDLES,
+    MAX_STREAM_MEMORY_REGIONS, MAX_STREAM_MODULES, MAX_STREAM_STRING_BYTES,
+    MAX_STREAM_THREAD_NAMES, MAX_STREAM_UNLOADED_MODULES,
+};
 #[cfg(windows)]
 use std::os::windows::ffi::OsStrExt;
 #[cfg(windows)]
@@ -996,8 +1015,14 @@ pub struct DebuggerExceptionInfo {
 pub struct DebuggerEventInfo {
     pub event_type: u32,
     pub event_name: String,
-    pub process_system_id: u32,
-    pub thread_system_id: u32,
+    /// DbgEng engine process ID reported by GetLastEventInformation (not the OS PID).
+    pub process_engine_id: u32,
+    /// DbgEng engine thread ID reported by GetLastEventInformation (not the OS TID).
+    pub thread_engine_id: u32,
+    /// OS process ID resolved from the engine ID, when the process is still enumerable.
+    pub process_system_id: Option<u32>,
+    /// OS thread ID resolved from the engine ID, when the thread is still enumerable.
+    pub thread_system_id: Option<u32>,
     pub description: Option<String>,
     pub extra_information_size: u32,
     pub breakpoint_id: Option<u32>,
@@ -1558,8 +1583,35 @@ pub struct DebuggerSession {
     registers: windows::Win32::System::Diagnostics::Debug::Extensions::IDebugRegisters,
     symbols: windows::Win32::System::Diagnostics::Debug::Extensions::IDebugSymbols5,
     system_objects: windows::Win32::System::Diagnostics::Debug::Extensions::IDebugSystemObjects,
+    engine_identity: DebuggerEngineIdentity,
     symbol_path: String,
     runtime: DbgEngRuntime,
+}
+
+/// DbgEng engine IDs are process-wide, so each session records the system and
+/// process it opened and reselects them before daemon work.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub struct DebuggerEngineIdentity {
+    pub system_id: Option<u32>,
+    pub process_id: Option<u32>,
+    pub process_system_id: Option<u32>,
+}
+
+#[cfg(windows)]
+fn capture_engine_identity(
+    system_objects: &windows::Win32::System::Diagnostics::Debug::Extensions::IDebugSystemObjects,
+) -> DebuggerEngineIdentity {
+    use windows::core::Interface;
+    use windows::Win32::System::Diagnostics::Debug::Extensions::IDebugSystemObjects3;
+    let system_id = system_objects
+        .cast::<IDebugSystemObjects3>()
+        .ok()
+        .and_then(|objects| unsafe { objects.GetCurrentSystemId().ok() });
+    DebuggerEngineIdentity {
+        system_id,
+        process_id: unsafe { system_objects.GetCurrentProcessId().ok() },
+        process_system_id: unsafe { system_objects.GetCurrentProcessSystemId().ok() },
+    }
 }
 
 #[cfg(windows)]
@@ -1819,6 +1871,45 @@ impl DebuggerSession {
         self.kind
     }
 
+    pub fn engine_identity(&self) -> DebuggerEngineIdentity {
+        self.engine_identity
+    }
+
+    /// Reselects this session's DbgEng system and process. Other sessions in the
+    /// same process can change this engine-global state between requests.
+    pub fn activate(&self) -> anyhow::Result<()> {
+        use windows::core::Interface;
+        use windows::Win32::System::Diagnostics::Debug::Extensions::IDebugSystemObjects3;
+        let identity = self.engine_identity;
+        if let Some(system_id) = identity.system_id {
+            let objects: IDebugSystemObjects3 = self
+                .system_objects
+                .cast()
+                .context("querying IDebugSystemObjects3")?;
+            if unsafe { objects.GetCurrentSystemId()? } != system_id {
+                unsafe { objects.SetCurrentSystemId(system_id) }
+                    .with_context(|| format!("selecting DbgEng system {system_id}"))?;
+            }
+            ensure!(
+                unsafe { objects.GetCurrentSystemId()? } == system_id,
+                "DbgEng did not select system {system_id}"
+            );
+        }
+        if let Some(process_id) = identity.process_id {
+            if unsafe { self.system_objects.GetCurrentProcessId()? } != process_id {
+                unsafe { self.system_objects.SetCurrentProcessId(process_id) }
+                    .with_context(|| format!("selecting DbgEng process {process_id}"))?;
+            }
+        }
+        if let Some(process_system_id) = identity.process_system_id {
+            ensure!(
+                self.current_process_system_id()? == process_system_id,
+                "DbgEng selected a different process than this session opened"
+            );
+        }
+        Ok(())
+    }
+
     pub fn execution_status(&self) -> DebuggerExecutionStatus {
         let raw = unsafe { self.control.GetExecutionStatus().ok() };
         DebuggerExecutionStatus {
@@ -2000,8 +2091,8 @@ impl DebuggerSession {
         const MAX_EVENT_EXTRA_BYTES: usize = 512;
 
         let mut event_type = 0u32;
-        let mut process_system_id = 0u32;
-        let mut thread_system_id = 0u32;
+        let mut process_engine_id = 0u32;
+        let mut thread_engine_id = 0u32;
         let mut extra_information = vec![0u8; MAX_EVENT_EXTRA_BYTES];
         let mut extra_information_used = 0u32;
         let mut description = vec![0u16; MAX_EVENT_DESCRIPTION_CHARS];
@@ -2009,8 +2100,8 @@ impl DebuggerSession {
         unsafe {
             self.control.GetLastEventInformationWide(
                 &mut event_type,
-                &mut process_system_id,
-                &mut thread_system_id,
+                &mut process_engine_id,
+                &mut thread_engine_id,
                 Some(extra_information.as_mut_ptr().cast()),
                 extra_information.len() as u32,
                 Some(&mut extra_information_used),
@@ -2081,8 +2172,15 @@ impl DebuggerSession {
         Ok(DebuggerEventInfo {
             event_type,
             event_name: event_type_name(event_type).to_string(),
-            process_system_id,
-            thread_system_id,
+            process_engine_id,
+            thread_engine_id,
+            process_system_id: self.process_system_id_for_engine_id(process_engine_id),
+            thread_system_id: self.threads().ok().and_then(|threads| {
+                threads
+                    .into_iter()
+                    .find(|thread| thread.engine_id == thread_engine_id)
+                    .map(|thread| thread.system_id)
+            }),
             description,
             extra_information_size: extra_information_used,
             breakpoint_id,
@@ -2232,15 +2330,17 @@ impl DebuggerSession {
     }
 
     pub fn detach(&self) -> anyhow::Result<()> {
+        self.activate()?;
         unsafe {
-            self.client.DetachProcesses()?;
+            self.client.DetachCurrentProcess()?;
         }
         Ok(())
     }
 
     pub fn terminate(&self) -> anyhow::Result<()> {
+        self.activate()?;
         unsafe {
-            self.client.TerminateProcesses()?;
+            self.client.TerminateCurrentProcess()?;
         }
         Ok(())
     }
@@ -2779,6 +2879,28 @@ impl DebuggerSession {
         Ok(u64::from_le_bytes(bytes))
     }
 
+    fn process_system_id_for_engine_id(&self, engine_id: u32) -> Option<u32> {
+        const MAX_EVENT_PROCESSES: u32 = 256;
+        let count =
+            unsafe { self.system_objects.GetNumberProcesses().ok()? }.min(MAX_EVENT_PROCESSES);
+        let mut engine_ids = vec![0u32; count as usize];
+        let mut system_ids = vec![0u32; count as usize];
+        unsafe {
+            self.system_objects
+                .GetProcessIdsByIndex(
+                    0,
+                    count,
+                    Some(engine_ids.as_mut_ptr()),
+                    Some(system_ids.as_mut_ptr()),
+                )
+                .ok()?;
+        }
+        engine_ids
+            .into_iter()
+            .position(|id| id == engine_id)
+            .map(|index| system_ids[index])
+    }
+
     pub fn threads(&self) -> anyhow::Result<Vec<ThreadInfo>> {
         let count = unsafe { self.system_objects.GetNumberThreads()? };
         let mut engine_ids = vec![0u32; count as usize];
@@ -3259,6 +3381,15 @@ impl DebuggerSession {
             )?;
         }
         frames.truncate(filled as usize);
+        Ok(self.describe_stack_frames(frames, max_frames, filled))
+    }
+
+    fn describe_stack_frames(
+        &self,
+        frames: Vec<windows::Win32::System::Diagnostics::Debug::Extensions::DEBUG_STACK_FRAME>,
+        max_frames: u32,
+        filled: u32,
+    ) -> StackTraceResult {
         let frames = frames
             .into_iter()
             .map(|frame| StackFrameInfo {
@@ -3306,14 +3437,14 @@ impl DebuggerSession {
         } else {
             "captured"
         };
-        Ok(StackTraceResult {
+        StackTraceResult {
             requested_frames: max_frames,
             returned_frames: filled,
             valid_frames,
             status: status.to_string(),
             stop_reason,
             frames,
-        })
+        }
     }
 
     pub fn thread_context(
@@ -3330,6 +3461,14 @@ impl DebuggerSession {
         ensure!(
             engine_thread_id != u32::MAX,
             "engine_thread_id cannot be DEBUG_ANY_ID"
+        );
+        // DbgEng engine thread IDs are global across targets in one engine; only accept threads
+        // owned by this session's process so a stale ID cannot select another target's thread.
+        ensure!(
+            self.threads()?
+                .iter()
+                .any(|thread| thread.engine_id == engine_thread_id),
+            "engine thread {engine_thread_id} does not belong to this target; use an engine_id from this target's thread list"
         );
 
         let previous_thread_id = unsafe { self.system_objects.GetCurrentThreadId()? };
@@ -3799,6 +3938,14 @@ impl DebuggerSession {
         DebuggerSessionKind::Live
     }
 
+    pub fn engine_identity(&self) -> DebuggerEngineIdentity {
+        DebuggerEngineIdentity::default()
+    }
+
+    pub fn activate(&self) -> anyhow::Result<()> {
+        bail!("DbgEng sessions are only supported on Windows")
+    }
+
     pub fn execution_status(&self) -> DebuggerExecutionStatus {
         DebuggerExecutionStatus {
             raw: None,
@@ -4099,6 +4246,7 @@ fn launch_live_session_impl(options: LiveLaunchSessionOptions) -> anyhow::Result
         data_spaces,
         registers,
         symbols,
+        engine_identity: capture_engine_identity(&system_objects),
         system_objects,
         symbol_path,
         runtime,
@@ -4138,6 +4286,7 @@ fn attach_live_session_impl(options: LiveAttachOptions) -> anyhow::Result<Debugg
         data_spaces,
         registers,
         symbols,
+        engine_identity: capture_engine_identity(&system_objects),
         system_objects,
         symbol_path,
         runtime,
@@ -4182,6 +4331,7 @@ fn open_dump_session_impl(options: DumpOpenOptions) -> anyhow::Result<DebuggerSe
         data_spaces,
         registers,
         symbols,
+        engine_identity: capture_engine_identity(&system_objects),
         system_objects,
         symbol_path,
         runtime,
@@ -4518,7 +4668,7 @@ mod tests {
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    fn temporary_runtime_directory(label: &str) -> PathBuf {
+    pub(super) fn temporary_runtime_directory(label: &str) -> PathBuf {
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
