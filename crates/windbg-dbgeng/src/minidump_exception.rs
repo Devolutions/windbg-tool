@@ -1120,6 +1120,71 @@ impl GuestMemory for super::DebuggerSession {
 
 #[cfg(windows)]
 impl super::DebuggerSession {
+    /// Returns the start of the function containing `address` and how it was found. On AMD64 the
+    /// image's RUNTIME_FUNCTION entry is used (following chained unwind info back to the primary
+    /// entry); otherwise, or when no entry exists, the nearest preceding symbol within 64 KiB.
+    pub fn function_start(
+        &self,
+        address: u64,
+        architecture: ContextArchitecture,
+    ) -> Option<(u64, &'static str)> {
+        if architecture == ContextArchitecture::Amd64 {
+            if let Some(start) = self.amd64_runtime_function_start(address) {
+                return Some((start, "runtime_function_entry"));
+            }
+        }
+        let symbol = self.symbol_by_offset(address).ok()??;
+        (symbol.displacement <= 0x1_0000 && symbol.displacement <= address)
+            .then(|| (address - symbol.displacement, "nearest_symbol"))
+    }
+
+    fn amd64_runtime_function_start(&self, address: u64) -> Option<u64> {
+        const UNW_FLAG_CHAININFO: u8 = 0x4;
+        let mut base = 0u64;
+        unsafe {
+            self.symbols
+                .GetModuleByOffset(address, 0, None, Some(&mut base))
+                .ok()?
+        };
+        let mut entry = [0u8; 12];
+        let mut needed = 0u32;
+        unsafe {
+            self.symbols
+                .GetFunctionEntryByOffset(
+                    address,
+                    0,
+                    Some(entry.as_mut_ptr().cast()),
+                    entry.len() as u32,
+                    Some(&mut needed),
+                )
+                .ok()?
+        };
+        let rva = |bytes: &[u8], offset: usize| {
+            u64::from(u32::from_le_bytes(
+                bytes[offset..offset + 4].try_into().unwrap(),
+            ))
+        };
+        let (mut begin, end) = (rva(&entry, 0), rva(&entry, 4));
+        if !(begin <= address.checked_sub(base)? && address - base < end) {
+            return None;
+        }
+        let mut unwind = rva(&entry, 8);
+        for _ in 0..8 {
+            let header = self.read_guest(base + unwind, 4).ok()?;
+            if header.len() < 4 || header[0] >> 3 & UNW_FLAG_CHAININFO == 0 {
+                return Some(base + begin);
+            }
+            let chained_offset = 4 + ((u64::from(header[2]) + 1) & !1) * 2;
+            let chained = self.read_guest(base + unwind + chained_offset, 12).ok()?;
+            if chained.len() < 12 {
+                return None;
+            }
+            begin = rva(&chained, 0);
+            unwind = rva(&chained, 8);
+        }
+        None
+    }
+
     pub fn user_dump_exception(
         &self,
         directory: &MinidumpDirectoryInventory,

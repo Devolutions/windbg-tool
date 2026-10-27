@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 use windbg_dbgeng::{
     open_dump_session, DebuggerSession, DumpOpenOptions, KernelDumpHeaderInventory,
-    MinidumpException, ModuleInfo,
+    MinidumpException, ModuleInfo, UserDumpStreams,
 };
 use windbg_symbols::{
     image_matches, inspect_pe_image_identity, prefetch_image, prefetch_pdb, NativeImageStatus,
@@ -125,6 +125,17 @@ pub fn dump_triage(request: DumpTriageRequest) -> anyhow::Result<Value> {
     if let Some(exception) = &mut user_exception {
         session.unwind_user_dump_exception(exception, request.max_frames);
     }
+    let user_streams = user_exception.as_ref().map(|exception| {
+        windbg_dbgeng::inspect_user_dump_streams(
+            &request.path,
+            &minidump_directory,
+            exception
+                .record
+                .as_ref()
+                .map(|record| record.exception_address),
+            exception.thread_system_id,
+        )
+    });
     let triage = dump_triage_value(
         &session,
         DumpTriageInput {
@@ -132,6 +143,7 @@ pub fn dump_triage(request: DumpTriageRequest) -> anyhow::Result<Value> {
             modules: &modules,
             bugcheck: &bugcheck,
             user_exception: user_exception.as_ref(),
+            user_streams: user_streams.as_ref(),
             kernel_dump_header: &kernel_dump_header,
             current_stack: &stack,
             max_frames: request.max_frames,
@@ -172,7 +184,17 @@ pub fn dump_triage(request: DumpTriageRequest) -> anyhow::Result<Value> {
                 "stack_frame_limit": request.max_frames,
                 "minidump_directory_entry_limit": windbg_dbgeng::MAX_MINIDUMP_DIRECTORY_ENTRIES,
                 "captured_event_code_byte_limit": windbg_dbgeng::MAX_CAPTURED_EVENT_CODE_BYTES,
-                "minidump_stream_payloads_decoded": user_exception.as_ref().is_some_and(|exception| exception.record.is_some()),
+                "minidump_stream_payloads_decoded": user_exception.as_ref().is_some_and(|exception| exception.record.is_some()) || user_streams.is_some(),
+                "auxiliary_stream_limits": user_streams.as_ref().map(|_| json!({
+                    "modules": windbg_dbgeng::MAX_STREAM_MODULES,
+                    "unloaded_modules": windbg_dbgeng::MAX_STREAM_UNLOADED_MODULES,
+                    "thread_names": windbg_dbgeng::MAX_STREAM_THREAD_NAMES,
+                    "memory_regions": windbg_dbgeng::MAX_STREAM_MEMORY_REGIONS,
+                    "handles": windbg_dbgeng::MAX_STREAM_HANDLES,
+                    "string_bytes": windbg_dbgeng::MAX_STREAM_STRING_BYTES,
+                })),
+                "fault_origin_function_byte_limit": super::fault_origin::FAULT_ORIGIN_MAX_FUNCTION_BYTES,
+                "fault_origin_hop_limit": super::fault_origin::FAULT_ORIGIN_MAX_HOPS,
                 "user_exception_context_byte_limit": windbg_dbgeng::MAX_USER_EXCEPTION_CONTEXT_BYTES,
                 "user_exception_nested_record_limit": windbg_dbgeng::MAX_NESTED_EXCEPTION_RECORDS,
                 "user_exception_cpp_type_limit": windbg_dbgeng::MAX_CPP_EXCEPTION_TYPES,
@@ -438,6 +460,7 @@ struct DumpTriageInput<'a> {
     modules: &'a [ModuleInfo],
     bugcheck: &'a windbg_dbgeng::BugCheckDataResult,
     user_exception: Option<&'a MinidumpException>,
+    user_streams: Option<&'a UserDumpStreams>,
     kernel_dump_header: &'a KernelDumpHeaderInventory,
     current_stack: &'a windbg_dbgeng::StackTraceResult,
     max_frames: u32,
@@ -534,6 +557,12 @@ fn dump_triage_value(session: &DebuggerSession, input: DumpTriageInput<'_>) -> V
                 windbg_dbgeng::GuestMemory::read_guest(session, address, size)
             })
         }),
+        "fault_origin": input.user_exception.map_or(Value::Null, |exception| {
+            dump_fault_origin(session, exception, input.user_streams)
+        }),
+        "user_dump_streams": input.user_streams.map_or(Value::Null, |streams| {
+            dump_user_streams_value(streams, input.user_exception)
+        }),
         "exception_context": exception_context,
         "exception_record": exception_record,
         "snapshot_event": snapshot_event,
@@ -561,11 +590,73 @@ fn dump_triage_value(session: &DebuggerSession, input: DumpTriageInput<'_>) -> V
             }, {
                 "priority": "medium",
                 "detail": "fault_operand names the faulting memory operand, base register and value from the captured context; it shows which pointer was bad at fault time, not why. Check exception_record.selection for C++ type names, fast-fail codes, CLR markers and nested records before inferring a cause.",
+            }, {
+                "priority": "medium",
+                "detail": "fault_origin walks back (linearly, not path-sensitively) to the instruction that loaded the faulting register and re-reads the source slot/object from the dump; use it to name the field that held the bad pointer, then confirm with source or disassembly. user_dump_streams.fault_module gives the exact build (file version, timestamp, PDB GUID/age) to match symbols and source.",
             }])
         } else {
             dump_recommendations(input.bugcheck)
         },
     })
+}
+
+fn dump_fault_origin(
+    session: &DebuggerSession,
+    exception: &MinidumpException,
+    streams: Option<&UserDumpStreams>,
+) -> Value {
+    let architecture = exception.context.architecture_kind();
+    super::fault_origin::fault_origin(
+        exception,
+        &super::fault_origin::FaultOriginSources {
+            read: &|address, size| windbg_dbgeng::GuestMemory::read_guest(session, address, size),
+            function_start: &|address| session.function_start(address, architecture?),
+            symbol: &|address| {
+                session
+                    .symbol_by_offset(address)
+                    .ok()
+                    .flatten()
+                    .map(|symbol| (symbol.name, symbol.displacement))
+            },
+            region: &|address| {
+                streams
+                    .and_then(|streams| streams.region_for(address))
+                    .map(|region| json!(region))
+            },
+        },
+    )
+}
+
+fn dump_user_streams_value(
+    streams: &UserDumpStreams,
+    exception: Option<&MinidumpException>,
+) -> Value {
+    let mut value = json!(streams);
+    let mut probes = Vec::new();
+    if let Some(exception) = exception {
+        let record = exception.record.as_ref();
+        for (label, address) in [
+            (
+                "exception_address",
+                record.map(|record| record.exception_address),
+            ),
+            (
+                "access_address",
+                record.and_then(|record| record.access.as_ref().map(|access| access.address)),
+            ),
+            ("stack_pointer", exception.context.stack_pointer),
+        ] {
+            if let Some(address) = address {
+                probes.push(json!({
+                    "label": label,
+                    "address": address,
+                    "region": streams.region_for(address),
+                }));
+            }
+        }
+    }
+    value["probed_regions"] = json!(probes);
+    value
 }
 
 fn dump_target_fault_address(

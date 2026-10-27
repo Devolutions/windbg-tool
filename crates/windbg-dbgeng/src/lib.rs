@@ -10,6 +10,15 @@ pub use minidump_exception::{
     MAX_EXCEPTION_STRING_BYTES, MAX_NESTED_EXCEPTION_RECORDS, MAX_USER_EXCEPTION_CONTEXT_BYTES,
     MAX_USER_EXCEPTION_STACK_FRAMES,
 };
+mod minidump_streams;
+pub use minidump_streams::{
+    inspect_user_dump_streams, protect_name, utc_timestamp, CodeViewIdentity, FaultModule,
+    HandleSummary, HandleTypeCount, MemoryInfoSummary, MemoryRegion, ModuleIdentity, ThreadName,
+    ThreadNames, UnloadedModule, UnloadedModules, UserDumpStreams, MAX_REPORTED_HANDLE_TYPES,
+    MAX_REPORTED_THREAD_NAMES, MAX_REPORTED_UNLOADED_MODULES, MAX_STREAM_HANDLES,
+    MAX_STREAM_MEMORY_REGIONS, MAX_STREAM_MODULES, MAX_STREAM_STRING_BYTES,
+    MAX_STREAM_THREAD_NAMES, MAX_STREAM_UNLOADED_MODULES,
+};
 #[cfg(windows)]
 use std::os::windows::ffi::OsStrExt;
 #[cfg(windows)]
@@ -1006,8 +1015,14 @@ pub struct DebuggerExceptionInfo {
 pub struct DebuggerEventInfo {
     pub event_type: u32,
     pub event_name: String,
-    pub process_system_id: u32,
-    pub thread_system_id: u32,
+    /// DbgEng engine process ID reported by GetLastEventInformation (not the OS PID).
+    pub process_engine_id: u32,
+    /// DbgEng engine thread ID reported by GetLastEventInformation (not the OS TID).
+    pub thread_engine_id: u32,
+    /// OS process ID resolved from the engine ID, when the process is still enumerable.
+    pub process_system_id: Option<u32>,
+    /// OS thread ID resolved from the engine ID, when the thread is still enumerable.
+    pub thread_system_id: Option<u32>,
     pub description: Option<String>,
     pub extra_information_size: u32,
     pub breakpoint_id: Option<u32>,
@@ -2076,8 +2091,8 @@ impl DebuggerSession {
         const MAX_EVENT_EXTRA_BYTES: usize = 512;
 
         let mut event_type = 0u32;
-        let mut process_system_id = 0u32;
-        let mut thread_system_id = 0u32;
+        let mut process_engine_id = 0u32;
+        let mut thread_engine_id = 0u32;
         let mut extra_information = vec![0u8; MAX_EVENT_EXTRA_BYTES];
         let mut extra_information_used = 0u32;
         let mut description = vec![0u16; MAX_EVENT_DESCRIPTION_CHARS];
@@ -2085,8 +2100,8 @@ impl DebuggerSession {
         unsafe {
             self.control.GetLastEventInformationWide(
                 &mut event_type,
-                &mut process_system_id,
-                &mut thread_system_id,
+                &mut process_engine_id,
+                &mut thread_engine_id,
                 Some(extra_information.as_mut_ptr().cast()),
                 extra_information.len() as u32,
                 Some(&mut extra_information_used),
@@ -2157,8 +2172,15 @@ impl DebuggerSession {
         Ok(DebuggerEventInfo {
             event_type,
             event_name: event_type_name(event_type).to_string(),
-            process_system_id,
-            thread_system_id,
+            process_engine_id,
+            thread_engine_id,
+            process_system_id: self.process_system_id_for_engine_id(process_engine_id),
+            thread_system_id: self.threads().ok().and_then(|threads| {
+                threads
+                    .into_iter()
+                    .find(|thread| thread.engine_id == thread_engine_id)
+                    .map(|thread| thread.system_id)
+            }),
             description,
             extra_information_size: extra_information_used,
             breakpoint_id,
@@ -2855,6 +2877,28 @@ impl DebuggerSession {
             bytes.len()
         );
         Ok(u64::from_le_bytes(bytes))
+    }
+
+    fn process_system_id_for_engine_id(&self, engine_id: u32) -> Option<u32> {
+        const MAX_EVENT_PROCESSES: u32 = 256;
+        let count =
+            unsafe { self.system_objects.GetNumberProcesses().ok()? }.min(MAX_EVENT_PROCESSES);
+        let mut engine_ids = vec![0u32; count as usize];
+        let mut system_ids = vec![0u32; count as usize];
+        unsafe {
+            self.system_objects
+                .GetProcessIdsByIndex(
+                    0,
+                    count,
+                    Some(engine_ids.as_mut_ptr()),
+                    Some(system_ids.as_mut_ptr()),
+                )
+                .ok()?;
+        }
+        engine_ids
+            .into_iter()
+            .position(|id| id == engine_id)
+            .map(|index| system_ids[index])
     }
 
     pub fn threads(&self) -> anyhow::Result<Vec<ThreadInfo>> {

@@ -68,6 +68,7 @@ fn user_dump_exception_triage() {
                 .thread_system_id
                 .expect("fault thread id");
             fault = Some((thread_id, exception.clone()));
+            assert_eq!(event.thread_system_id, Some(thread_id), "{event:?}");
             break;
         }
         assert!(
@@ -132,4 +133,11 @@ fn user_dump_exception_triage() {
         .unwrap()
         .iter()
         .any(|hint| hint["kind"] == "null_base_register" && hint["register"] == "rcx"));
+
+    let origin = &triage["fault_origin"];
+    assert!(origin["status"].is_string(), "{origin:#}");
+    let streams = &triage["user_dump_streams"];
+    assert_eq!(streams["fault_module"]["status"], "captured", "{streams:#}");
+    assert!(streams["fault_module"]["module"]["offset"].is_u64());
+    assert!(streams["probed_regions"].is_array());
 }

@@ -25,15 +25,24 @@ pub enum FaultRegisters<'a> {
     X86(&'a X86ExceptionRegisters),
 }
 
-impl FaultRegisters<'_> {
-    fn bitness(self) -> u32 {
+impl<'a> FaultRegisters<'a> {
+    pub(super) fn from_exception(exception: &'a MinidumpException) -> Option<Self> {
+        let context = &exception.context;
+        context
+            .registers
+            .as_ref()
+            .map(Self::Amd64)
+            .or_else(|| context.x86_registers.as_ref().map(Self::X86))
+    }
+
+    pub(super) fn bitness(self) -> u32 {
         match self {
             Self::Amd64(_) => 64,
             Self::X86(_) => 32,
         }
     }
 
-    fn value(self, register: Register) -> Option<u64> {
+    pub(super) fn value(self, register: Register) -> Option<u64> {
         let full = match self {
             Self::Amd64(r) => match register.full_register() {
                 Register::RAX => r.rax,
@@ -226,7 +235,7 @@ pub fn analyze_fault_operand(
     })
 }
 
-struct MemoryOperand {
+pub(super) struct MemoryOperand {
     operand_index: u32,
     segment: Option<String>,
     base: Option<String>,
@@ -235,8 +244,9 @@ struct MemoryOperand {
     index_value: Option<u64>,
     scale: u32,
     displacement: u64,
-    effective_address: Option<u64>,
+    pub(super) effective_address: Option<u64>,
     detail: Option<&'static str>,
+    pub(super) base_register: Register,
 }
 
 impl MemoryOperand {
@@ -256,7 +266,7 @@ impl MemoryOperand {
     }
 }
 
-fn memory_operand(
+pub(super) fn memory_operand(
     instruction: &Instruction,
     index: u32,
     registers: FaultRegisters<'_>,
@@ -334,6 +344,7 @@ fn memory_operand(
         } else {
             None
         },
+        base_register: if ip_relative { Register::None } else { base },
     })
 }
 
@@ -384,7 +395,7 @@ fn is_canonical(address: u64) -> bool {
     upper == 0 || upper == 0x1_FFFF
 }
 
-fn fill_pattern(value: u64) -> Option<&'static str> {
+pub(super) fn fill_pattern(value: u64) -> Option<&'static str> {
     DEBUG_FILL_PATTERNS.iter().find_map(|(pattern, name)| {
         let narrow = u64::from(*pattern);
         let wide = narrow | (narrow << 32);
@@ -398,7 +409,7 @@ fn access_value(access: &ExceptionAccess) -> Value {
     json!({ "operation": access.operation, "address": access.address })
 }
 
-fn register_name(register: Register) -> Option<String> {
+pub(super) fn register_name(register: Register) -> Option<String> {
     (register != Register::None).then(|| format!("{register:?}").to_ascii_lowercase())
 }
 

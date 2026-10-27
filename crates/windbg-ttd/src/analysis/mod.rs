@@ -8,6 +8,7 @@ pub mod disasm;
 pub mod discover;
 pub mod dump_triage;
 pub mod fault_operand;
+pub mod fault_origin;
 pub mod memory;
 pub mod modules;
 pub mod parity_tools;
