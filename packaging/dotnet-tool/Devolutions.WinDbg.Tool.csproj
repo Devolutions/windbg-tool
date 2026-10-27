@@ -8,7 +8,7 @@
     <ToolCommandName>windbg-tool</ToolCommandName>
     <PackageId>Devolutions.WinDbg.Tool</PackageId>
 
-    <Version Condition="'$(Version)' == ''">0.1.0</Version>
+    <Version Condition="'$(Version)' == ''">0.3.0</Version>
     <Authors>Devolutions</Authors>
     <Description>RID-specific dotnet tool wrapper around the signed windbg-tool Windows executable.</Description>
     <PackageReadmeFile>README.md</PackageReadmeFile>

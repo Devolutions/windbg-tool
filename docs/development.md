@@ -65,7 +65,7 @@ Release packages statically link the MSVC C runtime into Rust code with `RUSTFLA
 
 `windbg-tool.exe` and `ttd_replay_bridge.dll` embed Windows `VERSIONINFO` resources (company, product, file description, and version).
 
-- Default values come from the workspace package version in the root `Cargo.toml` (`0.1.0` today) and matching native bridge defaults.
+- Default values come from the workspace package version in the root `Cargo.toml` (`0.3.0` today) and matching native bridge defaults.
 - For release stamps, set `WINDBG_TOOL_VERSION` (for example `0.2.0`) before `cargo build -p windbg-tool` and `cargo xtask native-build`. The Windows packages workflow does this from the dispatch version input.
 - Inspect a built binary with:
 
