@@ -1,7 +1,15 @@
 use anyhow::{bail, ensure, Context};
 use serde::Serialize;
 mod minidump_exception;
-pub use minidump_exception::{MinidumpException, MAX_USER_EXCEPTION_STACK_FRAMES};
+pub use minidump_exception::{
+    decode_guest_exception_details, exception_code_name, fast_fail_name, undecorate_type_name,
+    Arm64ExceptionRegisters, ClrExceptionInfo, ContextArchitecture, CppExceptionInfo,
+    CppExceptionType, ExceptionAccess, ExtendedStateSummary, FastFailInfo, GuestMemory,
+    MinidumpException, MinidumpExceptionContext, MinidumpExceptionRecord, NestedExceptionChain,
+    NestedExceptionRecord, X86ExceptionRegisters, MAX_CPP_EXCEPTION_TYPES,
+    MAX_EXCEPTION_STRING_BYTES, MAX_NESTED_EXCEPTION_RECORDS, MAX_USER_EXCEPTION_CONTEXT_BYTES,
+    MAX_USER_EXCEPTION_STACK_FRAMES,
+};
 #[cfg(windows)]
 use std::os::windows::ffi::OsStrExt;
 #[cfg(windows)]
@@ -1560,8 +1568,35 @@ pub struct DebuggerSession {
     registers: windows::Win32::System::Diagnostics::Debug::Extensions::IDebugRegisters,
     symbols: windows::Win32::System::Diagnostics::Debug::Extensions::IDebugSymbols5,
     system_objects: windows::Win32::System::Diagnostics::Debug::Extensions::IDebugSystemObjects,
+    engine_identity: DebuggerEngineIdentity,
     symbol_path: String,
     runtime: DbgEngRuntime,
+}
+
+/// DbgEng engine IDs are process-wide, so each session records the system and
+/// process it opened and reselects them before daemon work.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub struct DebuggerEngineIdentity {
+    pub system_id: Option<u32>,
+    pub process_id: Option<u32>,
+    pub process_system_id: Option<u32>,
+}
+
+#[cfg(windows)]
+fn capture_engine_identity(
+    system_objects: &windows::Win32::System::Diagnostics::Debug::Extensions::IDebugSystemObjects,
+) -> DebuggerEngineIdentity {
+    use windows::core::Interface;
+    use windows::Win32::System::Diagnostics::Debug::Extensions::IDebugSystemObjects3;
+    let system_id = system_objects
+        .cast::<IDebugSystemObjects3>()
+        .ok()
+        .and_then(|objects| unsafe { objects.GetCurrentSystemId().ok() });
+    DebuggerEngineIdentity {
+        system_id,
+        process_id: unsafe { system_objects.GetCurrentProcessId().ok() },
+        process_system_id: unsafe { system_objects.GetCurrentProcessSystemId().ok() },
+    }
 }
 
 #[cfg(windows)]
@@ -1819,6 +1854,45 @@ impl DebuggerSession {
 
     pub fn kind(&self) -> DebuggerSessionKind {
         self.kind
+    }
+
+    pub fn engine_identity(&self) -> DebuggerEngineIdentity {
+        self.engine_identity
+    }
+
+    /// Reselects this session's DbgEng system and process. Other sessions in the
+    /// same process can change this engine-global state between requests.
+    pub fn activate(&self) -> anyhow::Result<()> {
+        use windows::core::Interface;
+        use windows::Win32::System::Diagnostics::Debug::Extensions::IDebugSystemObjects3;
+        let identity = self.engine_identity;
+        if let Some(system_id) = identity.system_id {
+            let objects: IDebugSystemObjects3 = self
+                .system_objects
+                .cast()
+                .context("querying IDebugSystemObjects3")?;
+            if unsafe { objects.GetCurrentSystemId()? } != system_id {
+                unsafe { objects.SetCurrentSystemId(system_id) }
+                    .with_context(|| format!("selecting DbgEng system {system_id}"))?;
+            }
+            ensure!(
+                unsafe { objects.GetCurrentSystemId()? } == system_id,
+                "DbgEng did not select system {system_id}"
+            );
+        }
+        if let Some(process_id) = identity.process_id {
+            if unsafe { self.system_objects.GetCurrentProcessId()? } != process_id {
+                unsafe { self.system_objects.SetCurrentProcessId(process_id) }
+                    .with_context(|| format!("selecting DbgEng process {process_id}"))?;
+            }
+        }
+        if let Some(process_system_id) = identity.process_system_id {
+            ensure!(
+                self.current_process_system_id()? == process_system_id,
+                "DbgEng selected a different process than this session opened"
+            );
+        }
+        Ok(())
     }
 
     pub fn execution_status(&self) -> DebuggerExecutionStatus {
@@ -2234,15 +2308,17 @@ impl DebuggerSession {
     }
 
     pub fn detach(&self) -> anyhow::Result<()> {
+        self.activate()?;
         unsafe {
-            self.client.DetachProcesses()?;
+            self.client.DetachCurrentProcess()?;
         }
         Ok(())
     }
 
     pub fn terminate(&self) -> anyhow::Result<()> {
+        self.activate()?;
         unsafe {
-            self.client.TerminateProcesses()?;
+            self.client.TerminateCurrentProcess()?;
         }
         Ok(())
     }
@@ -3342,6 +3418,14 @@ impl DebuggerSession {
             engine_thread_id != u32::MAX,
             "engine_thread_id cannot be DEBUG_ANY_ID"
         );
+        // DbgEng engine thread IDs are global across targets in one engine; only accept threads
+        // owned by this session's process so a stale ID cannot select another target's thread.
+        ensure!(
+            self.threads()?
+                .iter()
+                .any(|thread| thread.engine_id == engine_thread_id),
+            "engine thread {engine_thread_id} does not belong to this target; use an engine_id from this target's thread list"
+        );
 
         let previous_thread_id = unsafe { self.system_objects.GetCurrentThreadId()? };
         let changed_thread = previous_thread_id != engine_thread_id;
@@ -3810,6 +3894,14 @@ impl DebuggerSession {
         DebuggerSessionKind::Live
     }
 
+    pub fn engine_identity(&self) -> DebuggerEngineIdentity {
+        DebuggerEngineIdentity::default()
+    }
+
+    pub fn activate(&self) -> anyhow::Result<()> {
+        bail!("DbgEng sessions are only supported on Windows")
+    }
+
     pub fn execution_status(&self) -> DebuggerExecutionStatus {
         DebuggerExecutionStatus {
             raw: None,
@@ -4110,6 +4202,7 @@ fn launch_live_session_impl(options: LiveLaunchSessionOptions) -> anyhow::Result
         data_spaces,
         registers,
         symbols,
+        engine_identity: capture_engine_identity(&system_objects),
         system_objects,
         symbol_path,
         runtime,
@@ -4149,6 +4242,7 @@ fn attach_live_session_impl(options: LiveAttachOptions) -> anyhow::Result<Debugg
         data_spaces,
         registers,
         symbols,
+        engine_identity: capture_engine_identity(&system_objects),
         system_objects,
         symbol_path,
         runtime,
@@ -4193,6 +4287,7 @@ fn open_dump_session_impl(options: DumpOpenOptions) -> anyhow::Result<DebuggerSe
         data_spaces,
         registers,
         symbols,
+        engine_identity: capture_engine_identity(&system_objects),
         system_objects,
         symbol_path,
         runtime,

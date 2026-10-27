@@ -173,7 +173,11 @@ pub fn dump_triage(request: DumpTriageRequest) -> anyhow::Result<Value> {
                 "minidump_directory_entry_limit": windbg_dbgeng::MAX_MINIDUMP_DIRECTORY_ENTRIES,
                 "captured_event_code_byte_limit": windbg_dbgeng::MAX_CAPTURED_EVENT_CODE_BYTES,
                 "minidump_stream_payloads_decoded": user_exception.as_ref().is_some_and(|exception| exception.record.is_some()),
-                "user_exception_context_byte_limit": 1232,
+                "user_exception_context_byte_limit": windbg_dbgeng::MAX_USER_EXCEPTION_CONTEXT_BYTES,
+                "user_exception_nested_record_limit": windbg_dbgeng::MAX_NESTED_EXCEPTION_RECORDS,
+                "user_exception_cpp_type_limit": windbg_dbgeng::MAX_CPP_EXCEPTION_TYPES,
+                "user_exception_string_byte_limit": windbg_dbgeng::MAX_EXCEPTION_STRING_BYTES,
+                "fault_instruction_byte_limit": super::fault_operand::FAULT_INSTRUCTION_BYTES,
                 "user_exception_stack_frame_limit": windbg_dbgeng::MAX_USER_EXCEPTION_STACK_FRAMES,
                 "whole_dump_scan": false,
             },
@@ -525,6 +529,11 @@ fn dump_triage_value(session: &DebuggerSession, input: DumpTriageInput<'_>) -> V
             input.kernel_dump_header,
         ),
         "fault": fault,
+        "fault_operand": input.user_exception.map_or(Value::Null, |exception| {
+            super::fault_operand::fault_operand_hint(exception, &|address, size| {
+                windbg_dbgeng::GuestMemory::read_guest(session, address, size)
+            })
+        }),
         "exception_context": exception_context,
         "exception_record": exception_record,
         "snapshot_event": snapshot_event,
@@ -549,6 +558,9 @@ fn dump_triage_value(session: &DebuggerSession, input: DumpTriageInput<'_>) -> V
             json!([{
                 "priority": "high",
                 "detail": "Use the captured exception code, access parameters, fault-time registers and exception_context.context.stack. Top-level frames/registers and current_stack are debugger snapshot state, which may be inside WER. If the exception-context unwind is unavailable or invalid, do not substitute the snapshot stack or infer unobserved callers.",
+            }, {
+                "priority": "medium",
+                "detail": "fault_operand names the faulting memory operand, base register and value from the captured context; it shows which pointer was bad at fault time, not why. Check exception_record.selection for C++ type names, fast-fail codes, CLR markers and nested records before inferring a cause.",
             }])
         } else {
             dump_recommendations(input.bugcheck)
@@ -1693,9 +1705,11 @@ fn dump_symbol_modules(
     let mut modules = Vec::new();
     for address in [
         fault_address,
-        exception_context
-            .as_ref()
-            .and_then(|context| context["context"]["registers"]["rip"].as_u64()),
+        exception_context.as_ref().and_then(|context| {
+            context["context"]["instruction_pointer"]
+                .as_u64()
+                .or_else(|| context["context"]["registers"]["rip"].as_u64())
+        }),
     ]
     .into_iter()
     .flatten()

@@ -33,21 +33,50 @@ The same daemon-free `dump triage` command decodes a bounded, documented
 `triage.exception_record.selection` contains the captured exception code,
 address and parameters; access violations additionally report `access.operation`,
 `access.mode` and `access.address` (including address zero).
-`triage.exception_context.context` contains fault-time AMD64 integer/control
-registers and a separate `stack` walked with the complete captured base CONTEXT
-on the verified exception thread. The context location is a **file RVA**, not
-a guest virtual address. Fault-module image/PDB preparation uses the exception
-address rather than the current WER instruction.
+The record also reports `code_name` for well-known NTSTATUS codes,
+`noncontinuable`, the in-page I/O status (`access.io_status`) for
+`STATUS_IN_PAGE_ERROR`, and the `fast_fail` code/name for `__fastfail`.
+For MSVC C++ exceptions (`0xE06D7363`), `cpp_exception` decodes up to 16 thrown
+type names from ThrowInfo and, when the thrown type derives from
+`std::exception`, a bounded `what()` string (at most 256 bytes). CLR exceptions
+(`0xE0434352`/`0xE0434F4D`) are marked with their HRESULT; managed exception
+objects are not decoded. `nested_records` follows the captured
+`ExceptionRecord` chain through guest memory for at most 8 records and reports
+cycles, unreadable records and truncation explicitly.
+
+`triage.exception_context.context` contains fault-time registers for AMD64
+(`registers`), x86/WOW64 (`x86_registers`) or ARM64 (`arm64_registers`),
+plus `instruction_pointer`/`stack_pointer` and a separate `stack` walked with
+the captured base CONTEXT on the verified exception thread (at most 128
+frames). The context location is a **file RVA**, not a guest virtual address.
+`extended_state` summarizes CONTEXT_EX/XSTATE (feature mask and compaction)
+when it is present in the stream; WER dumps often set the XSTATE flag without
+capturing CONTEXT_EX, which is reported as `not_captured`. The unwind copy
+omits XSTATE. Fault-module image/PDB preparation uses the exception address
+rather than the current WER instruction.
+
+`triage.fault_operand` (user dumps only) decodes the faulting AMD64/x86
+instruction from at most 16 bytes of guest memory and relates its memory
+operand to the access-violation address and captured registers. Hints include
+`null_page_access`, `null_base_register`, `non_canonical_address`,
+`debug_fill_pattern`, `no_memory_operand` and `no_operand_matches_fault_address`.
+The status is `architecture_unsupported` on ARM64, `execute_fault` for DEP
+faults and `instruction_bytes_unavailable` when the code page was not captured.
+These are heuristics about the immediate operand; they do not prove why a
+pointer was null or freed.
 
 Top-level `frames`/`registers` and `triage.current_stack` remain the debugger
 snapshot, which can be inside WER or `UnhandledExceptionFilter`. They are never
 substituted for the fault-time stack. Missing, malformed, duplicate or unsupported
-streams/contexts and unwind failures are reported explicitly. Context decoding
-is currently AMD64-only, reads at most 1232 base-context bytes, does not decode
-extended/XSTATE state, and limits exception unwinds to 128 frames. Other
-architectures still expose the architecture-independent exception record.
-No whole-dump scan, nested-exception traversal or debugger command is used.
-The existing kernel bugcheck/context path is unchanged.
+streams/contexts and unwind failures are reported explicitly. No whole-dump scan
+or debugger command is used. The existing kernel bugcheck/context path is
+unchanged.
+
+`crates/windbg-ttd/tests/user_dump_exception.rs` reproduces this end to end
+without private dumps: it launches a helper that dereferences a null pointer,
+writes a full dump at the first-chance access violation and checks the triage
+output. It skips when DbgEng cannot launch the helper unless
+`WINDBG_TOOL_EXPECT_DBGENG=1` is set.
 
 ## Common replay workflow
 

@@ -6,6 +6,7 @@ use std::collections::HashMap;
 use std::env;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, SyncSender};
+use std::sync::{Mutex, MutexGuard};
 use std::thread::{self, JoinHandle};
 use std::time::Instant;
 use windbg_dbgeng::{
@@ -24,6 +25,16 @@ use windbg_symbols::{
 };
 
 pub type TargetId = u64;
+
+/// DbgEng keeps current system, process, and thread state per process, not per client.
+/// Hold this lock and activate the target before every engine operation.
+static DBGENG_ENGINE_LOCK: Mutex<()> = Mutex::new(());
+
+fn engine_lock() -> MutexGuard<'static, ()> {
+    DBGENG_ENGINE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 #[derive(Default)]
 pub struct TargetRegistry {
@@ -62,13 +73,19 @@ impl EngineWorker {
             .spawn(move || {
                 while let Ok(command) = receiver.recv() {
                     match command {
-                        EngineCommand::Run(operation) => operation(&session),
+                        EngineCommand::Run(operation) => {
+                            let _engine = engine_lock();
+                            operation(&session)
+                        }
                         EngineCommand::Shutdown {
                             detach_live_target,
                             response,
                         } => {
                             if detach_live_target && session.kind() == DebuggerSessionKind::Live {
-                                let _ = session.detach();
+                                let _engine = engine_lock();
+                                if session.activate().is_ok() {
+                                    let _ = session.detach();
+                                }
                             }
                             let _ = response.send(());
                             break;
@@ -100,7 +117,11 @@ impl EngineWorker {
         let (response_sender, response_receiver) = mpsc::sync_channel(1);
         sender
             .send(EngineCommand::Run(Box::new(move |session| {
-                let _ = response_sender.send(action(session));
+                let result = session
+                    .activate()
+                    .context("selecting this target in the shared DbgEng engine")
+                    .and_then(|()| action(session));
+                let _ = response_sender.send(result);
             })))
             .map_err(|_| {
                 anyhow::anyhow!("DbgEng engine worker closed while queueing {operation}")
@@ -532,6 +553,7 @@ impl TargetRegistry {
         &mut self,
         request: LiveLaunchRequest,
     ) -> anyhow::Result<TargetOpenedResponse> {
+        let engine = engine_lock();
         let session = launch_live_session(LiveLaunchSessionOptions {
             command_line: request.command_line,
             initial_break_timeout_ms: request.initial_break_timeout_ms,
@@ -541,6 +563,7 @@ impl TargetRegistry {
                 LiveInitialStop::SoftwareBreakpoint
             },
         })?;
+        drop(engine);
         self.insert_target(session, Value::Null, None)
     }
 
@@ -548,14 +571,17 @@ impl TargetRegistry {
         &mut self,
         request: LiveAttachRequest,
     ) -> anyhow::Result<TargetOpenedResponse> {
+        let engine = engine_lock();
         let session = attach_live_session(LiveAttachOptions {
             process_id: request.process_id,
             initial_break_timeout_ms: request.initial_break_timeout_ms,
         })?;
+        drop(engine);
         self.insert_target(session, Value::Null, None)
     }
 
     pub fn open_dump(&mut self, request: DumpOpenRequest) -> anyhow::Result<TargetOpenedResponse> {
+        let engine = engine_lock();
         let session = open_dump_session(DumpOpenOptions { path: request.path })?;
         let native_symbol_options = NativeSymbolOptions {
             cache_dir: request.symbol_cache,
@@ -569,6 +595,7 @@ impl TargetRegistry {
             &native_symbol_options.image_paths,
             native_symbol_options.offline,
         );
+        drop(engine);
         self.insert_target(session, native_symbols, Some(native_symbol_options))
     }
 
@@ -1040,7 +1067,13 @@ impl TargetRegistry {
         native_symbol_options: Option<NativeSymbolOptions>,
     ) -> anyhow::Result<TargetOpenedResponse> {
         let target_id = self.allocate_target_id();
-        let target = session.summary();
+        let target = {
+            let _engine = engine_lock();
+            session
+                .activate()
+                .context("selecting the new target in the shared DbgEng engine")?;
+            session.summary()
+        };
         let worker = EngineWorker::new(session)?;
         self.targets.insert(
             target_id,
