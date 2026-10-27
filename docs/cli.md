@@ -26,6 +26,29 @@ unwind, and never treats a loaded driver or `ntoskrnl.exe` fault location as dri
 Add `--refresh-symbols` only when the configured symbol path may be contacted; the report records
 whether DbgEng loaded PDB-backed symbols or only has module-level metadata.
 
+## User-mode dump triage
+
+The same daemon-free `dump triage` command decodes a bounded, documented
+`MINIDUMP_EXCEPTION_STREAM` when the target is a user-mode dump. The
+`triage.exception_record.selection` contains the captured exception code,
+address and parameters; access violations additionally report `access.operation`,
+`access.mode` and `access.address` (including address zero).
+`triage.exception_context.context` contains fault-time AMD64 integer/control
+registers and a separate `stack` walked with the complete captured base CONTEXT
+on the verified exception thread. The context location is a **file RVA**, not
+a guest virtual address. Fault-module image/PDB preparation uses the exception
+address rather than the current WER instruction.
+
+Top-level `frames`/`registers` and `triage.current_stack` remain the debugger
+snapshot, which can be inside WER or `UnhandledExceptionFilter`. They are never
+substituted for the fault-time stack. Missing, malformed, duplicate or unsupported
+streams/contexts and unwind failures are reported explicitly. Context decoding
+is currently AMD64-only, reads at most 1232 base-context bytes, does not decode
+extended/XSTATE state, and limits exception unwinds to 128 frames. Other
+architectures still expose the architecture-independent exception record.
+No whole-dump scan, nested-exception traversal or debugger command is used.
+The existing kernel bugcheck/context path is unchanged.
+
 ## Common replay workflow
 
 Start or reuse the local daemon:

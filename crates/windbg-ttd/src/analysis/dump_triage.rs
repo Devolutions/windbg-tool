@@ -11,7 +11,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 use windbg_dbgeng::{
-    open_dump_session, DebuggerSession, DumpOpenOptions, KernelDumpHeaderInventory, ModuleInfo,
+    open_dump_session, DebuggerSession, DumpOpenOptions, KernelDumpHeaderInventory,
+    MinidumpException, ModuleInfo,
 };
 use windbg_symbols::{
     image_matches, inspect_pe_image_identity, prefetch_image, prefetch_pdb, NativeImageStatus,
@@ -99,11 +100,13 @@ pub fn dump_triage(request: DumpTriageRequest) -> anyhow::Result<Value> {
     let bugcheck_started = Instant::now();
     let bugcheck = session.bugcheck_data();
     let bugcheck_elapsed_ms = bugcheck_started.elapsed().as_millis() as u64;
+    let mut user_exception = session.user_dump_exception(&minidump_directory)?;
     let symbols_started = Instant::now();
     let native_symbols = prepare_dump_native_symbols(
         &session,
         &modules,
         &bugcheck,
+        user_exception.as_ref(),
         &request.symbol_cache,
         &request.image_path,
         request.offline,
@@ -119,12 +122,16 @@ pub fn dump_triage(request: DumpTriageRequest) -> anyhow::Result<Value> {
     let stack = session.stack_trace_result(request.max_frames)?;
     let stack_elapsed_ms = stack_started.elapsed().as_millis() as u64;
     let triage_started = Instant::now();
+    if let Some(exception) = &mut user_exception {
+        session.unwind_user_dump_exception(exception, request.max_frames);
+    }
     let triage = dump_triage_value(
         &session,
         DumpTriageInput {
             target: &target,
             modules: &modules,
             bugcheck: &bugcheck,
+            user_exception: user_exception.as_ref(),
             kernel_dump_header: &kernel_dump_header,
             current_stack: &stack,
             max_frames: request.max_frames,
@@ -136,7 +143,11 @@ pub fn dump_triage(request: DumpTriageRequest) -> anyhow::Result<Value> {
     );
     let triage_elapsed_ms = triage_started.elapsed().as_millis() as u64;
     Ok(json!({
-        "triage_profile": triage_profile_label(request.profile.as_deref()),
+        "triage_profile": if user_exception.is_some() && request.profile.as_deref() != Some("inspect") {
+            "user_exception_context"
+        } else {
+            triage_profile_label(request.profile.as_deref())
+        },
         "target": target,
         "minidump_directory": minidump_directory,
         "kernel_dump_header": kernel_dump_header,
@@ -161,7 +172,9 @@ pub fn dump_triage(request: DumpTriageRequest) -> anyhow::Result<Value> {
                 "stack_frame_limit": request.max_frames,
                 "minidump_directory_entry_limit": windbg_dbgeng::MAX_MINIDUMP_DIRECTORY_ENTRIES,
                 "captured_event_code_byte_limit": windbg_dbgeng::MAX_CAPTURED_EVENT_CODE_BYTES,
-                "minidump_stream_payloads_decoded": false,
+                "minidump_stream_payloads_decoded": user_exception.as_ref().is_some_and(|exception| exception.record.is_some()),
+                "user_exception_context_byte_limit": 1232,
+                "user_exception_stack_frame_limit": windbg_dbgeng::MAX_USER_EXCEPTION_STACK_FRAMES,
                 "whole_dump_scan": false,
             },
         },
@@ -172,15 +185,13 @@ fn prepare_dump_native_symbols(
     session: &DebuggerSession,
     _modules: &[ModuleInfo],
     bugcheck: &windbg_dbgeng::BugCheckDataResult,
+    user_exception: Option<&MinidumpException>,
     cache_dir: &Path,
     extra_image_paths: &[PathBuf],
     offline: bool,
 ) -> Value {
-    let fault_address = bugcheck
-        .data
-        .as_ref()
-        .and_then(dump_fault_address)
-        .or_else(|| {
+    let fault_address =
+        dump_target_fault_address(bugcheck.data.as_ref(), user_exception).or_else(|| {
             session
                 .core_registers()
                 .ok()
@@ -422,6 +433,7 @@ struct DumpTriageInput<'a> {
     target: &'a windbg_dbgeng::DebuggerSessionSummary,
     modules: &'a [ModuleInfo],
     bugcheck: &'a windbg_dbgeng::BugCheckDataResult,
+    user_exception: Option<&'a MinidumpException>,
     kernel_dump_header: &'a KernelDumpHeaderInventory,
     current_stack: &'a windbg_dbgeng::StackTraceResult,
     max_frames: u32,
@@ -433,34 +445,78 @@ struct DumpTriageInput<'a> {
 
 fn dump_triage_value(session: &DebuggerSession, input: DumpTriageInput<'_>) -> Value {
     let bugcheck_data = input.bugcheck.data.as_ref();
-    let fault_address = bugcheck_data.and_then(dump_fault_address);
+    let fault_address = dump_target_fault_address(bugcheck_data, input.user_exception);
     let fault = fault_address.map(|address| dump_address_observation(session, address, 8));
-    let exception_context =
-        dump_exception_context(session, input.target, bugcheck_data, input.max_frames);
-    let exception_record = dump_exception_record(session, bugcheck_data, input.current_stack);
+    let exception_context = match input.user_exception {
+        Some(exception) => Some(json!({
+            "status": exception.context.status,
+            "selection": exception.source,
+            "thread_system_id": exception.thread_system_id,
+            "context": exception.context,
+            "detail": exception.context.detail,
+        })),
+        None => dump_exception_context(session, input.target, bugcheck_data, input.max_frames),
+    };
+    let exception_record = match input.user_exception {
+        Some(exception) => Some(json!({
+            "status": exception.status,
+            "source": exception.source,
+            "thread_system_id": exception.thread_system_id,
+            "selection": exception.record,
+            "detail": exception.detail,
+        })),
+        None => dump_exception_record(session, bugcheck_data, input.current_stack),
+    };
     let snapshot_event = dump_snapshot_event_observation(session, input.bugcheck);
     let debugger_context = dump_debugger_context(session);
-    let verifier = dump_verifier_observation(session);
+    let kernel_only = json!({
+        "status": "not_applicable",
+        "detail": "Kernel driver/pool attribution is not applicable to a user-mode dump.",
+    });
+    let verifier = if input.user_exception.is_some() {
+        kernel_only.clone()
+    } else {
+        dump_verifier_observation(session)
+    };
     let symbol_modules = dump_symbol_modules(session, fault_address, &exception_context);
     let symbol_readiness = dump_symbol_readiness(session, &symbol_modules, input.refresh_symbols);
-    let driver_evidence = dump_driver_evidence(
-        session,
-        input.modules,
-        fault_address,
-        input.current_stack,
-        &exception_context,
-    );
-    let pool_tracker = dump_pool_tracker_observation(
-        session,
-        &exception_context,
-        &fault,
-        input.tracker_table_base,
-    );
+    let driver_evidence = if input.user_exception.is_some() {
+        kernel_only.clone()
+    } else {
+        dump_driver_evidence(
+            session,
+            input.modules,
+            fault_address,
+            input.current_stack,
+            &exception_context,
+        )
+    };
+    let pool_tracker = if input.user_exception.is_some() {
+        kernel_only.clone()
+    } else {
+        dump_pool_tracker_observation(
+            session,
+            &exception_context,
+            &fault,
+            input.tracker_table_base,
+        )
+    };
     let address_inspection = input
         .inspected_address
         .map(|address| dump_address_inspection(session, address, input.tracker_table_base));
-    let bugcheck_driver = dump_bugcheck_driver(session);
-    let evidence = dump_evidence_grades(&driver_evidence, &pool_tracker, &bugcheck_driver);
+    let bugcheck_driver = if input.user_exception.is_some() {
+        kernel_only.clone()
+    } else {
+        dump_bugcheck_driver(session)
+    };
+    let evidence = if input.user_exception.is_some() {
+        json!({
+            "source": "minidump_exception_stream",
+            "detail": "The captured exception record/context describe the recorded exception, not its lifecycle cause. The current debugger stack remains separate from the exception-context unwind; kernel driver attribution is not applicable.",
+        })
+    } else {
+        dump_evidence_grades(&driver_evidence, &pool_tracker, &bugcheck_driver)
+    };
 
     json!({
         "bugcheck": dump_bugcheck_value(input.bugcheck),
@@ -489,8 +545,28 @@ fn dump_triage_value(session: &DebuggerSession, input: DumpTriageInput<'_>) -> V
             &fault,
             &exception_context,
         ),
-        "recommendations": dump_recommendations(input.bugcheck),
+        "recommendations": if input.user_exception.is_some() {
+            json!([{
+                "priority": "high",
+                "detail": "Use the captured exception code, access parameters, fault-time registers and exception_context.context.stack. Top-level frames/registers and current_stack are debugger snapshot state, which may be inside WER. If the exception-context unwind is unavailable or invalid, do not substitute the snapshot stack or infer unobserved callers.",
+            }])
+        } else {
+            dump_recommendations(input.bugcheck)
+        },
     })
+}
+
+fn dump_target_fault_address(
+    bugcheck: Option<&windbg_dbgeng::BugCheckData>,
+    user_exception: Option<&MinidumpException>,
+) -> Option<u64> {
+    match user_exception {
+        Some(exception) => exception
+            .record
+            .as_ref()
+            .map(|record| record.exception_address),
+        None => bugcheck.and_then(dump_fault_address),
+    }
 }
 
 fn dump_fault_address(data: &windbg_dbgeng::BugCheckData) -> Option<u64> {
@@ -1901,6 +1977,31 @@ fn dump_recommendations(bugcheck: &windbg_dbgeng::BugCheckDataResult) -> Value {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn user_dump_without_exception_does_not_inherit_a_kernel_fault_address() {
+        let bugcheck = windbg_dbgeng::BugCheckData {
+            code: 0x3b,
+            parameters: [0xc0000005, 0xfffff80012345678, 0, 0],
+        };
+        let user_exception = MinidumpException {
+            source: "minidump_exception_stream",
+            status: "not_present".into(),
+            thread_system_id: None,
+            record: None,
+            context: Default::default(),
+            detail: "No ExceptionStream".into(),
+        };
+        assert_eq!(
+            dump_target_fault_address(Some(&bugcheck), None),
+            Some(bugcheck.parameters[1])
+        );
+        assert_eq!(
+            dump_target_fault_address(Some(&bugcheck), Some(&user_exception)),
+            None
+        );
+        assert_eq!(dump_target_fault_address(None, None), None);
+    }
 
     #[test]
     fn dump_triage_describes_system_service_exception_parameters() {

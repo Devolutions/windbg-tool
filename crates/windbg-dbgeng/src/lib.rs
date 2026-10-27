@@ -1,5 +1,7 @@
 use anyhow::{bail, ensure, Context};
 use serde::Serialize;
+mod minidump_exception;
+pub use minidump_exception::{MinidumpException, MAX_USER_EXCEPTION_STACK_FRAMES};
 #[cfg(windows)]
 use std::os::windows::ffi::OsStrExt;
 #[cfg(windows)]
@@ -3259,6 +3261,15 @@ impl DebuggerSession {
             )?;
         }
         frames.truncate(filled as usize);
+        Ok(self.describe_stack_frames(frames, max_frames, filled))
+    }
+
+    fn describe_stack_frames(
+        &self,
+        frames: Vec<windows::Win32::System::Diagnostics::Debug::Extensions::DEBUG_STACK_FRAME>,
+        max_frames: u32,
+        filled: u32,
+    ) -> StackTraceResult {
         let frames = frames
             .into_iter()
             .map(|frame| StackFrameInfo {
@@ -3306,14 +3317,14 @@ impl DebuggerSession {
         } else {
             "captured"
         };
-        Ok(StackTraceResult {
+        StackTraceResult {
             requested_frames: max_frames,
             returned_frames: filled,
             valid_frames,
             status: status.to_string(),
             stop_reason,
             frames,
-        })
+        }
     }
 
     pub fn thread_context(
@@ -4518,7 +4529,7 @@ mod tests {
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    fn temporary_runtime_directory(label: &str) -> PathBuf {
+    pub(super) fn temporary_runtime_directory(label: &str) -> PathBuf {
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
