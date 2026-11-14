@@ -1,5 +1,6 @@
 use super::timeline::{
     collect_keyframe_events, collect_timeline_events, timeline_sequence, timeline_source_summary,
+    timeline_steps,
 };
 use super::triage::triage_value;
 use crate::backend::{capability_catalog, capability_contract};
@@ -127,16 +128,26 @@ pub fn ttd_open(state: &mut ServiceState, request: OpenTraceRequest) -> anyhow::
         trace_index: request.trace_index,
         symbols: request.symbols,
     })?;
-    let cursor = state.ttd.create_cursor(load.session_id)?;
-    let position = if let Some(position) = request.position {
-        Some(state.ttd.set_position(PositionRequest {
-            session_id: load.session_id,
-            cursor_id: cursor.cursor_id,
-            position,
-            thread_unique_id: request.thread_unique_id,
-        })?)
-    } else {
-        None
+    let setup = (|| -> anyhow::Result<_> {
+        let cursor = state.ttd.create_cursor(load.session_id)?;
+        let position = if let Some(position) = request.position {
+            Some(state.ttd.set_position(PositionRequest {
+                session_id: load.session_id,
+                cursor_id: cursor.cursor_id,
+                position,
+                thread_unique_id: request.thread_unique_id,
+            })?)
+        } else {
+            None
+        };
+        Ok((cursor, position))
+    })();
+    let (cursor, position) = match setup {
+        Ok(values) => values,
+        Err(error) => {
+            let _ = state.ttd.close_trace(load.session_id);
+            return Err(error);
+        }
     };
     Ok(json!({
         "session_id": load.session_id,
@@ -160,17 +171,15 @@ pub fn debug_capabilities(
     }
     let selected = if let Some(session_id) = args.session_id {
         let capabilities = state.ttd.capabilities(session_id)?;
-        let architecture = if let Some(cursor_id) = args.cursor_id {
-            Some(section_ok(state.ttd.register_context(
-                RegisterContextRequest {
+        let architecture = args.cursor_id.map(|cursor_id| {
+            section_result(|| {
+                state.ttd.register_context(RegisterContextRequest {
                     session_id,
                     cursor_id,
                     thread_id: None,
-                },
-            )?))
-        } else {
-            None
-        };
+                })
+            })
+        });
         Some(json!({
             "subject": {
                 "kind": "ttd_cursor",
@@ -242,11 +251,18 @@ pub fn ttd_context_snapshot(
     if let Some(session_id) = session_id {
         snapshot["trace_info"] = section_result(|| state.ttd.trace_info(session_id));
         snapshot["capabilities"] = section_result(|| state.ttd.capabilities(session_id));
+        snapshot["exceptions"] = section_result(|| state.ttd.list_exceptions(session_id));
         if let Some(cursor_id) = cursor_id {
             snapshot["position"] =
                 section_result(|| state.ttd.cursor_position(session_id, cursor_id));
             snapshot["active_threads"] =
                 section_result(|| state.ttd.active_threads(session_id, cursor_id));
+            snapshot["modules"] = section_result(|| {
+                let mut value =
+                    serde_json::to_value(state.ttd.cursor_modules(session_id, cursor_id)?)?;
+                value = bound_array(value, "modules", 64);
+                Ok(value)
+            });
             snapshot["stack"] = section_result(|| state.ttd.stack_info(session_id, cursor_id));
             snapshot["architecture_state"] = section_result(|| {
                 state.ttd.register_context(RegisterContextRequest {
@@ -259,6 +275,12 @@ pub fn ttd_context_snapshot(
                 section_result(|| state.ttd.command_line(session_id, cursor_id));
             snapshot["current_disassembly"] =
                 section_result(|| disasm_at_cursor(state, session_id, cursor_id, 4, 64));
+        } else {
+            snapshot["modules"] = section_result(|| {
+                let mut value = serde_json::to_value(state.ttd.list_modules(session_id)?)?;
+                value = bound_array(value, "modules", 64);
+                Ok(value)
+            });
         }
         snapshot["timeline_summary"] = section_result(|| {
             timeline_events(state, session_id, "all", args.max_timeline_events.max(1))
@@ -284,7 +306,7 @@ pub fn debug_snapshot(
     let cursor_id = args
         .cursor_id
         .context("debug_snapshot requires cursor_id with session_id")?;
-    let legacy = ttd_context_snapshot(
+    let mut legacy = ttd_context_snapshot(
         state,
         ContextSnapshotRequest {
             session_id: Some(session_id),
@@ -292,11 +314,19 @@ pub fn debug_snapshot(
             max_timeline_events: 16,
         },
     )?;
+    if args.disasm_count != 4 && section_enabled(&args, "current_disassembly") {
+        let count = (args.disasm_count as usize).clamp(1, 256);
+        let bytes = ((count as u32) * 16).clamp(64, 4096);
+        legacy["current_disassembly"] =
+            section_result(|| disasm_at_cursor(state, session_id, cursor_id, count, bytes));
+    }
     let mut sections = Map::new();
     add_legacy_section(&mut sections, "trace_info", &legacy, "info");
     add_legacy_section(&mut sections, "capabilities", &legacy, "debug capabilities");
     add_legacy_section(&mut sections, "position", &legacy, "position get");
     add_legacy_section(&mut sections, "active_threads", &legacy, "active-threads");
+    add_legacy_section(&mut sections, "modules", &legacy, "cursor modules");
+    add_legacy_section(&mut sections, "exceptions", &legacy, "exceptions");
     add_legacy_section(&mut sections, "stack", &legacy, "stack info");
     add_legacy_section(
         &mut sections,
@@ -527,6 +557,7 @@ fn timeline_events(
     events.sort_by(|left, right| {
         timeline_sequence(left)
             .cmp(&timeline_sequence(right))
+            .then_with(|| timeline_steps(left).cmp(&timeline_steps(right)))
             .then_with(|| left["kind"].as_str().cmp(&right["kind"].as_str()))
             .then_with(|| left.to_string().cmp(&right.to_string()))
     });
@@ -606,6 +637,22 @@ fn select_session_cursor(
     }
     if sessions.is_empty() {
         return Ok((None, None));
+    }
+    if let Some(requested_cursor) = cursor_id {
+        if let Some(matching_session) = sessions.iter().find(|session| {
+            session["cursors"].as_array().is_some_and(|cursors| {
+                cursors
+                    .iter()
+                    .any(|c| c["cursor_id"].as_u64() == Some(requested_cursor))
+            })
+        }) {
+            return Ok((
+                matching_session["session_id"].as_u64(),
+                Some(requested_cursor),
+            ));
+        }
+        let session = &sessions[0];
+        return Ok((session["session_id"].as_u64(), Some(requested_cursor)));
     }
     let session = &sessions[0];
     let session_id = session["session_id"].as_u64();
@@ -693,8 +740,10 @@ fn section_enabled(args: &DebugSnapshotRequest, name: &str) -> bool {
 
 fn bound_array(mut value: Value, key: &str, max: usize) -> Value {
     if let Some(array) = value.get_mut(key).and_then(Value::as_array_mut) {
-        if array.len() > max {
+        let total = array.len();
+        if total > max {
             array.truncate(max);
+            value["total"] = Value::from(total);
             value["truncated"] = Value::Bool(true);
             value["max"] = Value::from(max);
         }

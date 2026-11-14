@@ -71,8 +71,10 @@ pub fn pe_exports(request: PeExportsRequest) -> anyhow::Result<Value> {
     let exports = read_export_symbols(&request.path)?;
     let filter = request
         .filter
-        .as_ref()
-        .map(|value| value.to_ascii_lowercase());
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_ascii_lowercase);
     let filtered = filter_exports(&exports, filter.as_deref());
     let values = filtered
         .iter()
@@ -128,7 +130,7 @@ pub fn ttd_symbols_nearest(
         .context("address_info module did not include an RVA")?;
     let path = PathBuf::from(path);
     let exports = read_export_symbols(&path)?;
-    let nearest = nearest_export(&exports, rva as u32);
+    let nearest = nearest_export(&exports, rva);
     let export_sample = request.include_exports.then(|| {
         exports
             .iter()
@@ -411,17 +413,21 @@ fn session_pe_diagnostics(modules: &[Value]) -> Value {
     let mut local_file_count = 0usize;
     let mut parsed_count = 0usize;
     let mut samples = Vec::new();
+    let mut seen_paths = std::collections::HashSet::new();
 
     for module in modules {
-        let Some(path) = module_path(module) else {
+        let Some(path_str) = module_path(module) else {
             continue;
         };
         with_path_count += 1;
-        let path = PathBuf::from(path);
+        let path = PathBuf::from(path_str);
         if !path.exists() {
             continue;
         }
         local_file_count += 1;
+        if !seen_paths.insert(path_str.to_ascii_lowercase()) {
+            continue;
+        }
         if samples.len() >= MAX_PARSED_MODULES {
             continue;
         }
@@ -504,11 +510,11 @@ fn filter_exports<'a>(exports: &'a [ExportSymbol], filter: Option<&str>) -> Vec<
         .collect()
 }
 
-fn nearest_export(exports: &[ExportSymbol], rva: u32) -> Option<&ExportSymbol> {
+fn nearest_export(exports: &[ExportSymbol], rva: u64) -> Option<&ExportSymbol> {
     exports
         .iter()
-        .filter(|export| export.forwarder.is_none() && export.rva <= rva)
-        .max_by_key(|export| export.rva)
+        .filter(|export| export.forwarder.is_none() && u64::from(export.rva) <= rva)
+        .max_by_key(|export| (export.rva, export.name.is_some()))
 }
 
 fn export_display_name(export: &ExportSymbol, displacement: u64) -> String {

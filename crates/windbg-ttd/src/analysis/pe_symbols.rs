@@ -177,14 +177,25 @@ pub struct ExportSymbol {
 }
 
 pub fn diagnose_pe(path: &Path) -> anyhow::Result<Value> {
+    ensure!(
+        path.is_file(),
+        "PE path is not a regular file: {}",
+        path.display()
+    );
     let data = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+    ensure!(
+        read_bytes(&data, 0, 2)? == b"MZ",
+        "missing MZ DOS signature"
+    );
     let pe_offset = read_u32(&data, 0x3c)? as usize;
     ensure!(
         read_bytes(&data, pe_offset, 4)? == b"PE\0\0",
         "missing PE signature"
     );
 
-    let file_header = pe_offset + 4;
+    let file_header = pe_offset
+        .checked_add(4)
+        .context("PE header offset overflow")?;
     let machine = read_u16(&data, file_header)?;
     let section_count = read_u16(&data, file_header + 2)? as usize;
     let timestamp = read_u32(&data, file_header + 4)?;
@@ -200,23 +211,37 @@ pub fn diagnose_pe(path: &Path) -> anyhow::Result<Value> {
     };
     let size_of_image = read_u32(&data, optional + 56)?;
     let checksum = read_u32(&data, optional + 64)?;
+    let rva_and_sizes = read_u32(&data, data_dir_base - 4)? as usize;
 
-    let section_table = optional + optional_size;
+    let section_table = optional
+        .checked_add(optional_size)
+        .context("PE section table offset overflow")?;
     let sections = read_sections(&data, section_table, section_count)?;
     let export_dir = data_dir_base + IMAGE_DIRECTORY_ENTRY_EXPORT * 8;
-    let export_rva = read_u32(&data, export_dir)?;
-    let export_size = read_u32(&data, export_dir + 4)?;
+    let (export_rva, export_size) =
+        if rva_and_sizes > IMAGE_DIRECTORY_ENTRY_EXPORT && export_dir + 8 <= section_table {
+            (
+                read_u32(&data, export_dir)?,
+                read_u32(&data, export_dir + 4)?,
+            )
+        } else {
+            (0, 0)
+        };
     let exports = read_exports(&data, &sections, export_rva, export_size)?;
 
     let debug_dir = data_dir_base + IMAGE_DIRECTORY_ENTRY_DEBUG * 8;
-    let debug_rva = read_u32(&data, debug_dir)?;
-    let debug_size = read_u32(&data, debug_dir + 4)?;
+    let (debug_rva, debug_size) =
+        if rva_and_sizes > IMAGE_DIRECTORY_ENTRY_DEBUG && debug_dir + 8 <= section_table {
+            (read_u32(&data, debug_dir)?, read_u32(&data, debug_dir + 4)?)
+        } else {
+            (0, 0)
+        };
     let codeview = if debug_rva == 0 || debug_size == 0 {
         None
     } else {
         let offset = rva_to_file_offset(debug_rva, &sections)
             .with_context(|| format!("mapping debug directory RVA 0x{debug_rva:x}"))?;
-        read_codeview(&data, offset as usize, debug_size as usize)?
+        read_codeview(&data, offset as usize, debug_size as usize, &sections)?
     };
 
     let file_name = path
@@ -250,13 +275,24 @@ pub fn diagnose_pe(path: &Path) -> anyhow::Result<Value> {
 }
 
 pub fn read_export_symbols(path: &Path) -> anyhow::Result<Vec<ExportSymbol>> {
+    ensure!(
+        path.is_file(),
+        "PE path is not a regular file: {}",
+        path.display()
+    );
     let data = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+    ensure!(
+        read_bytes(&data, 0, 2)? == b"MZ",
+        "missing MZ DOS signature"
+    );
     let pe_offset = read_u32(&data, 0x3c)? as usize;
     ensure!(
         read_bytes(&data, pe_offset, 4)? == b"PE\0\0",
         "missing PE signature"
     );
-    let file_header = pe_offset + 4;
+    let file_header = pe_offset
+        .checked_add(4)
+        .context("PE header offset overflow")?;
     let section_count = read_u16(&data, file_header + 2)? as usize;
     let optional_size = read_u16(&data, file_header + 16)? as usize;
     let optional = file_header + 20;
@@ -266,15 +302,25 @@ pub fn read_export_symbols(path: &Path) -> anyhow::Result<Vec<ExportSymbol>> {
         OPTIONAL_HEADER_PE32_PLUS => optional + 112,
         _ => bail!("unsupported PE optional header magic 0x{magic:04x}"),
     };
-    let section_table = optional + optional_size;
+    let rva_and_sizes = read_u32(&data, data_dir_base - 4)? as usize;
+    let section_table = optional
+        .checked_add(optional_size)
+        .context("PE section table offset overflow")?;
     let sections = read_sections(&data, section_table, section_count)?;
     let export_dir = data_dir_base + IMAGE_DIRECTORY_ENTRY_EXPORT * 8;
+    if rva_and_sizes == 0 || export_dir + 8 > section_table {
+        return Ok(Vec::new());
+    }
     let export_rva = read_u32(&data, export_dir)?;
     let export_size = read_u32(&data, export_dir + 4)?;
     read_exports(&data, &sections, export_rva, export_size)
 }
 
 fn read_sections(data: &[u8], section_table: usize, count: usize) -> anyhow::Result<Vec<Section>> {
+    let table_bytes = count
+        .checked_mul(40)
+        .context("PE section table size overflow")?;
+    let _ = read_bytes(data, section_table, table_bytes)?;
     let mut sections = Vec::with_capacity(count);
     for index in 0..count {
         let offset = section_table + index * 40;
@@ -299,24 +345,35 @@ fn read_codeview(
     data: &[u8],
     directory_offset: usize,
     directory_size: usize,
+    sections: &[Section],
 ) -> anyhow::Result<Option<Value>> {
     let entry_count = directory_size / 28;
     for index in 0..entry_count {
-        let offset = directory_offset + index * 28;
+        let offset = directory_offset
+            .checked_add(index * 28)
+            .context("debug directory offset overflow")?;
         let debug_type = read_u32(data, offset + 12)?;
         if debug_type != IMAGE_DEBUG_TYPE_CODEVIEW {
             continue;
         }
         let size = read_u32(data, offset + 16)? as usize;
+        let rva = read_u32(data, offset + 20)?;
         let raw_offset = read_u32(data, offset + 24)? as usize;
-        let payload = read_bytes(data, raw_offset, size)?;
+        let file_offset = if raw_offset != 0 {
+            raw_offset
+        } else if rva != 0 {
+            rva_to_file_offset(rva, sections)? as usize
+        } else {
+            continue;
+        };
+        let payload = read_bytes(data, file_offset, size)?;
         if payload.len() >= 24 && &payload[..4] == b"RSDS" {
             let guid = pdb_guid_string(&payload[4..20]);
             let age = read_u32(payload, 20)?;
             let pdb_path = read_null_terminated_string(&payload[24..]);
-            let pdb_name = Path::new(&pdb_path)
-                .file_name()
-                .and_then(|name| name.to_str())
+            let pdb_name = pdb_path
+                .rsplit(['\\', '/'])
+                .next()
                 .unwrap_or(pdb_path.as_str());
             let pdb_key = format!("{guid}{age:X}");
             let pdb_symbol_store_path = if pdb_name.is_empty() {
@@ -372,15 +429,30 @@ fn read_exports(
     }
 
     let functions_offset = rva_to_file_offset(functions_rva, sections)? as usize;
+    let functions_bytes = function_count
+        .checked_mul(4)
+        .context("export function table size overflow")?;
+    let _ = read_bytes(data, functions_offset, functions_bytes)?;
+
     let names_offset = if name_count == 0 {
         None
     } else {
-        Some(rva_to_file_offset(names_rva, sections)? as usize)
+        let offset = rva_to_file_offset(names_rva, sections)? as usize;
+        let bytes = name_count
+            .checked_mul(4)
+            .context("export name table size overflow")?;
+        let _ = read_bytes(data, offset, bytes)?;
+        Some(offset)
     };
     let ordinals_offset = if name_count == 0 {
         None
     } else {
-        Some(rva_to_file_offset(ordinals_rva, sections)? as usize)
+        let offset = rva_to_file_offset(ordinals_rva, sections)? as usize;
+        let bytes = name_count
+            .checked_mul(2)
+            .context("export ordinal table size overflow")?;
+        let _ = read_bytes(data, offset, bytes)?;
+        Some(offset)
     };
 
     let mut names_by_index = vec![None; function_count];
@@ -410,7 +482,7 @@ fn read_exports(
         };
         exports.push(ExportSymbol {
             name,
-            ordinal: ordinal_base + index as u32,
+            ordinal: ordinal_base.wrapping_add(index as u32),
             rva,
             rva_hex: format!("{rva:X}"),
             forwarder,
@@ -451,11 +523,20 @@ pub fn export_symbol_value(export: &ExportSymbol) -> Value {
 
 fn rva_to_file_offset(rva: u32, sections: &[Section]) -> anyhow::Result<u32> {
     for section in sections {
-        let span = section.virtual_size.max(section.raw_size);
-        let start = section.virtual_address;
-        let end = start.saturating_add(span);
-        if rva >= start && rva < end {
-            return Ok(section.raw_offset + (rva - start));
+        if section.raw_offset == 0 || section.raw_size == 0 || rva < section.virtual_address {
+            continue;
+        }
+        let delta = rva - section.virtual_address;
+        let bound = if section.virtual_size == 0 {
+            section.raw_size
+        } else {
+            section.virtual_size.min(section.raw_size)
+        };
+        if delta < bound {
+            return section
+                .raw_offset
+                .checked_add(delta)
+                .with_context(|| format!("file offset overflow for RVA 0x{rva:x}"));
         }
     }
     bail!("RVA 0x{rva:x} is not covered by any section")

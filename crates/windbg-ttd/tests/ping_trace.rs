@@ -45,6 +45,10 @@ fn loads_ping_trace_fixture_and_exercises_cursor_path() -> anyhow::Result<()> {
         return Ok(());
     };
 
+    // Keep symbol-path resolution hermetic regardless of ambient machine environment.
+    std::env::remove_var("_NT_SYMBOL_PATH");
+    std::env::remove_var("_NT_ALT_SYMBOL_PATH");
+
     let symbol_settings = ping_symbol_settings(&trace_path);
     let resolved_symbols = symbol_settings.resolve_for_process();
 

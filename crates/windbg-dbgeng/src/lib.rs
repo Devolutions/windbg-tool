@@ -479,15 +479,22 @@ fn wait_for_initial_event(
     timeout_ms: u32,
     operation: &str,
 ) -> anyhow::Result<()> {
+    use windows::core::Interface;
     use windows::Win32::System::Diagnostics::Debug::Extensions::DEBUG_WAIT_DEFAULT;
 
-    match unsafe { control.WaitForEvent(DEBUG_WAIT_DEFAULT, timeout_ms) } {
-        Ok(()) => Ok(()),
-        Err(error) if is_dbgeng_wait_timeout_hresult(error.code().0) => {
-            bail!("DbgEng {operation} initial WaitForEvent timed out after {timeout_ms} ms")
-        }
-        Err(error) => Err(error).context(format!("DbgEng {operation} initial WaitForEvent failed")),
+    let status = unsafe {
+        (Interface::vtable(control).WaitForEvent)(
+            Interface::as_raw(control),
+            DEBUG_WAIT_DEFAULT,
+            timeout_ms,
+        )
+    };
+    if is_dbgeng_wait_timeout_hresult(status.0) {
+        bail!("DbgEng {operation} initial WaitForEvent timed out after {timeout_ms} ms");
     }
+    status
+        .ok()
+        .with_context(|| format!("DbgEng {operation} initial WaitForEvent failed"))
 }
 
 fn is_dbgeng_wait_timeout_hresult(hresult: i32) -> bool {
@@ -1374,7 +1381,12 @@ pub fn inspect_minidump_directory(path: &Path) -> MinidumpDirectoryInventory {
         return inventory;
     }
 
-    for (index, entry) in directory.chunks_exact(MINIDUMP_DIRECTORY_SIZE).enumerate() {
+    for (index, entry) in directory
+        .as_chunks::<MINIDUMP_DIRECTORY_SIZE>()
+        .0
+        .iter()
+        .enumerate()
+    {
         let stream_type = minidump_u32(entry, 0);
         let data_size = minidump_u32(entry, 4);
         let data_rva = minidump_u32(entry, 8);
@@ -1989,22 +2001,27 @@ impl DebuggerSession {
     }
 
     pub fn wait_for_event(&self, timeout_ms: u32) -> anyhow::Result<DebuggerExecutionStatus> {
+        use windows::core::Interface;
         use windows::Win32::System::Diagnostics::Debug::Extensions::{
             DEBUG_STATUS_TIMEOUT, DEBUG_WAIT_DEFAULT,
         };
 
-        let wait = unsafe { self.control.WaitForEvent(DEBUG_WAIT_DEFAULT, timeout_ms) };
-        match wait {
-            Ok(()) => Ok(self.execution_status()),
-            // DbgEng documents S_FALSE as its bounded wait timeout result.
-            Err(error) if is_dbgeng_wait_timeout_hresult(error.code().0) => {
-                Ok(DebuggerExecutionStatus {
-                    raw: Some(DEBUG_STATUS_TIMEOUT),
-                    name: Some(status_name(DEBUG_STATUS_TIMEOUT)),
-                })
-            }
-            Err(error) => Err(error).context("DbgEng WaitForEvent failed"),
+        let status = unsafe {
+            (Interface::vtable(&self.control).WaitForEvent)(
+                Interface::as_raw(&self.control),
+                DEBUG_WAIT_DEFAULT,
+                timeout_ms,
+            )
+        };
+        // DbgEng documents S_FALSE as its bounded wait timeout result.
+        if is_dbgeng_wait_timeout_hresult(status.0) {
+            return Ok(DebuggerExecutionStatus {
+                raw: Some(DEBUG_STATUS_TIMEOUT),
+                name: Some(status_name(DEBUG_STATUS_TIMEOUT)),
+            });
         }
+        status.ok().context("DbgEng WaitForEvent failed")?;
+        Ok(self.execution_status())
     }
 
     pub fn continue_execution(&self) -> anyhow::Result<DebuggerExecutionStatus> {
@@ -2341,6 +2358,14 @@ impl DebuggerSession {
         self.activate()?;
         unsafe {
             self.client.TerminateCurrentProcess()?;
+        }
+        Ok(())
+    }
+
+    pub fn end_session(&self) -> anyhow::Result<()> {
+        use windows::Win32::System::Diagnostics::Debug::Extensions::DEBUG_END_PASSIVE;
+        unsafe {
+            self.client.EndSession(DEBUG_END_PASSIVE)?;
         }
         Ok(())
     }
@@ -3993,6 +4018,10 @@ impl DebuggerSession {
         anyhow::bail!("DbgEng sessions are only supported on Windows")
     }
 
+    pub fn end_session(&self) -> anyhow::Result<()> {
+        anyhow::bail!("DbgEng sessions are only supported on Windows")
+    }
+
     pub fn write_dump(&self, _options: DumpWriteOptions) -> anyhow::Result<DumpWriteResult> {
         anyhow::bail!("DbgEng dump writing is only supported on Windows")
     }
@@ -4234,7 +4263,17 @@ fn launch_live_session_impl(options: LiveLaunchSessionOptions) -> anyhow::Result
         LiveInitialStop::SoftwareBreakpoint => "software initial-break",
         LiveInitialStop::CreateProcessEvent => "create-process",
     };
-    wait_for_initial_event(&control, options.initial_break_timeout_ms, initial_stop)?;
+    if let Err(error) =
+        wait_for_initial_event(&control, options.initial_break_timeout_ms, initial_stop)
+    {
+        unsafe {
+            let _ = client.TerminateCurrentProcess();
+            let _ = client.EndSession(
+                windows::Win32::System::Diagnostics::Debug::Extensions::DEBUG_END_PASSIVE,
+            );
+        }
+        return Err(error);
+    }
 
     Ok(DebuggerSession {
         kind: DebuggerSessionKind::Live,
@@ -4274,7 +4313,16 @@ fn attach_live_session_impl(options: LiveAttachOptions) -> anyhow::Result<Debugg
     unsafe {
         client.AttachProcess(0, options.process_id, DEBUG_ATTACH_DEFAULT)?;
     }
-    wait_for_initial_event(&control, options.initial_break_timeout_ms, "attach")?;
+    if let Err(error) = wait_for_initial_event(&control, options.initial_break_timeout_ms, "attach")
+    {
+        unsafe {
+            let _ = client.DetachCurrentProcess();
+            let _ = client.EndSession(
+                windows::Win32::System::Diagnostics::Debug::Extensions::DEBUG_END_PASSIVE,
+            );
+        }
+        return Err(error);
+    }
 
     Ok(DebuggerSession {
         kind: DebuggerSessionKind::Live,
@@ -4316,9 +4364,15 @@ fn open_dump_session_impl(options: DumpOpenOptions) -> anyhow::Result<DebuggerSe
     let symbol_path = configure_dbgeng_symbol_path(&symbols)?;
     unsafe {
         client.OpenDumpFileWide(PCWSTR(path.as_ptr()), 0)?;
-        control
+        if let Err(error) = control
             .WaitForEvent(DEBUG_WAIT_DEFAULT, 5000)
-            .context("DbgEng dump WaitForEvent failed")?;
+            .context("DbgEng dump WaitForEvent failed")
+        {
+            let _ = client.EndSession(
+                windows::Win32::System::Diagnostics::Debug::Extensions::DEBUG_END_PASSIVE,
+            );
+            return Err(error);
+        }
     }
 
     Ok(DebuggerSession {
@@ -4378,16 +4432,22 @@ fn read_wide_string<F>(mut reader: F) -> anyhow::Result<String>
 where
     F: FnMut(&mut [u16], Option<*mut u32>) -> windows::core::Result<()>,
 {
+    const MAX_WIDE_STRING_CHARS: usize = 65_536;
     let mut capacity = 256usize;
-    loop {
+    for _ in 0..2 {
         let mut buffer = vec![0u16; capacity];
         let mut needed = 0u32;
         reader(&mut buffer, Some(&mut needed))?;
         if needed == 0 || (needed as usize) <= buffer.len() {
             return Ok(decode_utf16(&buffer));
         }
+        ensure!(
+            (needed as usize) <= MAX_WIDE_STRING_CHARS,
+            "DbgEng wide-string output ({needed} chars) exceeds the {MAX_WIDE_STRING_CHARS}-char limit"
+        );
         capacity = needed as usize;
     }
+    bail!("DbgEng wide-string output did not fit after resizing to {capacity} chars")
 }
 
 #[cfg(windows)]
@@ -4553,6 +4613,16 @@ fn write_process_dump_file(
             process_id,
         )?
     };
+    struct ProcessHandleGuard(HANDLE);
+    impl Drop for ProcessHandleGuard {
+        fn drop(&mut self) {
+            unsafe {
+                let _ = CloseHandle(self.0);
+            }
+        }
+    }
+    let process_guard = ProcessHandleGuard(process);
+
     let file = OpenOptions::new()
         .create(true)
         .write(true)
@@ -4592,7 +4662,7 @@ fn write_process_dump_file(
     let mini_dump_write_dump: MiniDumpWriteDumpFn = unsafe { std::mem::transmute(procedure) };
     let write_result = unsafe {
         mini_dump_write_dump(
-            process,
+            process_guard.0,
             process_id,
             HANDLE(file.as_raw_handle()),
             dump_type,
@@ -4601,14 +4671,11 @@ fn write_process_dump_file(
             std::ptr::null(),
         )
     };
-    unsafe {
-        CloseHandle(process)?;
+    let write_error = (!write_result.as_bool()).then(Error::from_win32);
+    drop(process_guard);
+    if let Some(error) = write_error {
+        bail!("MiniDumpWriteDump failed: {error}");
     }
-    ensure!(
-        write_result.as_bool(),
-        "MiniDumpWriteDump failed: {}",
-        Error::from_win32()
-    );
     drop(file);
     let metadata = std::fs::metadata(&options.path)
         .with_context(|| format!("dump file was not created: {}", options.path.display()))?;

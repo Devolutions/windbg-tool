@@ -8,6 +8,7 @@ use super::memory::{
 use super::stack::recover_stack_candidates;
 use super::timeline::{
     collect_keyframe_events, collect_timeline_events, timeline_sequence, timeline_source_summary,
+    timeline_steps,
 };
 use super::util::{hex_to_bytes, parse_u64_argument};
 use crate::state::ServiceState;
@@ -305,9 +306,19 @@ pub fn ttd_stack_backtrace(
         decode_pointers: true,
     })?;
     let stack_value = serde_json::to_value(&stack_read)?;
-    let candidate_budget = request.max_frames.saturating_sub(1);
-    let mut candidates =
-        recover_stack_candidates(&stack_value, candidate_budget, request.min_confidence);
+    let current_pc = registers_value["program_counter"]
+        .as_u64()
+        .filter(|&pc| pc != 0);
+    let candidate_budget = if current_pc.is_some() {
+        request.max_frames.saturating_sub(1)
+    } else {
+        request.max_frames
+    };
+    let mut candidates = if candidate_budget > 0 {
+        recover_stack_candidates(&stack_value, candidate_budget, request.min_confidence)
+    } else {
+        Vec::new()
+    };
     if request.target_info {
         enrich_stack_candidates(
             state,
@@ -318,7 +329,7 @@ pub fn ttd_stack_backtrace(
     }
 
     let mut frames = Vec::new();
-    if let Some(pc) = registers_value["program_counter"].as_u64() {
+    if let Some(pc) = current_pc {
         let mut current = json!({
             "index": 0,
             "kind": "current_instruction",
@@ -477,7 +488,7 @@ pub fn ttd_memory_dps(
         if chunk.len() < request.pointer_size as usize {
             break;
         }
-        let slot = base + (index as u64 * request.pointer_size as u64);
+        let slot = base.wrapping_add(index as u64 * request.pointer_size as u64);
         let target = read_pointer_value(chunk, request.pointer_size)?;
         let mut row = json!({
             "slot": slot,
@@ -519,26 +530,62 @@ pub fn ttd_memory_chase(
     );
 
     let root_address = parse_u64_argument(&request.address)?;
+    ensure!(root_address != 0, "address must be non-zero");
     let mut current = root_address;
     let mut hops = Vec::new();
+    let mut visited = std::collections::BTreeSet::new();
+    visited.insert(current);
     let mut stop_reason = "max_depth";
 
     for depth in 0..request.depth {
-        let read_address = current
+        let Some(read_address) = current
             .checked_add(request.offset)
-            .context("pointer read address overflowed")?;
-        let read = state.ttd.read_memory(ReadMemoryRequest {
+            .filter(|&addr| addr != 0)
+        else {
+            stop_reason = "address_overflow";
+            break;
+        };
+        let read = match state.ttd.read_memory(ReadMemoryRequest {
             session_id: request.session_id,
             cursor_id: request.cursor_id,
             address: read_address,
             size: request.pointer_size,
             policy: request.policy,
-        })?;
+        }) {
+            Ok(read) => read,
+            Err(error) if depth > 0 => {
+                hops.push(json!({
+                    "index": depth,
+                    "base_address": current,
+                    "read_address": read_address,
+                    "offset": request.offset,
+                    "pointer_size": request.pointer_size,
+                    "error": error.to_string(),
+                }));
+                stop_reason = "unreadable_memory";
+                break;
+            }
+            Err(error) => return Err(error),
+        };
         let read_value = serde_json::to_value(&read)?;
         let data = read_value["data"]
             .as_str()
             .context("ttd_read_memory response did not include hex data")?;
         let bytes = hex_to_bytes(data)?;
+        if bytes.len() < request.pointer_size as usize {
+            hops.push(json!({
+                "index": depth,
+                "base_address": current,
+                "read_address": read_address,
+                "offset": request.offset,
+                "pointer_size": request.pointer_size,
+                "bytes": data,
+                "read": read_value,
+                "error": "short_read",
+            }));
+            stop_reason = "unreadable_memory";
+            break;
+        }
         let target = read_pointer_value(&bytes, request.pointer_size)?;
         let mut hop = json!({
             "index": depth,
@@ -559,6 +606,10 @@ pub fn ttd_memory_chase(
         hops.push(hop);
         if target == 0 {
             stop_reason = "null_pointer";
+            break;
+        }
+        if !visited.insert(target) {
+            stop_reason = "cycle_detected";
             break;
         }
         current = target;
@@ -640,6 +691,7 @@ pub fn ttd_timeline_events(
     events.sort_by(|left, right| {
         timeline_sequence(left)
             .cmp(&timeline_sequence(right))
+            .then_with(|| timeline_steps(left).cmp(&timeline_steps(right)))
             .then_with(|| left["kind"].as_str().cmp(&right["kind"].as_str()))
             .then_with(|| left.to_string().cmp(&right.to_string()))
     });

@@ -8,7 +8,9 @@ use super::memory::{
 use super::stack::recover_stack_candidates;
 use super::util::{hex_to_bytes, parse_u64_argument};
 use crate::state::ServiceState;
-use crate::targets::{TargetId, TargetMemoryReadRequest, TargetRequest};
+use crate::targets::{
+    TargetId, TargetMemoryReadRequest, TargetModuleParametersRequest, TargetRequest,
+};
 use anyhow::{ensure, Context};
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -154,17 +156,26 @@ fn resolve_target_sp(state: &ServiceState, target_id: TargetId) -> anyhow::Resul
         .context("target core registers did not include stack_offset; pass address")
 }
 
-fn stack_read_from_bytes(address: u64, bytes: &[u8]) -> Value {
+fn stack_read_from_bytes(
+    address: u64,
+    bytes: &[u8],
+    module_ranges: &[(u64, u64, String)],
+) -> Value {
     let mut pointers = Vec::new();
     let mut offset = 0usize;
     while offset + 8 <= bytes.len() {
-        let slot = address + offset as u64;
+        let slot = address.wrapping_add(offset as u64);
         let value = u64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap());
+        let module = module_ranges
+            .iter()
+            .find(|(base, end, _)| value >= *base && value < *end)
+            .map(|(_, _, name)| Value::String(name.clone()))
+            .unwrap_or(Value::Null);
         pointers.push(json!({
             "address": slot,
             "offset": offset,
             "value": value,
-            "module": Value::Null,
+            "module": module,
         }));
         offset += 8;
     }
@@ -173,6 +184,59 @@ fn stack_read_from_bytes(address: u64, bytes: &[u8]) -> Value {
         "size": bytes.len(),
         "pointers": pointers,
     })
+}
+
+fn target_module_ranges(state: &ServiceState, target_id: TargetId) -> Vec<(u64, u64, String)> {
+    let Ok(module_list) = state.targets.list_modules(TargetRequest { target_id }) else {
+        return Vec::new();
+    };
+    let mut bases = module_list
+        .modules
+        .iter()
+        .map(|module| module.base_address)
+        .collect::<Vec<_>>();
+    bases.sort_unstable();
+    bases.dedup();
+    bases.truncate(128);
+    if bases.is_empty() {
+        return Vec::new();
+    }
+    let Ok(params) = state
+        .targets
+        .module_parameters(TargetModuleParametersRequest {
+            target_id,
+            module_base_addresses: bases,
+        })
+    else {
+        return Vec::new();
+    };
+    params
+        .parameters
+        .into_iter()
+        .filter_map(|param| {
+            let end = param
+                .base_address
+                .checked_add(u64::from(param.image_size))?;
+            let name = module_list
+                .modules
+                .iter()
+                .find(|m| m.base_address == param.base_address)
+                .and_then(|m| {
+                    m.module_name
+                        .clone()
+                        .or_else(|| m.image_name.clone())
+                        .or_else(|| m.loaded_image_name.clone())
+                })?;
+            Some((param.base_address, end, name))
+        })
+        .collect()
+}
+
+fn plausible_pointer_for_size(value: u64, pointer_size: u32) -> bool {
+    match pointer_size {
+        4 => value >= 0x10000 && value <= u64::from(u32::MAX) && value.is_multiple_of(4),
+        _ => plausible_x64_pointer(value),
+    }
 }
 
 pub fn target_disassemble(
@@ -236,23 +300,50 @@ pub fn target_memory_strings(
     state: &ServiceState,
     request: TargetMemoryStringsRequest,
 ) -> anyhow::Result<Value> {
+    ensure!(
+        request.max_strings <= 10_000,
+        "max_strings must not exceed 10000"
+    );
+    let encoding = request.encoding.to_ascii_lowercase();
+    ensure!(
+        matches!(encoding.as_str(), "ascii" | "utf16" | "utf-16" | "both"),
+        "encoding must be ascii, utf16, or both"
+    );
     let address = parse_u64_argument(&request.base.address)?;
     let (address, bytes) =
         read_target_bytes(state, request.base.target_id, address, request.base.size)?;
-    let encoding = request.encoding.to_ascii_lowercase();
     let mut strings = Vec::new();
     if encoding == "ascii" || encoding == "both" {
-        strings.extend(ascii_strings(address, &bytes));
+        strings.extend(
+            ascii_strings(address, &bytes)
+                .into_iter()
+                .filter(|entry| {
+                    entry["text"]
+                        .as_str()
+                        .is_some_and(|text| text.len() >= request.min_len)
+                })
+                .map(|mut entry| {
+                    entry["encoding"] = Value::String("ascii".to_string());
+                    entry
+                }),
+        );
     }
     if matches!(encoding.as_str(), "utf16" | "utf-16" | "both") {
-        strings.extend(utf16le_strings(address, &bytes));
+        strings.extend(
+            utf16le_strings(address, &bytes)
+                .into_iter()
+                .filter(|entry| {
+                    entry["text"]
+                        .as_str()
+                        .is_some_and(|text| text.chars().count() >= request.min_len)
+                })
+                .map(|mut entry| {
+                    entry["encoding"] = Value::String("utf16".to_string());
+                    entry
+                }),
+        );
     }
-    strings.retain(|entry| {
-        entry["length"]
-            .as_u64()
-            .map(|len| len as usize >= request.min_len)
-            .unwrap_or(false)
-    });
+    strings.sort_by_key(|item| item["address"].as_u64().unwrap_or(u64::MAX));
     strings.truncate(request.max_strings);
     Ok(json!({
         "target_id": request.base.target_id,
@@ -281,14 +372,14 @@ pub fn target_memory_dps(
     let step = request.pointer_size as usize;
     let mut offset = 0usize;
     while offset + step <= bytes.len() {
-        let slot = address + offset as u64;
+        let slot = address.wrapping_add(offset as u64);
         let value = read_pointer_value(&bytes[offset..], request.pointer_size)?;
         rows.push(json!({
             "address": slot,
             "address_hex": format!("0x{slot:X}"),
             "value": value,
             "value_hex": format!("0x{value:X}"),
-            "plausible_pointer": plausible_x64_pointer(value),
+            "plausible_pointer": plausible_pointer_for_size(value, request.pointer_size),
         }));
         offset += step;
     }
@@ -316,6 +407,8 @@ pub fn target_memory_chase(
     );
     let mut current = parse_u64_argument(&request.address)?;
     let mut chain = Vec::new();
+    let mut visited = std::collections::BTreeSet::new();
+    visited.insert(current);
     for index in 0..request.depth {
         let read_at = current.saturating_add(request.offset);
         match state.targets.read_memory(TargetMemoryReadRequest {
@@ -334,15 +427,16 @@ pub fn target_memory_chase(
                     break;
                 }
                 let value = read_pointer_value(&bytes, request.pointer_size)?;
+                let plausible = plausible_pointer_for_size(value, request.pointer_size);
                 chain.push(json!({
                     "index": index,
                     "address": read_at,
                     "address_hex": format!("0x{read_at:X}"),
                     "value": value,
                     "value_hex": format!("0x{value:X}"),
-                    "plausible_pointer": plausible_x64_pointer(value),
+                    "plausible_pointer": plausible,
                 }));
-                if value == 0 || !plausible_x64_pointer(value) {
+                if value == 0 || !plausible || !visited.insert(value) {
                     break;
                 }
                 current = value;
@@ -386,7 +480,8 @@ pub fn target_stack_recover(
         None => resolve_target_sp(state, request.target_id)?,
     };
     let (address, bytes) = read_target_bytes(state, request.target_id, address, request.size)?;
-    let stack_value = stack_read_from_bytes(address, &bytes);
+    let module_ranges = target_module_ranges(state, request.target_id);
+    let stack_value = stack_read_from_bytes(address, &bytes, &module_ranges);
     let candidates =
         recover_stack_candidates(&stack_value, request.max_candidates, request.min_confidence);
     Ok(json!({

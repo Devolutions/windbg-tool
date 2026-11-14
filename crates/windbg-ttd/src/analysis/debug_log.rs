@@ -1,9 +1,10 @@
 //! Action-log summarizer shared by MCP and CLI.
 
-use anyhow::Context;
+use anyhow::{ensure, Context};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::{json, Value};
+use std::collections::VecDeque;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
@@ -21,6 +22,10 @@ pub struct DebugLogSummarizeRequest {
 }
 
 pub fn debug_log_summarize(request: DebugLogSummarizeRequest) -> anyhow::Result<Value> {
+    ensure!(
+        request.max <= 10_000,
+        "debug_log_summarize max must not exceed 10000"
+    );
     let path = request
         .path
         .or_else(action_log_path_from_env)
@@ -28,7 +33,9 @@ pub fn debug_log_summarize(request: DebugLogSummarizeRequest) -> anyhow::Result<
     let file =
         File::open(&path).with_context(|| format!("opening action log {}", path.display()))?;
     let reader = BufReader::new(file);
-    let mut entries = Vec::new();
+    let mut recent = VecDeque::with_capacity(request.max.min(256));
+    let mut total = 0_usize;
+    let mut failed = 0_usize;
     let mut malformed = 0_usize;
     for line in reader.lines() {
         let line = line.with_context(|| format!("reading action log {}", path.display()))?;
@@ -36,21 +43,22 @@ pub fn debug_log_summarize(request: DebugLogSummarizeRequest) -> anyhow::Result<
             continue;
         }
         match serde_json::from_str::<Value>(&line) {
-            Ok(value) => entries.push(value),
+            Ok(value) => {
+                total += 1;
+                if !value["ok"].as_bool().unwrap_or(false) {
+                    failed += 1;
+                }
+                if request.max > 0 {
+                    if recent.len() == request.max {
+                        recent.pop_front();
+                    }
+                    recent.push_back(value);
+                }
+            }
             Err(_) => malformed += 1,
         }
     }
-    let total = entries.len();
-    let failed = entries
-        .iter()
-        .filter(|entry| !entry["ok"].as_bool().unwrap_or(false))
-        .count();
-    let mut recent = entries
-        .into_iter()
-        .rev()
-        .take(request.max)
-        .collect::<Vec<_>>();
-    recent.reverse();
+    let recent = Vec::from(recent);
     Ok(json!({
         "schema_version": 1,
         "path": path,

@@ -60,14 +60,22 @@ pub(super) async fn ensure_daemon(pipe: &str) -> anyhow::Result<Value> {
 
 fn spawn_daemon(pipe: &str) -> anyhow::Result<()> {
     let daemon_path = daemon_exe_path()?;
-    Command::new(&daemon_path)
+    let mut command = Command::new(&daemon_path);
+    command
         .arg("--pipe")
         .arg(pipe)
         .arg("daemon")
         .arg("start")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        command.creation_flags(CREATE_NEW_PROCESS_GROUP);
+    }
+    command
         .spawn()
         .with_context(|| format!("spawning {}", daemon_path.display()))?;
     Ok(())

@@ -42,7 +42,14 @@ try {
     $msixName = "TTD-$Arch.msix"
     $msixPath = Join-Path $bundleDir $msixName
     if (!(Test-Path $msixPath)) {
-        throw "Could not find $msixName inside the downloaded bundle."
+        $fallback = Get-ChildItem -Path $bundleDir -Filter "*$Arch*.msix" -Recurse -File | Select-Object -First 1
+        if ($null -ne $fallback) {
+            $msixPath = $fallback.FullName
+            $msixName = $fallback.Name
+        }
+        else {
+            throw "Could not find $msixName inside the downloaded bundle."
+        }
     }
 
     $msixZip = Join-Path $tempDir "TTD-$Arch.zip"

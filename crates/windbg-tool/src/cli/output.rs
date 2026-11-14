@@ -29,6 +29,9 @@ impl OutputOptions {
         let mut compact = false;
         let mut envelope = env_envelope_enabled();
         for arg in std::env::args_os().skip(1) {
+            if arg == "--" {
+                break;
+            }
             if arg == "--compact" {
                 compact = true;
             } else if arg == "--envelope" {
@@ -49,7 +52,7 @@ pub(super) fn print_value(mut value: Value, output: &OutputOptions) -> anyhow::R
         value = select_field(&value, path)?;
     }
 
-    if output.envelope && !(output.raw && output.field.is_some()) {
+    if output.envelope && !output.raw {
         print_json(
             json!({
                 "schema_version": SCHEMA_VERSION,
@@ -126,7 +129,9 @@ pub(super) fn classify_error(error: anyhow::Error) -> CliFailure {
         return failure;
     }
 
-    if combined.contains("session") && combined.contains("not found") {
+    if combined.contains("session")
+        && (combined.contains("not found") || combined.contains("unknown session"))
+    {
         return CliFailure::with_causes(
             CliErrorCode::SessionNotFound,
             message,
@@ -135,7 +140,9 @@ pub(super) fn classify_error(error: anyhow::Error) -> CliFailure {
             causes,
         );
     }
-    if combined.contains("cursor") && combined.contains("not found") {
+    if combined.contains("cursor")
+        && (combined.contains("not found") || combined.contains("unknown cursor"))
+    {
         return CliFailure::with_causes(
             CliErrorCode::CursorNotFound,
             message,
@@ -156,7 +163,11 @@ pub(super) fn classify_error(error: anyhow::Error) -> CliFailure {
             causes,
         );
     }
-    if combined.contains("unknown tool") || combined.contains("invalid tool arguments") {
+    if combined.contains("unknown tool")
+        || combined.contains("invalid tool arguments")
+        || combined.contains("unknown target id")
+        || combined.contains("unknown job id")
+    {
         return CliFailure::with_causes(
             CliErrorCode::ToolError,
             message,
@@ -270,31 +281,73 @@ pub(super) enum CliErrorCode {
 
 fn select_field(value: &Value, path: &str) -> anyhow::Result<Value> {
     let mut current = value;
-    for segment in path.split('.') {
-        if segment.is_empty() {
+    for raw_segment in path.split('.') {
+        if raw_segment.is_empty() {
             return Err(invalid_argument("field path contains an empty segment").into());
         }
-        current = match current {
-            Value::Object(object) => object
-                .get(segment)
-                .ok_or_else(|| invalid_argument(format!("field '{segment}' was not found")))?,
-            Value::Array(items) => {
-                let index = segment.parse::<usize>().map_err(|_| {
-                    invalid_argument(format!("array field segment '{segment}' is not an index"))
-                })?;
-                items.get(index).ok_or_else(|| {
-                    invalid_argument(format!("array index {index} is out of range"))
-                })?
-            }
-            _ => {
-                return Err(invalid_argument(format!(
-                    "field '{segment}' cannot be selected from a scalar value"
-                ))
-                .into())
-            }
-        };
+        for segment in split_bracket_segments(raw_segment)? {
+            current = match current {
+                Value::Object(object) => object
+                    .get(segment)
+                    .ok_or_else(|| invalid_argument(format!("field '{segment}' was not found")))?,
+                Value::Array(items) => {
+                    let index = segment.parse::<usize>().map_err(|_| {
+                        invalid_argument(format!("array field segment '{segment}' is not an index"))
+                    })?;
+                    items.get(index).ok_or_else(|| {
+                        invalid_argument(format!("array index {index} is out of range"))
+                    })?
+                }
+                _ => {
+                    return Err(invalid_argument(format!(
+                        "field '{segment}' cannot be selected from a scalar value"
+                    ))
+                    .into())
+                }
+            };
+        }
     }
     Ok(current.clone())
+}
+
+fn split_bracket_segments(segment: &str) -> anyhow::Result<Vec<&str>> {
+    if !segment.contains('[') && !segment.contains(']') {
+        return Ok(vec![segment]);
+    }
+    let mut parts = Vec::new();
+    let mut rest = segment;
+    while let Some(open) = rest.find('[') {
+        if open > 0 {
+            parts.push(&rest[..open]);
+        }
+        let after_open = &rest[open + 1..];
+        let Some(close) = after_open.find(']') else {
+            return Err(
+                invalid_argument(format!("unclosed bracket in field path '{segment}'")).into(),
+            );
+        };
+        let index_str = &after_open[..close];
+        if index_str.is_empty() {
+            return Err(
+                invalid_argument(format!("empty bracket index in field path '{segment}'")).into(),
+            );
+        }
+        parts.push(index_str);
+        rest = &after_open[close + 1..];
+        if !rest.is_empty() && !rest.starts_with('[') {
+            return Err(invalid_argument(format!(
+                "unexpected trailing characters in field segment '{segment}'"
+            ))
+            .into());
+        }
+    }
+    if rest.contains(']') {
+        return Err(invalid_argument(format!(
+            "unmatched closing bracket in field path '{segment}'"
+        ))
+        .into());
+    }
+    Ok(parts)
 }
 
 fn print_json(value: Value, compact: bool) -> anyhow::Result<()> {
@@ -347,4 +400,26 @@ fn extract_pipe_hint(message: &str) -> Option<String> {
         .find(|ch: char| ch == '`' || ch == '\'' || ch == '"' || ch.is_whitespace())
         .unwrap_or(pipe.len());
     (!pipe[..end].is_empty()).then(|| pipe[..end].to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn selects_dot_and_bracket_array_fields() {
+        let value = json!({
+            "sessions": [
+                { "session_id": 42, "cursors": [{ "cursor_id": 7 }] }
+            ]
+        });
+        assert_eq!(select_field(&value, "sessions.0.session_id").unwrap(), 42);
+        assert_eq!(select_field(&value, "sessions[0].session_id").unwrap(), 42);
+        assert_eq!(
+            select_field(&value, "sessions[0].cursors[0].cursor_id").unwrap(),
+            7
+        );
+        assert!(select_field(&value, "sessions[unclosed.session_id").is_err());
+        assert!(select_field(&value, "sessions[].session_id").is_err());
+    }
 }

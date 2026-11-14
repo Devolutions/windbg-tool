@@ -108,12 +108,16 @@ pub fn inspect_pe_identity_bytes(
     );
     let debug_offset = rva_to_file_offset(debug_rva, &sections)
         .with_context(|| format!("mapping debug directory RVA 0x{debug_rva:x}"))?;
-    let codeview = read_codeview(data, debug_offset, debug_size as usize)?
+    let codeview = read_codeview(data, debug_offset, debug_size as usize, &sections)?
         .context("PE has no RSDS CodeView record")?;
     let image_name = image_name
         .filter(|name| !name.is_empty())
         .context("PE image filename is required for symbol resolution")?
         .to_string();
+    ensure!(
+        is_safe_file_name(&image_name),
+        "PE image filename must be a basename without path separators"
+    );
     let image_store_key = format!("{timestamp:X}{image_size:X}");
     Ok(PeIdentity {
         image_store_path: format!("{image_name}\\{image_store_key}\\{image_name}"),
@@ -447,10 +451,13 @@ fn ensure_microsoft_symbol_url(url: &Url) -> anyhow::Result<()> {
 
 fn is_safe_file_name(name: &str) -> bool {
     !name.is_empty()
+        && name != "."
+        && name != ".."
+        && !name.contains(['/', '\\', ':', '\0'])
+        && !name.chars().any(char::is_control)
         && Path::new(name)
             .file_name()
             .is_some_and(|file_name| file_name == name)
-        && !name.contains(['/', '\\'])
 }
 
 fn run_async<T: Send + 'static>(
@@ -492,9 +499,18 @@ fn rva_to_file_offset(rva: u32, sections: &[Section]) -> anyhow::Result<usize> {
     sections
         .iter()
         .find_map(|section| {
-            let size = section.virtual_size.max(section.raw_size);
-            (rva >= section.virtual_address && rva < section.virtual_address.saturating_add(size))
-                .then_some(section.raw_offset as usize + (rva - section.virtual_address) as usize)
+            if section.raw_offset == 0 || section.raw_size == 0 || rva < section.virtual_address {
+                return None;
+            }
+            let delta = rva - section.virtual_address;
+            let bound = if section.virtual_size == 0 {
+                section.raw_size
+            } else {
+                section.virtual_size.min(section.raw_size)
+            };
+            (delta < bound)
+                .then(|| (section.raw_offset as usize).checked_add(delta as usize))
+                .flatten()
         })
         .context("RVA does not map to a PE section")
 }
@@ -503,6 +519,7 @@ fn read_codeview(
     data: &[u8],
     directory_offset: usize,
     directory_size: usize,
+    sections: &[Section],
 ) -> anyhow::Result<Option<CodeViewIdentity>> {
     for index in 0..directory_size / 28 {
         let offset = directory_offset + index * 28;
@@ -510,19 +527,27 @@ fn read_codeview(
             continue;
         }
         let size = read_u32(data, offset + 16)? as usize;
+        let rva = read_u32(data, offset + 20)?;
         let raw_offset = read_u32(data, offset + 24)? as usize;
-        let payload = read_bytes(data, raw_offset, size)?;
+        let file_offset = if raw_offset != 0 {
+            raw_offset
+        } else if rva != 0 {
+            rva_to_file_offset(rva, sections)?
+        } else {
+            continue;
+        };
+        let payload = read_bytes(data, file_offset, size)?;
         if payload.len() < 24 || &payload[..4] != b"RSDS" {
             continue;
         }
         let guid = pdb_guid_string(&payload[4..20]);
         let age = read_u32(payload, 20)?;
         let pdb_path = read_null_terminated_string(&payload[24..]);
-        let pdb_name = Path::new(&pdb_path)
-            .file_name()
-            .and_then(|name| name.to_str())
-            .filter(|name| !name.is_empty())
-            .context("RSDS CodeView record has no PDB filename")?
+        let pdb_name = pdb_path
+            .rsplit(['\\', '/'])
+            .next()
+            .filter(|name| is_safe_file_name(name))
+            .context("RSDS CodeView record has no valid PDB filename")?
             .to_string();
         let pdb_store_key = format!("{guid}{age:X}");
         return Ok(Some(CodeViewIdentity {
@@ -649,6 +674,37 @@ mod tests {
         assert_eq!(cached.status, NativeImageStatus::Cached);
         assert_eq!(cached.image_path.as_deref(), Some(cached_path.as_path()));
         fs::remove_dir_all(cache).unwrap();
+    }
+
+    #[test]
+    fn rva_to_file_offset_rejects_uninitialized_tail_and_bss_sections() {
+        let sections = vec![
+            Section {
+                virtual_address: 0x1000,
+                virtual_size: 0x2000,
+                raw_offset: 0x400,
+                raw_size: 0x800,
+            },
+            Section {
+                virtual_address: 0x3000,
+                virtual_size: 0x1000,
+                raw_offset: 0,
+                raw_size: 0,
+            },
+        ];
+        assert_eq!(rva_to_file_offset(0x1100, &sections).unwrap(), 0x500);
+        assert!(rva_to_file_offset(0x1800, &sections).is_err());
+        assert!(rva_to_file_offset(0x3000, &sections).is_err());
+    }
+
+    #[test]
+    fn safe_file_name_rejects_alternate_data_streams_and_dot_segments() {
+        assert!(is_safe_file_name("ntoskrnl.exe"));
+        assert!(!is_safe_file_name("."));
+        assert!(!is_safe_file_name(".."));
+        assert!(!is_safe_file_name("ntoskrnl.exe:zone.identifier"));
+        assert!(!is_safe_file_name("dir/ntoskrnl.exe"));
+        assert!(!is_safe_file_name("dir\\ntoskrnl.exe"));
     }
 
     fn test_pe_header(timestamp: u32, image_size: u32) -> Vec<u8> {

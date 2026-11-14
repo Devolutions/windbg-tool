@@ -384,14 +384,21 @@ fn remote_workflow(kind: RemoteKind) -> Value {
 }
 
 fn parse_tcp_transport(transport: &str) -> Option<u16> {
-    let rest = transport.strip_prefix("tcp:")?;
-    rest.split(',')
-        .find_map(|part| part.strip_prefix("port="))
-        .and_then(|port| port.parse::<u16>().ok())
+    let trimmed = transport.trim();
+    if trimmed.len() < 4 || !trimmed[..4].eq_ignore_ascii_case("tcp:") {
+        return None;
+    }
+    let rest = &trimmed[4..];
+    rest.split(',').find_map(|part| {
+        let part = part.trim();
+        (part.len() > 5 && part[..5].eq_ignore_ascii_case("port="))
+            .then(|| part[5..].trim().parse::<u16>().ok())
+            .flatten()
+    })
 }
 
 fn connect_probe(server: &str, port: u16, timeout_ms: u64) -> anyhow::Result<Value> {
-    let timeout = Duration::from_millis(timeout_ms);
+    let timeout = Duration::from_millis(timeout_ms.max(1));
     let mut addrs = (server, port)
         .to_socket_addrs()
         .with_context(|| format!("resolving {server}:{port}"))?;
@@ -525,5 +532,6 @@ mod tests {
         .unwrap();
         assert_eq!(value["kind"], "dbgsrv");
         assert!(value["steps"].as_array().unwrap().len() >= 2);
+        assert_eq!(parse_tcp_transport("TCP:Port=5005"), Some(5005));
     }
 }

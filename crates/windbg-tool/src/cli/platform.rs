@@ -853,6 +853,8 @@ fn startup_profile_report_module_identity(
             module
                 .get(field)
                 .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
                 .map(ToOwned::to_owned)
         })
 }
@@ -1271,11 +1273,11 @@ fn startup_profile_compare_run_sequence(
         .take_while(|(baseline, candidate)| baseline == candidate)
         .count();
     let first_divergence =
-        if shared_prefix < baseline_tokens.len() && shared_prefix < candidate_tokens.len() {
+        if shared_prefix < baseline_tokens.len() || shared_prefix < candidate_tokens.len() {
             Some(json!({
                 "index": shared_prefix,
-                "baseline": baseline_tokens[shared_prefix],
-                "candidate": candidate_tokens[shared_prefix]
+                "baseline": baseline_tokens.get(shared_prefix).cloned().unwrap_or(Value::Null),
+                "candidate": candidate_tokens.get(shared_prefix).cloned().unwrap_or(Value::Null)
             }))
         } else {
             None
@@ -2107,15 +2109,22 @@ fn startup_profile_thread_accounting_event_selected(
 }
 
 fn normalize_startup_profile_module(module: ModuleInfo) -> StartupProfileModule {
-    let image_path = [
-        module.loaded_image_name.as_deref(),
+    let candidates = [
         module.image_name.as_deref(),
+        module.loaded_image_name.as_deref(),
         module.module_name.as_deref(),
     ]
     .into_iter()
     .flatten()
-    .find(|value| !value.trim().is_empty())
-    .map(normalize_startup_profile_path);
+    .map(str::trim)
+    .filter(|value| !value.is_empty())
+    .collect::<Vec<_>>();
+    let image_path = candidates
+        .iter()
+        .copied()
+        .find(|value| Path::new(value).is_absolute() || value.contains(['\\', '/']))
+        .or_else(|| candidates.first().copied())
+        .map(normalize_startup_profile_path);
     let basename = image_path
         .as_deref()
         .and_then(|path| Path::new(path).file_name())
@@ -3459,7 +3468,9 @@ fn parse_managed_method_signature(value: Option<&str>) -> anyhow::Result<Option<
 
     let signature = hexadecimal
         .as_bytes()
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|pair| {
             let high = (pair[0] as char)
                 .to_digit(16)
@@ -4146,10 +4157,13 @@ fn parse_ttd_sidecar(contents: &str) -> TtdSidecarSummary {
             }
         }
         if line.starts_with("Simulation time of ") {
-            summary.simulation_duration_ms = line
-                .rsplit_once(':')
-                .and_then(|(_, duration)| duration.trim().strip_suffix("ms."))
-                .and_then(|duration| duration.parse().ok());
+            summary.simulation_duration_ms = line.rsplit_once(':').and_then(|(_, duration)| {
+                duration
+                    .trim()
+                    .trim_end_matches('.')
+                    .strip_suffix("ms")
+                    .and_then(|value| value.trim().parse().ok())
+            });
         }
     }
     summary
@@ -4336,7 +4350,6 @@ fn command_from_ttd_stop(
 
 const CET_USER_SHADOW_STACKS_ALWAYS_OFF: u64 = 0x0000_0000_2000_0000;
 const PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY: usize = 0x0002_0007;
-const WAIT_FAILED: u32 = u32::MAX;
 
 fn launch_target_with_shadow_stacks_disabled(command_line: &str) -> anyhow::Result<u32> {
     let mut attribute_list_size = 0usize;
@@ -4396,13 +4409,13 @@ fn launch_target_with_shadow_stacks_disabled(command_line: &str) -> anyhow::Resu
         );
         DeleteProcThreadAttributeList(attribute_list);
         created.context("launching the target with CET shadow stacks disabled")?;
-        let input_idle = WaitForInputIdle(process_information.hProcess, 10_000);
-        CloseHandle(process_information.hThread).context("closing the target thread handle")?;
-        CloseHandle(process_information.hProcess).context("closing the target process handle")?;
-        ensure!(
-            input_idle != WAIT_FAILED,
-            "waiting for the target process to initialize"
-        );
+        // WaitForInputIdle is best-effort: console applications do not have a GUI
+        // message queue and legitimately return WAIT_FAILED.
+        let _ = WaitForInputIdle(process_information.hProcess, 10_000);
+        let close_thread = CloseHandle(process_information.hThread);
+        let close_process = CloseHandle(process_information.hProcess);
+        close_thread.context("closing the target thread handle")?;
+        close_process.context("closing the target process handle")?;
     }
 
     Ok(process_information.dwProcessId)
@@ -4731,7 +4744,8 @@ pub(super) fn run_windbg_command(
         WindbgCommand::Status(args) => {
             let _ = args.json;
             let manager = WindbgManager::new(args.install_dir)?;
-            print_value(serde_json::to_value(manager.status(true)?)?, output)
+            let status = manager.status(true).or_else(|_| manager.status(false))?;
+            print_value(serde_json::to_value(status)?, output)
         }
         WindbgCommand::Install(args) => {
             let _ = args.json;

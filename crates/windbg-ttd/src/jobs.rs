@@ -105,22 +105,17 @@ impl JobRegistry {
     }
 
     pub fn job_count(&self) -> usize {
-        self.jobs.len()
+        self.jobs
+            .values()
+            .filter(|job| job.status == JobStatus::Running)
+            .count()
     }
 
     pub fn start_watch_memory_sweep(
         &mut self,
         request: &SweepWatchMemoryJobRequest,
     ) -> anyhow::Result<JobStartedResponse> {
-        if request.max_hits == 0 {
-            bail!("max_hits must be greater than zero");
-        }
-        if request.max_hits > 1024 {
-            bail!("max_hits must not exceed 1024");
-        }
-        if request.direction == MemoryAccessDirection::Unknown {
-            bail!("direction must be 'previous' or 'next'");
-        }
+        validate_watch_memory_sweep_request(request)?;
 
         self.next_job_id += 1;
         let job_id = self.next_job_id;
@@ -344,19 +339,23 @@ async fn run_watch_memory_sweep_job(
             return;
         }
 
-        if let Some(sequence) = hit.position.sequence.checked_into() {
-            if !seen_positions.insert(sequence) {
-                stop_reason = "duplicate_position";
-                hits.push(hit_value);
-                let _ = state_guard.jobs.complete(
-                    job_id,
-                    build_sweep_result(&request, &hits, stop_reason, false, true),
-                );
-                return;
-            }
+        let position_key = (hit.position.sequence, hit.position.steps);
+        if !seen_positions.insert(position_key) {
+            stop_reason = "duplicate_position";
+            let _ = state_guard.jobs.complete(
+                job_id,
+                build_sweep_result(&request, &hits, stop_reason, false, true),
+            );
+            return;
         }
 
         hits.push(hit_value);
+        let _ = state_guard
+            .jobs
+            .set_progress(job_id, hits.len() as u64, Some(total));
+        if hits.len() >= request.max_hits {
+            break;
+        }
         let direction = match request.direction {
             MemoryAccessDirection::Previous => StepDirection::Backward,
             _ => StepDirection::Forward,
@@ -371,9 +370,6 @@ async fn run_watch_memory_sweep_job(
             let _ = state_guard.jobs.fail(job_id, error);
             return;
         }
-        let _ = state_guard
-            .jobs
-            .set_progress(job_id, hits.len() as u64, Some(total));
     }
 
     let mut state_guard = state.lock().await;
@@ -388,12 +384,7 @@ pub fn ttd_watch_memory_sweep(
     state: &mut ServiceState,
     request: SweepWatchMemoryJobRequest,
 ) -> anyhow::Result<Value> {
-    if request.max_hits == 0 {
-        bail!("max_hits must be greater than zero");
-    }
-    if request.max_hits > 1024 {
-        bail!("max_hits must not exceed 1024");
-    }
+    validate_watch_memory_sweep_request(&request)?;
 
     let mut hits = Vec::new();
     let mut seen_positions = BTreeSet::new();
@@ -417,15 +408,16 @@ pub fn ttd_watch_memory_sweep(
             break;
         }
 
-        if let Some(sequence) = hit.position.sequence.checked_into() {
-            if !seen_positions.insert(sequence) {
-                stop_reason = "duplicate_position";
-                hits.push(hit_value);
-                break;
-            }
+        let position_key = (hit.position.sequence, hit.position.steps);
+        if !seen_positions.insert(position_key) {
+            stop_reason = "duplicate_position";
+            break;
         }
 
         hits.push(hit_value);
+        if hits.len() >= request.max_hits {
+            break;
+        }
         let direction = match request.direction {
             MemoryAccessDirection::Previous => StepDirection::Backward,
             _ => StepDirection::Forward,
@@ -446,6 +438,25 @@ pub fn ttd_watch_memory_sweep(
         false,
         false,
     ))
+}
+
+fn validate_watch_memory_sweep_request(request: &SweepWatchMemoryJobRequest) -> anyhow::Result<()> {
+    if request.address == 0 {
+        bail!("address must be non-zero");
+    }
+    if request.size == 0 {
+        bail!("size must be greater than zero");
+    }
+    if request.max_hits == 0 {
+        bail!("max_hits must be greater than zero");
+    }
+    if request.max_hits > 1024 {
+        bail!("max_hits must not exceed 1024");
+    }
+    if request.direction == MemoryAccessDirection::Unknown {
+        bail!("direction must be 'previous' or 'next'");
+    }
+    Ok(())
 }
 
 fn build_sweep_result(
@@ -477,16 +488,6 @@ fn build_sweep_result(
     })
 }
 
-trait CheckedInto<T> {
-    fn checked_into(self) -> Option<T>;
-}
-
-impl CheckedInto<u64> for u64 {
-    fn checked_into(self) -> Option<u64> {
-        Some(self)
-    }
-}
-
 fn default_max_hits() -> usize {
     16
 }
@@ -496,4 +497,47 @@ fn now_unix_ms() -> u128 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis())
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ttd_replay::MemoryAccessMask;
+
+    #[test]
+    fn active_job_count_tracks_only_running_jobs() {
+        let mut registry = JobRegistry::default();
+        let request = SweepWatchMemoryJobRequest {
+            session_id: 1,
+            cursor_id: 1,
+            address: 0x1000,
+            size: 8,
+            access: MemoryAccessMask::Write,
+            direction: MemoryAccessDirection::Previous,
+            thread_unique_id: None,
+            max_hits: 4,
+        };
+        let started = registry.start_watch_memory_sweep(&request).unwrap();
+        assert_eq!(registry.job_count(), 1);
+        registry
+            .complete(started.job_id, json!({"ok": true}))
+            .unwrap();
+        assert_eq!(registry.job_count(), 0);
+    }
+
+    #[test]
+    fn rejects_zero_address_or_size_watch_memory_sweep() {
+        let mut registry = JobRegistry::default();
+        let bad_addr = SweepWatchMemoryJobRequest {
+            session_id: 1,
+            cursor_id: 1,
+            address: 0,
+            size: 8,
+            access: MemoryAccessMask::Write,
+            direction: MemoryAccessDirection::Previous,
+            thread_unique_id: None,
+            max_hits: 4,
+        };
+        assert!(registry.start_watch_memory_sweep(&bad_addr).is_err());
+    }
 }

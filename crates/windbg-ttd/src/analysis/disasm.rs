@@ -1,5 +1,6 @@
 use iced_x86::{
-    Decoder, DecoderOptions, FlowControl, Formatter, Instruction, NasmFormatter, OpKind, Register,
+    Decoder, DecoderOptions, FlowControl, Formatter, Instruction, Mnemonic, NasmFormatter, OpKind,
+    Register,
 };
 use serde_json::{json, Value};
 
@@ -8,13 +9,13 @@ pub fn disassemble_x64(address: u64, bytes: &[u8], count: usize) -> Vec<Value> {
     let mut formatter = NasmFormatter::new();
     let mut instructions = Vec::new();
     while decoder.can_decode() && instructions.len() < count {
+        let offset = decoder.position();
         let instruction = decoder.decode();
+        let end = decoder.position().min(bytes.len());
         let mut text = String::new();
         formatter.format(&instruction, &mut text);
         let len = instruction.len();
-        let offset = instruction.ip().saturating_sub(address) as usize;
-        let end = offset.saturating_add(len).min(bytes.len());
-        let instruction_bytes = if offset < bytes.len() {
+        let instruction_bytes = if offset < end {
             bytes[offset..end]
                 .iter()
                 .map(|byte| format!("{byte:02X}"))
@@ -52,11 +53,28 @@ fn instruction_classification(instruction: &Instruction, text: &str) -> Value {
     if has_memory_operand(instruction) {
         tags.push("memory_access");
     }
-    if lower.contains("rsp")
+    let stack_related = lower.contains("rsp")
         || lower.contains("rbp")
         || lower.contains("esp")
         || lower.contains("ebp")
-    {
+        || matches!(
+            instruction.mnemonic(),
+            Mnemonic::Push
+                | Mnemonic::Pop
+                | Mnemonic::Pusha
+                | Mnemonic::Pushad
+                | Mnemonic::Pushf
+                | Mnemonic::Pushfd
+                | Mnemonic::Pushfq
+                | Mnemonic::Popa
+                | Mnemonic::Popad
+                | Mnemonic::Popf
+                | Mnemonic::Popfd
+                | Mnemonic::Popfq
+                | Mnemonic::Enter
+                | Mnemonic::Leave
+        );
+    if stack_related {
         tags.push("stack_related");
     }
     if instruction.memory_segment() == Register::FS || instruction.memory_segment() == Register::GS
@@ -73,7 +91,7 @@ fn instruction_classification(instruction: &Instruction, text: &str) -> Value {
         "tags": tags,
         "is_control_flow": instruction.flow_control() != FlowControl::Next,
         "has_memory_operand": has_memory_operand(instruction),
-        "is_stack_related": lower.contains("rsp") || lower.contains("rbp") || lower.contains("esp") || lower.contains("ebp"),
+        "is_stack_related": stack_related,
     })
 }
 

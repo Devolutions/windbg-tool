@@ -1,6 +1,7 @@
 use anyhow::{bail, ensure, Context};
 
 pub fn hex_to_bytes(data: &str) -> anyhow::Result<Vec<u8>> {
+    ensure!(data.is_ascii(), "hex data must be ASCII");
     ensure!(data.len().is_multiple_of(2), "hex data length must be even");
     (0..data.len())
         .step_by(2)
@@ -13,13 +14,23 @@ pub fn hex_to_bytes(data: &str) -> anyhow::Result<Vec<u8>> {
 
 pub fn parse_u64_argument(value: &str) -> anyhow::Result<u64> {
     let value = value.trim();
-    if let Some(hex) = value
+    ensure!(!value.is_empty(), "integer argument must not be empty");
+    ensure!(
+        !value.starts_with(['+', '-']),
+        "unsigned integer argument must not have a sign prefix"
+    );
+    let cleaned = if value.contains(['`', '_']) {
+        std::borrow::Cow::Owned(value.replace(['`', '_'], ""))
+    } else {
+        std::borrow::Cow::Borrowed(value)
+    };
+    if let Some(hex) = cleaned
         .strip_prefix("0x")
-        .or_else(|| value.strip_prefix("0X"))
+        .or_else(|| cleaned.strip_prefix("0X"))
     {
         return u64::from_str_radix(hex, 16).context("parsing hexadecimal integer");
     }
-    value.parse::<u64>().context("parsing decimal integer")
+    cleaned.parse::<u64>().context("parsing decimal integer")
 }
 
 pub fn ensure_json_object(value: serde_json::Value) -> anyhow::Result<serde_json::Value> {

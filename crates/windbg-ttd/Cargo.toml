@@ -5,7 +5,6 @@ edition.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
-homepage.workspace = true
 description = "TTD replay facade, MCP server, and daemon services for windbg-tool"
 
 [dependencies]

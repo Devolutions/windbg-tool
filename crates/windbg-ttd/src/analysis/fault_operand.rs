@@ -77,9 +77,12 @@ impl<'a> FaultRegisters<'a> {
                 _ => return None,
             }),
         };
-        Some(match register.size() {
-            8 => full,
-            size => full & ((1u64 << (size * 8)) - 1),
+        Some(match register {
+            Register::AH | Register::BH | Register::CH | Register::DH => (full >> 8) & 0xFF,
+            _ => match register.size() {
+                8 => full,
+                size => full & ((1u64 << (size * 8)) - 1),
+            },
         })
     }
 }
@@ -272,7 +275,8 @@ pub(super) fn memory_operand(
     registers: FaultRegisters<'_>,
     address_mask: u64,
 ) -> Option<MemoryOperand> {
-    let (base, index_register, scale, displacement) = match instruction.op_kind(index) {
+    let op_kind = instruction.op_kind(index);
+    let (base, index_register, scale, displacement) = match op_kind {
         OpKind::Memory => (
             instruction.memory_base(),
             instruction.memory_index(),
@@ -280,7 +284,7 @@ pub(super) fn memory_operand(
             instruction.memory_displacement64(),
         ),
         OpKind::MemorySegSI | OpKind::MemorySegESI | OpKind::MemorySegRSI => (
-            string_register(instruction, Register::RSI),
+            string_register(op_kind, Register::RSI),
             Register::None,
             1,
             0,
@@ -291,7 +295,7 @@ pub(super) fn memory_operand(
         | OpKind::MemoryESDI
         | OpKind::MemoryESEDI
         | OpKind::MemoryESRDI => (
-            string_register(instruction, Register::RDI),
+            string_register(op_kind, Register::RDI),
             Register::None,
             1,
             0,
@@ -348,8 +352,8 @@ pub(super) fn memory_operand(
     })
 }
 
-fn string_register(instruction: &Instruction, register64: Register) -> Register {
-    let size = match instruction.op_kind(0) {
+fn string_register(op_kind: OpKind, register64: Register) -> Register {
+    let size = match op_kind {
         OpKind::MemorySegSI | OpKind::MemorySegDI | OpKind::MemoryESDI => 2,
         OpKind::MemorySegESI | OpKind::MemorySegEDI | OpKind::MemoryESEDI => 4,
         _ => 8,
@@ -474,6 +478,20 @@ mod tests {
         assert_eq!(value["status"], "decoded");
         assert_eq!(value["instruction"]["text"], "mov rax,[rcx]");
         assert_eq!(value["instruction"]["bytes"], "488B01");
+
+        let regs_high = amd64(0x1122_3344, 0x5566_7788);
+        assert_eq!(
+            FaultRegisters::Amd64(&regs_high).value(Register::BH),
+            Some(0x33)
+        );
+        assert_eq!(
+            FaultRegisters::Amd64(&regs_high).value(Register::BL),
+            Some(0x44)
+        );
+        assert_eq!(
+            FaultRegisters::Amd64(&regs_high).value(Register::CH),
+            Some(0x77)
+        );
         assert_eq!(value["matched_operand"], 0);
         assert_eq!(value["memory_operands"][0]["base"], "rcx");
         assert_eq!(value["memory_operands"][0]["effective_address"], 0);

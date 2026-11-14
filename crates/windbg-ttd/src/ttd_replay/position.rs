@@ -46,15 +46,26 @@ impl FromStr for Position {
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         let (sequence, steps) = value
+            .trim()
             .split_once(':')
             .ok_or(PositionParseError::MissingSeparator)?;
         Ok(Self {
-            sequence: u64::from_str_radix(sequence.trim(), 16)
-                .map_err(|_| PositionParseError::InvalidSequence)?,
-            steps: u64::from_str_radix(steps.trim(), 16)
-                .map_err(|_| PositionParseError::InvalidSteps)?,
+            sequence: parse_hex_component(sequence).ok_or(PositionParseError::InvalidSequence)?,
+            steps: parse_hex_component(steps).ok_or(PositionParseError::InvalidSteps)?,
         })
     }
+}
+
+fn parse_hex_component(raw: &str) -> Option<u64> {
+    let trimmed = raw.trim();
+    let digits = trimmed
+        .strip_prefix("0x")
+        .or_else(|| trimmed.strip_prefix("0X"))
+        .unwrap_or(trimmed);
+    if digits.is_empty() || digits.starts_with(['+', '-']) {
+        return None;
+    }
+    u64::from_str_radix(digits, 16).ok()
 }
 
 impl PositionOrPercent {
@@ -63,7 +74,17 @@ impl PositionOrPercent {
             Self::Position(position) => Ok(position),
             Self::Text(text) => Ok(text.parse()?),
             Self::Percent(percent) => {
-                let percent = percent.min(100) as u128;
+                anyhow::ensure!(
+                    percent <= 100,
+                    "position percentage must be between 0 and 100, got {percent}"
+                );
+                if percent == 0 {
+                    return Ok(start);
+                }
+                if percent == 100 {
+                    return Ok(end);
+                }
+                let percent = percent as u128;
                 let start_sequence = start.sequence as u128;
                 let end_sequence = end.sequence as u128;
                 let sequence = start_sequence
@@ -87,21 +108,24 @@ mod tests {
         assert_eq!(position.sequence, 0x3065bf);
         assert_eq!(position.steps, 0x1a);
         assert_eq!(position.to_string(), "3065BF:1A");
+
+        let prefixed: Position = "0x3065BF:0x1A".parse().unwrap();
+        assert_eq!(prefixed, position);
+        assert!("+10:0".parse::<Position>().is_err());
     }
 
     #[test]
     fn resolves_percent_to_sequence_range() {
+        let start = Position {
+            sequence: 0x10,
+            steps: 5,
+        };
+        let end = Position {
+            sequence: 0x30,
+            steps: 9,
+        };
         let position = PositionOrPercent::Percent(50)
-            .resolve_against(
-                Position {
-                    sequence: 0x10,
-                    steps: 0,
-                },
-                Position {
-                    sequence: 0x30,
-                    steps: 0,
-                },
-            )
+            .resolve_against(start, end)
             .unwrap();
         assert_eq!(
             position,
@@ -110,5 +134,20 @@ mod tests {
                 steps: 0
             }
         );
+        assert_eq!(
+            PositionOrPercent::Percent(0)
+                .resolve_against(start, end)
+                .unwrap(),
+            start
+        );
+        assert_eq!(
+            PositionOrPercent::Percent(100)
+                .resolve_against(start, end)
+                .unwrap(),
+            end
+        );
+        assert!(PositionOrPercent::Percent(101)
+            .resolve_against(start, end)
+            .is_err());
     }
 }

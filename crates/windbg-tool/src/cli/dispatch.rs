@@ -381,6 +381,123 @@ pub(super) async fn run_cli() -> anyhow::Result<()> {
             TargetCommand::Dump(args) => {
                 call_and_print(pipe, target_dump_call(args), &output).await
             }
+            TargetCommand::Analysis { command } => match command {
+                TargetAnalysisCommand::Disasm(args) => {
+                    call_and_print(
+                        pipe,
+                        ToolCall {
+                            name: "target_disassemble_analysis".to_string(),
+                            arguments: json!({
+                                "target_id": args.target,
+                                "address": args.address,
+                                "count": args.count,
+                                "bytes": args.bytes,
+                            }),
+                        },
+                        &output,
+                    )
+                    .await
+                }
+                TargetAnalysisCommand::MemoryDump(args) => {
+                    call_and_print(
+                        pipe,
+                        ToolCall {
+                            name: "target_memory_dump".to_string(),
+                            arguments: json!({
+                                "target_id": args.target,
+                                "address": args.address,
+                                "size": args.size,
+                                "format": args.format,
+                            }),
+                        },
+                        &output,
+                    )
+                    .await
+                }
+                TargetAnalysisCommand::MemoryClassify(args) => {
+                    call_and_print(
+                        pipe,
+                        ToolCall {
+                            name: "target_memory_classify".to_string(),
+                            arguments: json!({
+                                "target_id": args.target,
+                                "address": args.address,
+                                "size": args.size,
+                            }),
+                        },
+                        &output,
+                    )
+                    .await
+                }
+                TargetAnalysisCommand::MemoryStrings(args) => {
+                    call_and_print(
+                        pipe,
+                        ToolCall {
+                            name: "target_memory_strings".to_string(),
+                            arguments: json!({
+                                "target_id": args.target,
+                                "address": args.address,
+                                "size": args.size,
+                                "encoding": args.encoding,
+                                "min_len": args.min_len,
+                                "max_strings": args.max_strings,
+                            }),
+                        },
+                        &output,
+                    )
+                    .await
+                }
+                TargetAnalysisCommand::MemoryDps(args) => {
+                    call_and_print(
+                        pipe,
+                        ToolCall {
+                            name: "target_memory_dps".to_string(),
+                            arguments: json!({
+                                "target_id": args.target,
+                                "address": args.address,
+                                "size": args.size,
+                                "pointer_size": args.pointer_size,
+                            }),
+                        },
+                        &output,
+                    )
+                    .await
+                }
+                TargetAnalysisCommand::MemoryChase(args) => {
+                    call_and_print(
+                        pipe,
+                        ToolCall {
+                            name: "target_memory_chase".to_string(),
+                            arguments: json!({
+                                "target_id": args.target,
+                                "address": args.address,
+                                "offset": args.offset,
+                                "depth": args.depth,
+                                "pointer_size": args.pointer_size,
+                            }),
+                        },
+                        &output,
+                    )
+                    .await
+                }
+                TargetAnalysisCommand::StackRecover(args) => {
+                    call_and_print(
+                        pipe,
+                        ToolCall {
+                            name: "target_stack_recover".to_string(),
+                            arguments: json!({
+                                "target_id": args.target,
+                                "address": args.address,
+                                "size": args.size,
+                                "max_candidates": args.max_candidates,
+                                "min_confidence": args.min_confidence,
+                            }),
+                        },
+                        &output,
+                    )
+                    .await
+                }
+            },
         },
         Some(Commands::Disasm(args)) => disasm_and_print(pipe, args, &output).await,
         Some(Commands::Registers(args)) => {
