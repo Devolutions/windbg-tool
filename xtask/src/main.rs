@@ -360,16 +360,11 @@ fn native_build(options: &XtaskOptions) -> anyhow::Result<()> {
 
     run(&mut configure).context("configuring native TTD replay bridge")?;
 
-    let cmake_config = if options.profile == "debug" {
-        "Debug"
-    } else {
-        "Release"
-    };
     run(Command::new("cmake")
         .arg("--build")
         .arg(&build_dir)
         .arg("--config")
-        .arg(cmake_config))
+        .arg("Release"))
     .context("building native TTD replay bridge")?;
 
     Ok(())

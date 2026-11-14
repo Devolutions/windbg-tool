@@ -52,7 +52,7 @@ pub(super) fn print_value(mut value: Value, output: &OutputOptions) -> anyhow::R
         value = select_field(&value, path)?;
     }
 
-    if output.envelope && !output.raw {
+    if output.envelope && !(output.raw && output.field.is_some()) {
         print_json(
             json!({
                 "schema_version": SCHEMA_VERSION,

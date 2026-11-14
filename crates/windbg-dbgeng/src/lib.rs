@@ -2362,14 +2362,6 @@ impl DebuggerSession {
         Ok(())
     }
 
-    pub fn end_session(&self) -> anyhow::Result<()> {
-        use windows::Win32::System::Diagnostics::Debug::Extensions::DEBUG_END_PASSIVE;
-        unsafe {
-            self.client.EndSession(DEBUG_END_PASSIVE)?;
-        }
-        Ok(())
-    }
-
     pub fn write_dump(&self, options: DumpWriteOptions) -> anyhow::Result<DumpWriteResult> {
         if self.kind != DebuggerSessionKind::Live {
             bail!("DbgEng dump writing requires a live target session");
@@ -2427,23 +2419,50 @@ impl DebuggerSession {
     }
 
     pub fn read_memory(&self, address: u64, size: u32) -> anyhow::Result<MemoryReadResult> {
-        let mut buffer = vec![0u8; size as usize];
-        let mut bytes_read = 0u32;
-        unsafe {
-            self.data_spaces.ReadVirtual(
-                address,
-                buffer.as_mut_ptr() as _,
-                size,
-                Some(&mut bytes_read),
-            )?;
+        ensure!(size > 0, "size must be greater than zero");
+        const CHUNK_SIZE: u32 = 64 * 1024;
+        let mut total_bytes = Vec::with_capacity((size as usize).min(CHUNK_SIZE as usize));
+        let mut chunk = vec![0u8; (size as usize).min(CHUNK_SIZE as usize)];
+        let mut remaining = size;
+        let mut current_address = address;
+        while remaining > 0 {
+            let to_read = remaining.min(CHUNK_SIZE);
+            let mut bytes_read = 0u32;
+            let result = unsafe {
+                self.data_spaces.ReadVirtual(
+                    current_address,
+                    chunk.as_mut_ptr() as _,
+                    to_read,
+                    Some(&mut bytes_read),
+                )
+            };
+            match result {
+                Ok(()) => {}
+                Err(_) if bytes_read > 0 => {}
+                Err(error) if total_bytes.is_empty() => return Err(error.into()),
+                Err(_) => break,
+            }
+            let read_count = (bytes_read as usize).min(to_read as usize);
+            if read_count == 0 {
+                break;
+            }
+            total_bytes.extend_from_slice(&chunk[..read_count]);
+            if (read_count as u32) < to_read {
+                break;
+            }
+            remaining -= read_count as u32;
+            let Some(next) = current_address.checked_add(read_count as u64) else {
+                break;
+            };
+            current_address = next;
         }
-        buffer.truncate(bytes_read as usize);
+        let bytes_read = total_bytes.len() as u32;
         Ok(MemoryReadResult {
             address,
             requested_size: size,
             bytes_read,
             complete: bytes_read == size,
-            data: encode_hex(&buffer),
+            data: encode_hex(&total_bytes),
         })
     }
 
@@ -4018,10 +4037,6 @@ impl DebuggerSession {
         anyhow::bail!("DbgEng sessions are only supported on Windows")
     }
 
-    pub fn end_session(&self) -> anyhow::Result<()> {
-        anyhow::bail!("DbgEng sessions are only supported on Windows")
-    }
-
     pub fn write_dump(&self, _options: DumpWriteOptions) -> anyhow::Result<DumpWriteResult> {
         anyhow::bail!("DbgEng dump writing is only supported on Windows")
     }
@@ -4268,9 +4283,6 @@ fn launch_live_session_impl(options: LiveLaunchSessionOptions) -> anyhow::Result
     {
         unsafe {
             let _ = client.TerminateCurrentProcess();
-            let _ = client.EndSession(
-                windows::Win32::System::Diagnostics::Debug::Extensions::DEBUG_END_PASSIVE,
-            );
         }
         return Err(error);
     }
@@ -4317,9 +4329,6 @@ fn attach_live_session_impl(options: LiveAttachOptions) -> anyhow::Result<Debugg
     {
         unsafe {
             let _ = client.DetachCurrentProcess();
-            let _ = client.EndSession(
-                windows::Win32::System::Diagnostics::Debug::Extensions::DEBUG_END_PASSIVE,
-            );
         }
         return Err(error);
     }
@@ -4364,15 +4373,9 @@ fn open_dump_session_impl(options: DumpOpenOptions) -> anyhow::Result<DebuggerSe
     let symbol_path = configure_dbgeng_symbol_path(&symbols)?;
     unsafe {
         client.OpenDumpFileWide(PCWSTR(path.as_ptr()), 0)?;
-        if let Err(error) = control
+        control
             .WaitForEvent(DEBUG_WAIT_DEFAULT, 5000)
-            .context("DbgEng dump WaitForEvent failed")
-        {
-            let _ = client.EndSession(
-                windows::Win32::System::Diagnostics::Debug::Extensions::DEBUG_END_PASSIVE,
-            );
-            return Err(error);
-        }
+            .context("DbgEng dump WaitForEvent failed")?;
     }
 
     Ok(DebuggerSession {

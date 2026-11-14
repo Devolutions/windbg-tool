@@ -385,15 +385,19 @@ fn remote_workflow(kind: RemoteKind) -> Value {
 
 fn parse_tcp_transport(transport: &str) -> Option<u16> {
     let trimmed = transport.trim();
-    if trimmed.len() < 4 || !trimmed[..4].eq_ignore_ascii_case("tcp:") {
+    if !trimmed
+        .get(..4)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("tcp:"))
+    {
         return None;
     }
-    let rest = &trimmed[4..];
+    let rest = trimmed.get(4..)?;
     rest.split(',').find_map(|part| {
         let part = part.trim();
-        (part.len() > 5 && part[..5].eq_ignore_ascii_case("port="))
-            .then(|| part[5..].trim().parse::<u16>().ok())
-            .flatten()
+        part.get(..5)
+            .filter(|prefix| prefix.eq_ignore_ascii_case("port="))
+            .and_then(|_| part.get(5..))
+            .and_then(|value| value.trim().parse::<u16>().ok())
     })
 }
 
@@ -533,5 +537,7 @@ mod tests {
         assert_eq!(value["kind"], "dbgsrv");
         assert!(value["steps"].as_array().unwrap().len() >= 2);
         assert_eq!(parse_tcp_transport("TCP:Port=5005"), Some(5005));
+        assert_eq!(parse_tcp_transport("abcé"), None);
+        assert_eq!(parse_tcp_transport("tcp:pört=5005"), None);
     }
 }

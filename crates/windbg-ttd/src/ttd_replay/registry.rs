@@ -1135,9 +1135,7 @@ fn stack_context(address: u64, stack: &StackInfo) -> AddressStackContext {
         stack_limit: stack.stack_limit,
         stack_limit_hex: hex_u64(stack.stack_limit),
         stack_pointer_in_range: stack.stack_pointer_in_range,
-        address_in_stack: valid_stack
-            && stack.stack_limit <= address
-            && address <= stack.stack_base,
+        address_in_stack: valid_stack && stack.stack_limit <= address && address < stack.stack_base,
         offset_from_sp: signed_delta(address, stack.stack_pointer),
         offset_from_fp: signed_delta(address, stack.frame_pointer),
     }
@@ -1402,6 +1400,7 @@ mod tests {
             stack_pointer_in_range: true,
             ..invalid
         };
-        assert!(stack_context(0x2000, &valid).address_in_stack);
+        assert!(stack_context(0x1ff8, &valid).address_in_stack);
+        assert!(!stack_context(0x2000, &valid).address_in_stack);
     }
 }

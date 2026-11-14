@@ -656,7 +656,7 @@ fn collect_source_matches(
         let entry_path = entry.path();
         if entry_path.is_dir() {
             let dir_name = entry.file_name().to_string_lossy().to_ascii_lowercase();
-            if matches!(dir_name.as_str(), ".git" | "target" | "node_modules") {
+            if dir_name == ".git" && !recorded_components.iter().any(|c| c == ".git") {
                 continue;
             }
         }

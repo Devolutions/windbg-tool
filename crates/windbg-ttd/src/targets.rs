@@ -81,13 +81,11 @@ impl EngineWorker {
                             detach_live_target,
                             response,
                         } => {
-                            let _engine = engine_lock();
-                            if session.activate().is_ok() {
-                                if detach_live_target && session.kind() == DebuggerSessionKind::Live
-                                {
+                            if detach_live_target && session.kind() == DebuggerSessionKind::Live {
+                                let _engine = engine_lock();
+                                if session.activate().is_ok() {
                                     let _ = session.detach();
                                 }
-                                let _ = session.end_session();
                             }
                             let _ = response.send(());
                             break;
@@ -747,7 +745,6 @@ impl TargetRegistry {
         request: TargetMemoryReadRequest,
     ) -> anyhow::Result<TargetMemoryReadResponse> {
         ensure!(request.size > 0, "size must be greater than zero");
-        ensure!(request.size <= 0x10000, "size must be 64 KiB or less");
         let target = self.target(request.target_id)?;
         let address = request.address;
         let size = request.size;
