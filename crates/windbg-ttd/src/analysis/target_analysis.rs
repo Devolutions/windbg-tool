@@ -232,7 +232,7 @@ fn target_module_ranges(state: &ServiceState, target_id: TargetId) -> Vec<(u64, 
         .collect()
 }
 
-fn plausible_pointer_for_size(value: u64, pointer_size: u32) -> bool {
+pub(super) fn plausible_pointer_for_size(value: u64, pointer_size: u32) -> bool {
     match pointer_size {
         4 => value >= 0x10000 && value <= u64::from(u32::MAX) && value.is_multiple_of(4),
         _ => plausible_x64_pointer(value),
@@ -410,7 +410,14 @@ pub fn target_memory_chase(
     let mut visited = std::collections::BTreeSet::new();
     visited.insert(current);
     for index in 0..request.depth {
-        let read_at = current.saturating_add(request.offset);
+        let Some(read_at) = current.checked_add(request.offset) else {
+            chain.push(json!({
+                "index": index,
+                "address": current,
+                "error": "address_overflow",
+            }));
+            break;
+        };
         match state.targets.read_memory(TargetMemoryReadRequest {
             target_id: request.target_id,
             address: read_at,

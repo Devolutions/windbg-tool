@@ -453,23 +453,31 @@ pub fn fast_fail_name(code: u64) -> Option<&'static str> {
         28 => "FAST_FAIL_INVALID_BUFFER_ACCESS",
         29 => "FAST_FAIL_INVALID_BALANCED_TREE",
         30 => "FAST_FAIL_INVALID_NEXT_THREAD",
+        31 => "FAST_FAIL_GUARD_ICALL_CHECK_SUPPRESSED",
         32 => "FAST_FAIL_APCS_DISABLED",
         33 => "FAST_FAIL_INVALID_IDLE_STATE",
         34 => "FAST_FAIL_MRDATA_PROTECTION_FAILURE",
         35 => "FAST_FAIL_UNEXPECTED_HEAP_EXCEPTION",
         36 => "FAST_FAIL_INVALID_LOCK_STATE",
+        37 => "FAST_FAIL_GUARD_JUMPTABLE",
         38 => "FAST_FAIL_INVALID_LONGJUMP_TARGET",
         39 => "FAST_FAIL_INVALID_DISPATCH_CONTEXT",
         40 => "FAST_FAIL_INVALID_THREAD",
+        41 => "FAST_FAIL_INVALID_SYSCALL_NUMBER",
+        42 => "FAST_FAIL_INVALID_FILE_OPERATION",
+        43 => "FAST_FAIL_LPAC_ACCESS_DENIED",
         44 => "FAST_FAIL_GUARD_SS_FAILURE",
+        45 => "FAST_FAIL_LOADER_CONTINUITY_FAILURE",
         46 => "FAST_FAIL_GUARD_EXPORT_SUPPRESSION_FAILURE",
         47 => "FAST_FAIL_INVALID_CONTROL_STACK",
         48 => "FAST_FAIL_SET_CONTEXT_DENIED",
         49 => "FAST_FAIL_INVALID_IAT",
         50 => "FAST_FAIL_HEAP_METADATA_CORRUPTION",
         51 => "FAST_FAIL_PAYLOAD_RESTRICTION_VIOLATION",
+        52 => "FAST_FAIL_LOW_LABEL_ACCESS_DENIED",
         53 => "FAST_FAIL_ENCLAVE_CALL_FAILURE",
         54 => "FAST_FAIL_UNHANDLED_LSS_EXCEPTON",
+        55 => "FAST_FAIL_ADMINLESS_ACCESS_DENIED",
         56 => "FAST_FAIL_UNEXPECTED_CALL",
         57 => "FAST_FAIL_CONTROL_INVALID_RETURN_ADDRESS",
         58 => "FAST_FAIL_UNEXPECTED_HOST_BEHAVIOR",
@@ -479,11 +487,13 @@ pub fn fast_fail_name(code: u64) -> Option<&'static str> {
         62 => "FAST_FAIL_RIO_ABORT",
         63 => "FAST_FAIL_INVALID_PFN",
         64 => "FAST_FAIL_GUARD_ICALL_CHECK_FAILURE_XFG",
+        65 => "FAST_FAIL_CAST_GUARD",
         66 => "FAST_FAIL_HOST_VISIBILITY_CHANGE",
         67 => "FAST_FAIL_KERNEL_CET_SHADOW_STACK_ASSIST",
         68 => "FAST_FAIL_PATCH_CALLBACK_FAILED",
         69 => "FAST_FAIL_NTDLL_PATCH_FAILED",
         70 => "FAST_FAIL_INVALID_FLS_DATA",
+        71 => "FAST_FAIL_ASAN_ERROR",
         72 => "FAST_FAIL_CLR_EXCEPTION_AOT",
         73 => "FAST_FAIL_POINTER_AUTH_INVALID_RETURN_ADDRESS",
         74 => "FAST_FAIL_INVALID_THREAD_STATE",
@@ -1742,6 +1752,17 @@ mod tests {
             assert!(info.what.is_none());
         }
         assert!(cpp_exception(0xc000_0005, &[], None, &memory).is_none());
+    }
+
+    #[test]
+    fn names_every_winnt_fast_fail_code() {
+        assert_eq!(fast_fail_name(37), Some("FAST_FAIL_GUARD_JUMPTABLE"));
+        assert_eq!(fast_fail_name(65), Some("FAST_FAIL_CAST_GUARD"));
+        assert_eq!(fast_fail_name(71), Some("FAST_FAIL_ASAN_ERROR"));
+        let unnamed = (0..=77)
+            .filter(|code| fast_fail_name(*code).is_none())
+            .collect::<Vec<_>>();
+        assert_eq!(unnamed, [15, 16, 17]);
     }
 
     #[test]

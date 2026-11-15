@@ -33,7 +33,14 @@ pub fn capability_contract(kind: &str) -> Value {
             },
             "mutability": {
                 "read_only": ["memory", "registers", "modules", "threads", "timeline"],
-                "cursor_state": ["position_set", "step"],
+                "cursor_state": [
+                    "position_set",
+                    "step",
+                    "replay_to",
+                    "exception_focus",
+                    "memory_watchpoint",
+                    "watch_memory_sweep"
+                ],
                 "destructive": ["close_trace"]
             },
             "required_identifiers": ["session_id", "cursor_id"],
@@ -71,7 +78,7 @@ pub fn capability_contract(kind: &str) -> Value {
             },
             "mutability": {
                 "read_only": ["status", "event", "memory", "modules", "threads", "stack", "symbols", "source", "disassembly"],
-                "target_execution": ["continue", "continue_and_wait", "step", "breakpoint_set", "breakpoint_enablement", "breakpoint_remove", "write_dump"],
+                "target_execution": ["wait", "continue", "continue_and_wait", "step", "breakpoint_set", "breakpoint_enablement", "breakpoint_remove", "write_dump"],
                 "destructive": ["terminate", "close"]
             },
             "required_identifiers": ["target_id"],
@@ -189,6 +196,21 @@ mod tests {
             "supported"
         );
         assert_eq!(contract["engine_execution_model"], "serialized_worker");
+    }
+
+    #[test]
+    fn mutability_lists_include_every_state_changing_operation() {
+        let ttd = capability_contract("ttd_cursor");
+        let cursor_state = ttd["mutability"]["cursor_state"].as_array().unwrap();
+        for operation in ["memory_watchpoint", "replay_to", "exception_focus"] {
+            assert!(cursor_state.iter().any(|value| value == operation));
+        }
+        let live = capability_contract("dbgeng_live");
+        assert!(live["mutability"]["target_execution"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|value| value == "wait"));
     }
 
     #[test]

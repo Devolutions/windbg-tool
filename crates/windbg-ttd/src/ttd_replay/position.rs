@@ -68,11 +68,33 @@ fn parse_hex_component(raw: &str) -> Option<u64> {
     u64::from_str_radix(digits, 16).ok()
 }
 
+/// Recognizes textual percentages such as `"50%"` or `"50"`. Text containing `:` is a
+/// `HEX:HEX` position and is left to `Position::from_str`.
+fn parse_percent_text(text: &str) -> anyhow::Result<Option<u8>> {
+    let trimmed = text.trim();
+    if trimmed.contains(':') {
+        return Ok(None);
+    }
+    let digits = trimmed.strip_suffix('%').unwrap_or(trimmed).trim();
+    if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Ok(None);
+    }
+    let percent = digits.parse::<u64>().unwrap_or(u64::MAX);
+    anyhow::ensure!(
+        percent <= 100,
+        "position percentage must be between 0 and 100, got {digits}"
+    );
+    Ok(Some(percent as u8))
+}
+
 impl PositionOrPercent {
     pub fn resolve_against(self, start: Position, end: Position) -> anyhow::Result<Position> {
         match self {
             Self::Position(position) => Ok(position),
-            Self::Text(text) => Ok(text.parse()?),
+            Self::Text(text) => match parse_percent_text(&text)? {
+                Some(percent) => Self::Percent(percent).resolve_against(start, end),
+                None => Ok(text.parse()?),
+            },
             Self::Percent(percent) => {
                 anyhow::ensure!(
                     percent <= 100,
@@ -149,5 +171,50 @@ mod tests {
         assert!(PositionOrPercent::Percent(101)
             .resolve_against(start, end)
             .is_err());
+    }
+
+    #[test]
+    fn resolves_textual_percent() {
+        let start = Position {
+            sequence: 0x10,
+            steps: 5,
+        };
+        let end = Position {
+            sequence: 0x30,
+            steps: 9,
+        };
+        let half = Position {
+            sequence: 0x20,
+            steps: 0,
+        };
+        for text in ["50%", " 50 % ", "50"] {
+            assert_eq!(
+                PositionOrPercent::Text(text.to_string())
+                    .resolve_against(start, end)
+                    .unwrap(),
+                half,
+                "{text:?}"
+            );
+        }
+        assert_eq!(
+            PositionOrPercent::Text("100%".to_string())
+                .resolve_against(start, end)
+                .unwrap(),
+            end
+        );
+        assert!(PositionOrPercent::Text("150%".to_string())
+            .resolve_against(start, end)
+            .unwrap_err()
+            .to_string()
+            .contains("between 0 and 100"));
+        assert_eq!(
+            PositionOrPercent::Text("20:1".to_string())
+                .resolve_against(start, end)
+                .unwrap(),
+            Position {
+                sequence: 0x20,
+                steps: 1
+            }
+        );
     }
 }

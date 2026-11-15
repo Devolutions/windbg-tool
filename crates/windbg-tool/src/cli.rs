@@ -1,10 +1,10 @@
-use anyhow::{bail, ensure, Context};
+use anyhow::{ensure, Context};
 use clap::{Arg, Args, Command, CommandFactory, Parser, Subcommand, ValueEnum};
 use rmcp::{transport::stdio, ServiceExt};
 use serde_json::{json, Map, Value};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use windbg_ttd::analysis::{
     breakpoint_plan as shared_breakpoint_plan,
@@ -26,7 +26,7 @@ mod output;
 mod platform;
 mod remote;
 
-use output::{classify_error, print_failure, print_value, OutputOptions};
+use output::{classify_error, invalid_argument, print_failure, print_value, OutputOptions};
 
 #[derive(Debug, Parser)]
 #[command(about = "WinDbg Time Travel Debugging MCP server, daemon, and CLI")]
@@ -1992,7 +1992,6 @@ struct CliSchemaArgs {
     #[arg(
         value_name = "COMMAND",
         num_args = 0..,
-        trailing_var_arg = true,
         help = "Optional command path to describe, for example: memory read"
     )]
     command: Vec<String>,
@@ -2151,7 +2150,7 @@ struct StackReadArgs {
     cursor: u64,
     #[arg(long)]
     size: Option<u32>,
-    #[arg(long)]
+    #[arg(long, allow_negative_numbers = true)]
     offset_from_sp: Option<i64>,
     #[arg(long)]
     decode_pointers: bool,
@@ -2165,7 +2164,7 @@ struct StackRecoverArgs {
     cursor: u64,
     #[arg(long)]
     size: Option<u32>,
-    #[arg(long)]
+    #[arg(long, allow_negative_numbers = true)]
     offset_from_sp: Option<i64>,
     #[arg(long, default_value_t = 32)]
     max_candidates: usize,
@@ -2186,7 +2185,7 @@ struct StackBacktraceArgs {
     cursor: u64,
     #[arg(long, default_value_t = 4096)]
     size: u32,
-    #[arg(long)]
+    #[arg(long, allow_negative_numbers = true)]
     offset_from_sp: Option<i64>,
     #[arg(long, default_value_t = 32)]
     max_frames: usize,
@@ -2705,14 +2704,14 @@ async fn open_and_print(
     output: &OutputOptions,
 ) -> anyhow::Result<()> {
     let mut arguments = json!({
-        "trace_path": args.trace_path,
-        "companion_path": args.companion_path,
+        "trace_path": daemon_path(&args.trace_path),
+        "companion_path": args.companion_path.as_deref().map(daemon_path),
         "trace_index": args.trace_index,
         "thread_unique_id": args.thread_unique_id,
         "symbols": {
-            "binary_paths": args.binary_paths,
+            "binary_paths": daemon_paths(&args.binary_paths),
             "symbol_paths": args.symbol_paths,
-            "symcache_dir": args.symcache_dir,
+            "symcache_dir": args.symcache_dir.as_deref().map(daemon_path),
         }
     });
     if let Some(position) = args.position.as_deref() {
@@ -2864,7 +2863,7 @@ fn resolve_debug_subject(
     require_cursor: bool,
 ) -> anyhow::Result<Option<DebugSubject>> {
     if args.target.is_some() && (args.session.is_some() || args.cursor.is_some()) {
-        bail!("choose either --target or --session/--cursor, not both");
+        anyhow::bail!("choose either --target or --session/--cursor, not both");
     }
     if let Some(target) = args.target {
         return Ok(Some(DebugSubject::Target { target }));
@@ -2878,8 +2877,8 @@ fn resolve_debug_subject(
             session,
             cursor: None,
         })),
-        (Some(_), None) => bail!("--cursor is required with --session for this command"),
-        (None, Some(_)) => bail!("--session is required with --cursor"),
+        (Some(_), None) => anyhow::bail!("--cursor is required with --session for this command"),
+        (None, Some(_)) => anyhow::bail!("--session is required with --cursor"),
         (None, None) => Ok(None),
     }
 }
@@ -2917,12 +2916,19 @@ fn append_action_log(exit_code: i32, started: Instant) -> anyhow::Result<()> {
             .with_context(|| format!("creating action log directory {}", parent.display()))?;
     }
     let full_args = std::env::var_os("WINDBG_TOOL_ACTION_LOG_FULL").is_some();
+    // `std::env::args()` panics on non-Unicode arguments (for example unpaired UTF-16
+    // surrogates in Windows paths), so log a lossy rendering instead.
+    let lossy_args = || {
+        std::env::args_os()
+            .skip(1)
+            .map(|arg| arg.to_string_lossy().into_owned())
+    };
     let entry = json!({
         "schema_version": 1,
         "timestamp_unix_ms": SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis(),
-        "command_path": command_path_from_args(std::env::args().skip(1)),
+        "command_path": command_path_from_args(lossy_args()),
         "args": if full_args {
-            std::env::args().skip(1).collect::<Vec<_>>()
+            lossy_args().collect::<Vec<_>>()
         } else {
             Vec::<String>::new()
         },
@@ -3097,9 +3103,9 @@ async fn dump_open_and_print(
         ToolCall {
             name: "dump_open_session".to_string(),
             arguments: json!({
-                "path": args.path,
-                "symbol_cache": args.symbol_cache,
-                "image_paths": args.image_path,
+                "path": daemon_path(&args.path),
+                "symbol_cache": daemon_path(&args.symbol_cache),
+                "image_paths": daemon_paths(&args.image_path),
                 "offline": args.offline,
             }),
         },
@@ -3125,13 +3131,13 @@ fn load_call(args: LoadArgs) -> ToolCall {
     ToolCall {
         name: "ttd_load_trace".to_string(),
         arguments: json!({
-            "trace_path": args.trace_path,
-            "companion_path": args.companion_path,
+            "trace_path": daemon_path(&args.trace_path),
+            "companion_path": args.companion_path.as_deref().map(daemon_path),
             "trace_index": args.trace_index,
             "symbols": {
-                "binary_paths": args.binary_paths,
+                "binary_paths": daemon_paths(&args.binary_paths),
                 "symbol_paths": args.symbol_paths,
-                "symcache_dir": args.symcache_dir,
+                "symcache_dir": args.symcache_dir.as_deref().map(daemon_path),
             },
         }),
     }
@@ -3141,10 +3147,21 @@ fn trace_list_call(args: TraceListArgs) -> ToolCall {
     ToolCall {
         name: "ttd_trace_list".to_string(),
         arguments: json!({
-            "trace_path": args.trace_path,
-            "companion_path": args.companion_path,
+            "trace_path": daemon_path(&args.trace_path),
+            "companion_path": args.companion_path.as_deref().map(daemon_path),
         }),
     }
+}
+
+/// Resolves a user-supplied path against the CLI's working directory before it
+/// is sent to the long-lived daemon, which may have been started elsewhere and
+/// would otherwise resolve relative paths against its own working directory.
+fn daemon_path(path: &Path) -> PathBuf {
+    std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+fn daemon_paths(paths: &[PathBuf]) -> Vec<PathBuf> {
+    paths.iter().map(|path| daemon_path(path)).collect()
 }
 
 fn index_build_call(args: IndexBuildArgs) -> ToolCall {
@@ -3322,6 +3339,7 @@ fn inferred_command_metadata(command: &Command, path: &[String]) -> Value {
         path_string.as_str(),
         "symbols inspect"
             | "symbols exports"
+            | "module search-order"
             | "dbgeng server"
             | "dbgsrv"
             | "trace record"
@@ -3346,18 +3364,32 @@ fn inferred_command_metadata(command: &Command, path: &[String]) -> Value {
     );
     let has_session = command.get_arguments().any(|arg| arg.get_id() == "session");
     let has_cursor = command.get_arguments().any(|arg| arg.get_id() == "cursor");
+    let session_required = command
+        .get_arguments()
+        .any(|arg| arg.get_id() == "session" && arg.is_required_set());
+    let cursor_required = command
+        .get_arguments()
+        .any(|arg| arg.get_id() == "cursor" && arg.is_required_set());
     json!({
         "command": path_string,
         "requires_daemon": !no_daemon,
         "requires_native_ttd": has_session || has_cursor,
-        "session_required": has_session,
-        "cursor_required": has_cursor,
+        "session_required": session_required,
+        "cursor_required": cursor_required,
         "cost": if has_session || has_cursor { "depends_on_trace_and_bounds" } else { "low" },
-        "safety": if path_string.contains("terminate") || path_string.contains("remove") || path_string.contains("cancel") {
+        "safety": if path_string.contains("terminate")
+            || path_string.contains("remove")
+            || path_string.contains("cancel")
+            || matches!(path_string.as_str(), "close" | "target close" | "daemon shutdown")
+        {
             "destructive"
         } else if path_string.contains("write")
             || path_string == "dump create"
             || path_string == "target dump"
+            || path_string == "breakpoint enable"
+            || path_string == "breakpoint disable"
+            || path_string == "index build"
+            || path_string == "trace record"
             || path_string.contains("set")
             || path_string.contains("continue")
             || path_string.contains("step")
@@ -4342,7 +4374,7 @@ fn target_memory_call(args: TargetMemoryReadArgs) -> anyhow::Result<ToolCall> {
         name: "target_read_memory".to_string(),
         arguments: json!({
             "target_id": args.target,
-            "address": parse_u64_argument(&args.address)?,
+            "address": parse_address_argument(&args.address)?,
             "size": args.size,
         }),
     })
@@ -4363,7 +4395,7 @@ fn target_address_inspect_call(args: TargetAddressArgs) -> anyhow::Result<ToolCa
         name: "target_inspect_address".to_string(),
         arguments: json!({
             "target_id": args.target,
-            "address": parse_u64_argument(&args.address)?,
+            "address": parse_address_argument(&args.address)?,
         }),
     })
 }
@@ -4386,7 +4418,7 @@ fn target_module_parameters_call(args: TargetModuleParametersArgs) -> anyhow::Re
     let module_base_addresses = args
         .module_bases
         .iter()
-        .map(|address| parse_u64_argument(address))
+        .map(|address| parse_address_argument(address))
         .collect::<anyhow::Result<Vec<_>>>()?;
     let mut unique = module_base_addresses.clone();
     unique.sort_unstable();
@@ -4409,7 +4441,7 @@ fn target_dump_call(args: TargetDumpArgs) -> ToolCall {
         name: "target_write_dump".to_string(),
         arguments: json!({
             "target_id": args.target,
-            "path": args.output,
+            "path": daemon_path(&args.output),
             "kind": cli_dump_kind_name(args.kind),
             "overwrite": args.overwrite,
         }),
@@ -4450,7 +4482,7 @@ fn target_disasm_call(args: TargetDisasmArgs) -> anyhow::Result<ToolCall> {
         name: "target_disassemble".to_string(),
         arguments: json!({
             "target_id": args.target,
-            "address": args.address.as_deref().map(parse_u64_argument).transpose()?,
+            "address": args.address.as_deref().map(parse_address_argument).transpose()?,
             "count": args.count,
         }),
     })
@@ -4461,7 +4493,7 @@ fn target_address_call(name: &str, args: TargetAddressArgs) -> anyhow::Result<To
         name: name.to_string(),
         arguments: json!({
             "target_id": args.target,
-            "address": parse_u64_argument(&args.address)?,
+            "address": parse_address_argument(&args.address)?,
         }),
     })
 }
@@ -4470,7 +4502,7 @@ fn breakpoint_set_call(args: BreakpointSetArgs) -> anyhow::Result<ToolCall> {
     let address = args
         .address
         .as_deref()
-        .map(parse_u64_argument)
+        .map(parse_address_argument)
         .transpose()?;
 
     Ok(ToolCall {
@@ -4543,16 +4575,18 @@ fn tool_arguments(args: ToolArgs) -> anyhow::Result<Value> {
     let value = if let Some(path) = args.json_file {
         let text = fs::read_to_string(&path)
             .with_context(|| format!("reading JSON arguments from {}", path.display()))?;
-        serde_json::from_str(&text).with_context(|| format!("parsing {}", path.display()))?
+        serde_json::from_str(&text)
+            .map_err(|error| invalid_argument(format!("parsing {}: {error}", path.display())))?
     } else {
-        serde_json::from_str(&args.json).context("parsing --json")?
+        serde_json::from_str(&args.json)
+            .map_err(|error| invalid_argument(format!("parsing --json: {error}")))?
     };
     ensure_json_object(value)
 }
 
 fn module_info_call(args: ModuleInfoArgs) -> anyhow::Result<ToolCall> {
     if args.name.is_none() && args.address.is_none() {
-        bail!("module info requires --name or --address")
+        return Err(invalid_argument("module info requires --name or --address").into());
     }
     let mut object = session_object(args.session);
     insert_option(&mut object, "name", args.name.map(Value::String));
@@ -4561,7 +4595,7 @@ fn module_info_call(args: ModuleInfoArgs) -> anyhow::Result<ToolCall> {
         "address",
         args.address
             .as_deref()
-            .map(parse_u64_argument)
+            .map(parse_address_argument)
             .transpose()?
             .map(Value::from),
     );
@@ -4676,7 +4710,7 @@ fn watch_memory_job_call(args: SweepWatchMemoryArgs) -> anyhow::Result<ToolCall>
         arguments: json!({
             "session_id": args.session,
             "cursor_id": args.cursor,
-            "address": parse_u64_argument(&args.address)?,
+            "address": parse_address_argument(&args.address)?,
             "size": args.size,
             "access": args.access,
             "direction": args.direction,
@@ -4781,7 +4815,7 @@ async fn sweep_watch_memory_and_print(
             arguments: json!({
                 "session_id": args.session,
                 "cursor_id": args.cursor,
-                "address": parse_u64_argument(&args.address)?,
+                "address": parse_address_argument(&args.address)?,
                 "size": args.size,
                 "access": args.access,
                 "direction": args.direction,
@@ -4872,7 +4906,7 @@ fn memory_read_call(args: MemoryReadArgs) -> anyhow::Result<ToolCall> {
     let mut object = cursor_object(args.session, args.cursor);
     object.insert(
         "address".to_string(),
-        Value::from(parse_u64_argument(&args.address)?),
+        Value::from(parse_address_argument(&args.address)?),
     );
     object.insert("size".to_string(), Value::from(args.size));
     insert_option(&mut object, "policy", args.policy.map(Value::String));
@@ -4886,7 +4920,7 @@ fn memory_range_call(args: MemoryRangeArgs) -> anyhow::Result<ToolCall> {
     let mut object = cursor_object(args.session, args.cursor);
     object.insert(
         "address".to_string(),
-        Value::from(parse_u64_argument(&args.address)?),
+        Value::from(parse_address_argument(&args.address)?),
     );
     insert_option(&mut object, "max_bytes", args.max_bytes.map(Value::from));
     insert_option(&mut object, "policy", args.policy.map(Value::String));
@@ -4900,7 +4934,7 @@ fn memory_buffer_call(args: MemoryBufferArgs) -> anyhow::Result<ToolCall> {
     let mut object = cursor_object(args.session, args.cursor);
     object.insert(
         "address".to_string(),
-        Value::from(parse_u64_argument(&args.address)?),
+        Value::from(parse_address_argument(&args.address)?),
     );
     object.insert("size".to_string(), Value::from(args.size));
     insert_option(&mut object, "max_ranges", args.max_ranges.map(Value::from));
@@ -4917,7 +4951,7 @@ fn watchpoint_call(args: WatchpointArgs) -> anyhow::Result<ToolCall> {
         arguments: json!({
             "session_id": args.session,
             "cursor_id": args.cursor,
-            "address": parse_u64_argument(&args.address)?,
+            "address": parse_address_argument(&args.address)?,
             "size": args.size,
             "access": args.access,
             "direction": args.direction,
@@ -5110,18 +5144,29 @@ fn insert_option(object: &mut Map<String, Value>, key: &str, value: Option<Value
     }
 }
 
+/// Parse a user-supplied address/integer flag, reporting failures as invalid arguments (exit 2).
+fn parse_address_argument(value: &str) -> anyhow::Result<u64> {
+    parse_u64_argument(value).map_err(|error| {
+        invalid_argument(format!("invalid address or integer '{value}': {error:#}")).into()
+    })
+}
+
 fn parse_position_argument(value: &str) -> anyhow::Result<Value> {
     let trimmed = value.trim();
     let candidate = trimmed.strip_suffix('%').unwrap_or(trimmed).trim();
     if let Ok(percent) = candidate.parse::<u8>() {
-        ensure!(
-            percent <= 100,
-            "position percentage must be between 0 and 100, got {percent}"
-        );
+        if percent > 100 {
+            return Err(invalid_argument(format!(
+                "position percentage must be between 0 and 100, got {percent}"
+            ))
+            .into());
+        }
         return Ok(json!(percent));
     }
     if trimmed.starts_with('{') {
-        return serde_json::from_str(trimmed).context("parsing JSON position object");
+        return serde_json::from_str(trimmed).map_err(|error| {
+            invalid_argument(format!("parsing JSON position object: {error}")).into()
+        });
     }
     Ok(json!(trimmed))
 }
@@ -5130,7 +5175,7 @@ fn ensure_json_object(value: Value) -> anyhow::Result<Value> {
     if value.is_object() {
         Ok(value)
     } else {
-        bail!("tool arguments must be a JSON object")
+        Err(invalid_argument("tool arguments must be a JSON object").into())
     }
 }
 
@@ -5303,6 +5348,83 @@ mod tests {
         assert_eq!(parse_position_argument("50%").unwrap(), json!(50));
         assert!(parse_position_argument("101%").is_err());
         assert_eq!(parse_position_argument("10:0").unwrap(), json!("10:0"));
+    }
+
+    #[test]
+    fn cli_argument_validation_errors_are_invalid_arguments() {
+        let exit_code =
+            |result: anyhow::Result<Value>| classify_error(result.unwrap_err()).exit_code();
+        assert_eq!(exit_code(parse_address_argument("zzz").map(Value::from)), 2);
+        assert_eq!(parse_address_argument("0x10").unwrap(), 0x10);
+        assert_eq!(exit_code(parse_position_argument("200%")), 2);
+        assert_eq!(exit_code(parse_position_argument("{not json")), 2);
+        assert_eq!(exit_code(ensure_json_object(json!([1]))), 2);
+        assert_eq!(
+            exit_code(
+                module_info_call(ModuleInfoArgs {
+                    session: 1,
+                    name: None,
+                    address: None,
+                })
+                .map(|call| call.arguments)
+            ),
+            2
+        );
+    }
+
+    #[test]
+    fn parses_negative_stack_offsets_and_trailing_global_flags() {
+        let cli = Cli::try_parse_from([
+            "windbg-tool",
+            "stack",
+            "read",
+            "--session",
+            "1",
+            "--cursor",
+            "2",
+            "--offset-from-sp",
+            "-16",
+        ])
+        .unwrap();
+        let Some(Commands::Stack {
+            command: StackCommand::Read(args),
+        }) = cli.command
+        else {
+            panic!("expected stack read");
+        };
+        assert_eq!(args.offset_from_sp, Some(-16));
+
+        let cli = Cli::try_parse_from(["windbg-tool", "cli-schema", "memory", "read", "--compact"])
+            .unwrap();
+        assert!(cli.compact);
+        let Some(Commands::CliSchema(args)) = cli.command else {
+            panic!("expected cli-schema");
+        };
+        assert_eq!(args.command, vec!["memory", "read"]);
+    }
+
+    #[test]
+    fn inferred_cli_metadata_reflects_daemon_requirement_optionality_and_safety() {
+        let metadata = |path: &[&str]| {
+            cli_schema(CliSchemaArgs {
+                command: path.iter().map(|segment| segment.to_string()).collect(),
+            })
+            .unwrap()["command"]["metadata"]
+                .clone()
+        };
+        assert_eq!(
+            metadata(&["module", "search-order"])["requires_daemon"],
+            false
+        );
+        let audit = metadata(&["module", "audit"]);
+        assert_eq!(audit["session_required"], true);
+        assert_eq!(audit["cursor_required"], false);
+        assert_eq!(
+            metadata(&["breakpoint", "enable"])["safety"],
+            "mutating_or_side_effecting"
+        );
+        assert_eq!(metadata(&["close"])["safety"], "destructive");
+        assert_eq!(metadata(&["memory", "read"])["safety"], "read_only");
     }
 
     #[test]
@@ -5512,6 +5634,52 @@ mod tests {
         assert_eq!(call.arguments["path"], r"C:\dumps\app.dmp");
         assert_eq!(call.arguments["kind"], "full");
         assert_eq!(call.arguments["overwrite"], true);
+    }
+
+    #[test]
+    fn daemon_bound_paths_are_absolutized_against_cli_cwd() -> anyhow::Result<()> {
+        let cwd = std::env::current_dir()?;
+        let call = trace_list_call(TraceListArgs {
+            trace_path: PathBuf::from(r"traces\ping\ping01.run"),
+            companion_path: None,
+        });
+        assert_eq!(
+            call.arguments["trace_path"],
+            json!(cwd.join(r"traces\ping\ping01.run"))
+        );
+        assert!(call.arguments["companion_path"].is_null());
+
+        let call = load_call(LoadArgs {
+            trace_path: PathBuf::from("a.run"),
+            companion_path: Some(PathBuf::from("a.idx")),
+            trace_index: None,
+            binary_paths: vec![PathBuf::from("bin"), cwd.join("abs-bin")],
+            symbol_paths: vec!["srv*cache*https://msdl.microsoft.com/download/symbols".into()],
+            symcache_dir: Some(PathBuf::from("symcache")),
+        });
+        assert_eq!(call.arguments["trace_path"], json!(cwd.join("a.run")));
+        assert_eq!(call.arguments["companion_path"], json!(cwd.join("a.idx")));
+        assert_eq!(
+            call.arguments["symbols"]["binary_paths"],
+            json!([cwd.join("bin"), cwd.join("abs-bin")])
+        );
+        assert_eq!(
+            call.arguments["symbols"]["symbol_paths"],
+            json!(["srv*cache*https://msdl.microsoft.com/download/symbols"])
+        );
+        assert_eq!(
+            call.arguments["symbols"]["symcache_dir"],
+            json!(cwd.join("symcache"))
+        );
+
+        let call = target_dump_call(TargetDumpArgs {
+            target: 1,
+            output: PathBuf::from("app.dmp"),
+            kind: CliDumpKind::Mini,
+            overwrite: false,
+        });
+        assert_eq!(call.arguments["path"], json!(cwd.join("app.dmp")));
+        Ok(())
     }
 
     #[test]

@@ -23,11 +23,9 @@ pub fn ping_trace_path() -> anyhow::Result<Option<PathBuf>> {
         return Ok(Some(path));
     }
 
+    // Check for the extracted trace only under the extraction lock: another test thread may be
+    // mid-extraction, in which case ping01.run already exists but is still being written.
     let default_trace = workspace_root().join(PING_TRACE_RUN);
-    if default_trace.is_file() {
-        return Ok(Some(default_trace));
-    }
-
     if !ensure_ping_fixture_extracted()? {
         return Ok(None);
     }

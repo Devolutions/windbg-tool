@@ -176,6 +176,8 @@ pub fn remote_doctor(request: RemoteDoctorRequest) -> anyhow::Result<Value> {
         probe_connect: request.probe_connect,
         timeout_ms: request.timeout_ms,
     })?;
+    let verify_command =
+        status_probe_command(request.kind, request.server.as_deref(), &request.transport).join(" ");
     let plan = remote_plan(RemotePlanRequest {
         kind: request.kind,
         server: request.server,
@@ -191,7 +193,7 @@ pub fn remote_doctor(request: RemoteDoctorRequest) -> anyhow::Result<Value> {
         "diagnostics": status["diagnostics"],
         "next_safe_commands": [
             "windbg-tool remote plan",
-            "windbg-tool remote status --probe-connect"
+            verify_command
         ]
     }))
 }
@@ -327,7 +329,11 @@ pub fn remote_plan(request: RemotePlanRequest) -> anyhow::Result<Value> {
             {
                 "id": "verify",
                 "side": "host",
-                "command": ["windbg-tool", "remote", "status", "--probe-connect"],
+                "command": status_probe_command(
+                    request.kind,
+                    request.server.as_deref(),
+                    &request.transport,
+                ),
                 "notes": ["Run after the target-side server is listening."]
             }
         ],
@@ -336,6 +342,23 @@ pub fn remote_plan(request: RemotePlanRequest) -> anyhow::Result<Value> {
             "Stop the target-side server process or terminal."
         ]
     }))
+}
+
+/// Host-side `remote status --probe-connect` command carrying the same kind,
+/// transport, and server; without `--server` the probe is always skipped.
+fn status_probe_command(kind: RemoteKind, server: Option<&str>, transport: &str) -> Vec<String> {
+    vec![
+        "windbg-tool".to_string(),
+        "remote".into(),
+        "status".into(),
+        "--kind".into(),
+        kind.as_str().into(),
+        "--transport".into(),
+        transport.into(),
+        "--server".into(),
+        server.unwrap_or("<target>").into(),
+        "--probe-connect".into(),
+    ]
 }
 
 fn ensure_exclusive_ntsd_target(
@@ -403,10 +426,21 @@ fn parse_tcp_transport(transport: &str) -> Option<u16> {
 
 fn connect_probe(server: &str, port: u16, timeout_ms: u64) -> anyhow::Result<Value> {
     let timeout = Duration::from_millis(timeout_ms.max(1));
-    let mut addrs = (server, port)
-        .to_socket_addrs()
-        .with_context(|| format!("resolving {server}:{port}"))?;
-    let Some(addr) = addrs.next() else {
+    // Name resolution failures are a diagnostic result, not a tool failure.
+    let addrs = match (server, port).to_socket_addrs() {
+        Ok(addrs) => addrs.collect::<Vec<_>>(),
+        Err(error) => {
+            return Ok(json!({
+                "status": "error",
+                "summary": "Server name resolution failed.",
+                "server": server,
+                "port": port,
+                "timeout_ms": timeout_ms,
+                "error": error.to_string()
+            }));
+        }
+    };
+    if addrs.is_empty() {
         return Ok(json!({
             "status": "error",
             "summary": "No socket addresses resolved.",
@@ -414,26 +448,35 @@ fn connect_probe(server: &str, port: u16, timeout_ms: u64) -> anyhow::Result<Val
             "port": port,
             "timeout_ms": timeout_ms
         }));
-    };
-    Ok(match TcpStream::connect_timeout(&addr, timeout) {
-        Ok(_) => json!({
-            "status": "ok",
-            "summary": "TCP connect probe succeeded.",
-            "server": server,
-            "port": port,
-            "address": addr.to_string(),
-            "timeout_ms": timeout_ms
-        }),
-        Err(error) => json!({
-            "status": "error",
-            "summary": "TCP connect probe failed.",
-            "server": server,
-            "port": port,
-            "address": addr.to_string(),
-            "timeout_ms": timeout_ms,
-            "error": error.to_string()
-        }),
-    })
+    }
+    // Try every resolved address (e.g. ::1 then 127.0.0.1) before reporting failure.
+    let mut last_error = None;
+    for addr in &addrs {
+        match TcpStream::connect_timeout(addr, timeout) {
+            Ok(_) => {
+                return Ok(json!({
+                    "status": "ok",
+                    "summary": "TCP connect probe succeeded.",
+                    "server": server,
+                    "port": port,
+                    "address": addr.to_string(),
+                    "timeout_ms": timeout_ms
+                }));
+            }
+            Err(error) => last_error = Some((addr, error)),
+        }
+    }
+    let (addr, error) = last_error.context("connect probe had no address to try")?;
+    Ok(json!({
+        "status": "error",
+        "summary": "TCP connect probe failed.",
+        "server": server,
+        "port": port,
+        "address": addr.to_string(),
+        "addresses_tried": addrs.iter().map(ToString::to_string).collect::<Vec<_>>(),
+        "timeout_ms": timeout_ms,
+        "error": error.to_string()
+    }))
 }
 
 fn build_server_command(args: &RemoteServerCommandRequest) -> Vec<String> {
@@ -539,5 +582,44 @@ mod tests {
         assert_eq!(parse_tcp_transport("TCP:Port=5005"), Some(5005));
         assert_eq!(parse_tcp_transport("abcé"), None);
         assert_eq!(parse_tcp_transport("tcp:pört=5005"), None);
+    }
+
+    #[test]
+    fn plan_verify_step_carries_server_and_transport() {
+        let value = remote_plan(RemotePlanRequest {
+            kind: RemoteKind::Ntsd,
+            server: Some("target.example".into()),
+            transport: "tcp:port=5007".into(),
+            pid: Some(42),
+            executable: None,
+        })
+        .unwrap();
+        let verify = value["steps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|step| step["id"] == "verify")
+            .unwrap();
+        let command = verify["command"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|part| part.as_str().unwrap())
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(command.contains("--server target.example"), "{command}");
+        assert!(command.contains("--transport tcp:port=5007"), "{command}");
+        assert!(command.contains("--kind ntsd"), "{command}");
+    }
+
+    #[test]
+    fn connect_probe_tries_every_resolved_address() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        // "localhost" commonly resolves to ::1 first; the IPv4 listener must still be found.
+        // The timeout applies per address and a refused ::1 connect can consume all of it on
+        // Windows, so keep it generous enough that a loaded test machine cannot flake.
+        let probe = connect_probe("localhost", port, 10_000).unwrap();
+        assert_eq!(probe["status"], "ok", "{probe}");
     }
 }

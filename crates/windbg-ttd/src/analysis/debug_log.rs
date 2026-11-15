@@ -32,17 +32,26 @@ pub fn debug_log_summarize(request: DebugLogSummarizeRequest) -> anyhow::Result<
         .context("debug_log_summarize requires path or WINDBG_TOOL_ACTION_LOG")?;
     let file =
         File::open(&path).with_context(|| format!("opening action log {}", path.display()))?;
-    let reader = BufReader::new(file);
+    let mut reader = BufReader::new(file);
     let mut recent = VecDeque::with_capacity(request.max.min(256));
     let mut total = 0_usize;
     let mut failed = 0_usize;
     let mut malformed = 0_usize;
-    for line in reader.lines() {
-        let line = line.with_context(|| format!("reading action log {}", path.display()))?;
-        if line.trim().is_empty() {
+    let mut line = Vec::new();
+    loop {
+        line.clear();
+        // Read raw bytes: a non-UTF-8 line (e.g. a torn write) is a malformed
+        // entry, not a reason to abort the whole summary.
+        let read = reader
+            .read_until(b'\n', &mut line)
+            .with_context(|| format!("reading action log {}", path.display()))?;
+        if read == 0 {
+            break;
+        }
+        if line.trim_ascii().is_empty() {
             continue;
         }
-        match serde_json::from_str::<Value>(&line) {
+        match serde_json::from_slice::<Value>(&line) {
             Ok(value) => {
                 total += 1;
                 if !value["ok"].as_bool().unwrap_or(false) {
@@ -107,5 +116,30 @@ mod tests {
         assert_eq!(summary["failed_entries"], 1);
         assert_eq!(summary["malformed_entries"], 1);
         assert_eq!(summary["returned"], 2);
+    }
+
+    #[test]
+    fn counts_non_utf8_lines_as_malformed() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("windbg-tool-action-log-utf8-{stamp}.jsonl"));
+        {
+            let mut file = File::create(&path).unwrap();
+            writeln!(file, r#"{{"ok":true,"command":"a"}}"#).unwrap();
+            file.write_all(b"{\"ok\":true,\"command\":\"\xff\xfe\"}\r\n")
+                .unwrap();
+            writeln!(file, r#"{{"ok":false,"command":"c"}}"#).unwrap();
+        }
+        let summary = debug_log_summarize(DebugLogSummarizeRequest {
+            path: Some(path.clone()),
+            max: 10,
+        });
+        let _ = std::fs::remove_file(&path);
+        let summary = summary.unwrap();
+        assert_eq!(summary["total_entries"], 2);
+        assert_eq!(summary["failed_entries"], 1);
+        assert_eq!(summary["malformed_entries"], 1);
     }
 }

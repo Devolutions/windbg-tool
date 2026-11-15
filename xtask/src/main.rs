@@ -501,7 +501,12 @@ fn mcp_smoke() -> anyhow::Result<()> {
 }
 
 fn workspace_root() -> anyhow::Result<PathBuf> {
-    env::current_dir().context("reading current directory")
+    // `cargo xtask` can be invoked from any directory inside the workspace, so
+    // derive the root from this crate's manifest rather than the process CWD.
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .map(Path::to_path_buf)
+        .context("xtask manifest directory has no parent workspace directory")
 }
 
 fn check_command(command: &str) {
@@ -593,21 +598,60 @@ fn package_dir(packages_dir: &Path, package: &str) -> anyhow::Result<PathBuf> {
         return Ok(exact);
     }
 
-    let package_prefix = format!("{}.", package.to_ascii_lowercase());
+    // NuGet leaves older restored versions behind, and directory enumeration is
+    // alphabetical on NTFS, so pick the highest version explicitly instead of
+    // whichever entry is listed first.
+    let mut best: Option<(Vec<u64>, PathBuf)> = None;
     for entry in
         fs::read_dir(packages_dir).with_context(|| format!("reading {}", packages_dir.display()))?
     {
         let entry = entry?;
-        let name = entry.file_name().to_string_lossy().to_ascii_lowercase();
-        if name.starts_with(&package_prefix) && entry.path().is_dir() {
-            return Ok(entry.path());
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let Some(version) = package_dir_version(&name, package) else {
+            continue;
+        };
+        if entry.path().is_dir() && best.as_ref().is_none_or(|(current, _)| version > *current) {
+            best = Some((version, entry.path()));
         }
+    }
+    if let Some((_, path)) = best {
+        return Ok(path);
     }
 
     bail!(
         "restored package directory for {} was not found under {}",
         package,
         packages_dir.display()
+    )
+}
+
+/// Returns the numeric version components of a restored NuGet package
+/// directory named `<package>.<version>`, or `None` when the directory belongs
+/// to a different package (including ones that merely share a name prefix).
+fn package_dir_version(dir_name: &str, package: &str) -> Option<Vec<u64>> {
+    let prefix_len = package.len() + 1;
+    if dir_name.len() <= prefix_len
+        || dir_name.as_bytes()[package.len()] != b'.'
+        || !dir_name
+            .get(..package.len())
+            .is_some_and(|name| name.eq_ignore_ascii_case(package))
+    {
+        return None;
+    }
+    let version = &dir_name[prefix_len..];
+    if !version.starts_with(|c: char| c.is_ascii_digit()) {
+        return None;
+    }
+    Some(
+        version
+            .split(['.', '-'])
+            .map(|part| {
+                let digits = part
+                    .find(|c: char| !c.is_ascii_digit())
+                    .map_or(part, |end| &part[..end]);
+                digits.parse().unwrap_or(0)
+            })
+            .collect(),
     )
 }
 
@@ -743,7 +787,9 @@ impl SmokeClient {
             .env("WINDBG_TOOL_MCP_IN_PROCESS", "1")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
+            // stderr is never drained; piping it lets server logging fill the
+            // pipe buffer and deadlock the smoke test.
+            .stderr(Stdio::inherit())
             .spawn()
             .with_context(|| format!("spawning packaged MCP server {}", server_path.display()))?;
         let stdin = child.stdin.take().context("child stdin was not piped")?;
@@ -867,4 +913,62 @@ fn run(command: &mut Command) -> anyhow::Result<()> {
         bail!("command failed with status {status}");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn package_dir_version_matches_only_the_exact_package_id() {
+        assert_eq!(
+            package_dir_version(
+                "Microsoft.TimeTravelDebugging.Apis.0.9.10",
+                "Microsoft.TimeTravelDebugging.Apis"
+            ),
+            Some(vec![0, 9, 10])
+        );
+        assert_eq!(
+            package_dir_version(
+                "microsoft.debugging.platform.dbgeng.20260319.1511.0",
+                "Microsoft.Debugging.Platform.DbgEng"
+            ),
+            Some(vec![20260319, 1511, 0])
+        );
+        assert_eq!(
+            package_dir_version(
+                "Microsoft.Debugging.Platform.DbgEng.Extensions.1.0.0",
+                "Microsoft.Debugging.Platform.DbgEng"
+            ),
+            None
+        );
+        assert_eq!(
+            package_dir_version(
+                "Microsoft.Debugging.Platform.DbgEng",
+                "Microsoft.Debugging.Platform.DbgEng"
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn package_dir_prefers_the_highest_restored_version() {
+        let packages_dir =
+            env::temp_dir().join(format!("xtask-package-dir-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&packages_dir);
+        for name in [
+            "Microsoft.TimeTravelDebugging.Apis.0.9.9",
+            "Microsoft.TimeTravelDebugging.Apis.0.9.10",
+            "Microsoft.TimeTravelDebugging.Apis.0.10.0-preview",
+            "Microsoft.TimeTravelDebugging.Apis.Extras.9.9.9",
+        ] {
+            fs::create_dir_all(packages_dir.join(name)).unwrap();
+        }
+        let selected = package_dir(&packages_dir, "Microsoft.TimeTravelDebugging.Apis").unwrap();
+        fs::remove_dir_all(&packages_dir).unwrap();
+        assert_eq!(
+            selected.file_name().unwrap(),
+            "Microsoft.TimeTravelDebugging.Apis.0.10.0-preview"
+        );
+    }
 }

@@ -179,6 +179,9 @@ pub fn search_candidate(order: usize, kind: &str, directory: &Path, dll: &str) -
 pub fn directory_risk(directory: &Path) -> &'static str {
     let lower = directory.to_string_lossy().to_ascii_lowercase();
     let lower_path = PathBuf::from(&lower);
+    // Directories usually lack a trailing separator; add one so `\temp\`-style
+    // component checks also match the final component (e.g. `...\Downloads`).
+    let lower = format!("{}\\", lower.replace('/', "\\").trim_end_matches('\\'));
     let windows_dir = PathBuf::from(
         std::env::var("WINDIR")
             .or_else(|_| std::env::var("SystemRoot"))
@@ -256,6 +259,27 @@ mod tests {
             directory_risk(Path::new(r"C:\Windows_temp\evil")),
             "system_controlled"
         );
+    }
+
+    #[test]
+    fn directory_risk_matches_final_path_component() {
+        assert_eq!(
+            directory_risk(Path::new(r"C:\Users\me\Downloads")),
+            "temp_or_download_path"
+        );
+        assert_eq!(
+            directory_risk(Path::new(r"C:\Users\me\AppData\Local\Temp")),
+            "temp_or_download_path"
+        );
+        assert_eq!(
+            directory_risk(Path::new(r"C:\Temp\")),
+            "temp_or_download_path"
+        );
+        assert_eq!(
+            directory_risk(Path::new(r"C:\ProgramData")),
+            "user_or_programdata_path"
+        );
+        assert_eq!(directory_risk(Path::new(r"D:\tools")), "review_path_acl");
     }
 
     #[test]

@@ -248,7 +248,7 @@ pub fn diagnose_pe(path: &Path) -> anyhow::Result<Value> {
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or_default();
-    let image_key = format!("{timestamp:X}{size_of_image:X}");
+    let image_key = image_symbol_store_key(timestamp, size_of_image);
     let image_symbol_store_path = if file_name.is_empty() {
         None
     } else {
@@ -272,6 +272,11 @@ pub fn diagnose_pe(path: &Path) -> anyhow::Result<Value> {
         "sections": sections.iter().map(section_value).collect::<Vec<_>>(),
         "codeview": codeview,
     }))
+}
+
+/// SymSrv image index: TimeDateStamp as eight zero-padded hex digits followed by SizeOfImage.
+fn image_symbol_store_key(timestamp: u32, size_of_image: u32) -> String {
+    format!("{timestamp:08X}{size_of_image:X}")
 }
 
 pub fn read_export_symbols(path: &Path) -> anyhow::Result<Vec<ExportSymbol>> {
@@ -613,6 +618,15 @@ fn read_u32(data: &[u8], offset: usize) -> anyhow::Result<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn image_symbol_store_key_zero_pads_timestamp() {
+        assert_eq!(
+            image_symbol_store_key(0x0123_4567, 0x1F000),
+            "012345671F000"
+        );
+        assert_eq!(image_symbol_store_key(0xABCD_EF01, 0x2000), "ABCDEF012000");
+    }
 
     #[cfg(windows)]
     #[test]

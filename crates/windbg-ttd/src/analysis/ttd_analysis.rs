@@ -2,10 +2,10 @@
 
 use super::disasm::disassemble_x64;
 use super::memory::{
-    ascii_strings, classify_memory, memory_dump, plausible_x64_pointer, read_pointer_value,
-    utf16le_strings,
+    ascii_strings, classify_memory, memory_dump, read_pointer_value, utf16le_strings,
 };
 use super::stack::recover_stack_candidates;
+use super::target_analysis::plausible_pointer_for_size;
 use super::timeline::{
     collect_keyframe_events, collect_timeline_events, timeline_sequence, timeline_source_summary,
     timeline_steps,
@@ -344,7 +344,7 @@ pub fn ttd_stack_backtrace(
         }
         frames.push(current);
     }
-    for (index, candidate) in candidates.into_iter().enumerate() {
+    for (index, candidate) in backtrace_stack_order(candidates) {
         frames.push(json!({
             "index": frames.len(),
             "kind": "recovered_return_address",
@@ -438,7 +438,8 @@ pub fn ttd_memory_strings(
                 .filter(|item| {
                     item["text"]
                         .as_str()
-                        .is_some_and(|text| text.len() >= request.min_len)
+                        // min_len counts characters; non-ASCII UTF-16 text is longer in UTF-8 bytes.
+                        .is_some_and(|text| text.chars().count() >= request.min_len)
                 })
                 .map(|mut item| {
                     item["encoding"] = Value::String("utf16".to_string());
@@ -495,7 +496,8 @@ pub fn ttd_memory_dps(
             "slot_hex": format!("0x{slot:016x}"),
             "value": target,
             "value_hex": format!("0x{target:016x}"),
-            "plausible_x64_pointer": plausible_x64_pointer(target),
+            // Honor pointer_size: x86 pointers are only 4-byte aligned and below 4 GiB.
+            "plausible_x64_pointer": plausible_pointer_for_size(target, request.pointer_size),
             "null": target == 0
         });
         if request.target_info && target != 0 {
@@ -840,6 +842,15 @@ fn read_memory_bytes(
     Ok((address, read_value, bytes))
 }
 
+/// `recover_stack_candidates` ranks by confidence; a backtrace must list frames in stack
+/// order (ascending slot address, innermost caller first) so frame indexes reflect depth.
+/// Returns each candidate paired with its original confidence rank.
+fn backtrace_stack_order(candidates: Vec<Value>) -> Vec<(usize, Value)> {
+    let mut ranked = candidates.into_iter().enumerate().collect::<Vec<_>>();
+    ranked.sort_by_key(|(_, candidate)| candidate["slot_address"].as_u64().unwrap_or(u64::MAX));
+    ranked
+}
+
 fn enrich_stack_candidates(
     state: &mut ServiceState,
     session_id: SessionId,
@@ -897,4 +908,26 @@ pub fn ttd_replay_to(state: &mut ServiceState, request: ReplayToRequest) -> anyh
         "before": before,
         "after": after,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn backtrace_frames_follow_stack_slot_order_not_confidence() {
+        let candidates = vec![
+            json!({ "slot_address": 0x2000u64, "confidence": 0.95 }),
+            json!({ "slot_address": 0x1000u64, "confidence": 0.70 }),
+            json!({ "slot_address": 0x1800u64, "confidence": 0.60 }),
+        ];
+        let ordered = backtrace_stack_order(candidates);
+        let slots = ordered
+            .iter()
+            .map(|(_, candidate)| candidate["slot_address"].as_u64().unwrap())
+            .collect::<Vec<_>>();
+        let ranks = ordered.iter().map(|(rank, _)| *rank).collect::<Vec<_>>();
+        assert_eq!(slots, vec![0x1000, 0x1800, 0x2000]);
+        assert_eq!(ranks, vec![1, 2, 0]);
+    }
 }

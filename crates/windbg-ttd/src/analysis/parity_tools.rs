@@ -291,9 +291,10 @@ pub fn ttd_object_vtable(
 
 pub fn module_search_order(request: ModuleSearchOrderRequest) -> anyhow::Result<Value> {
     let dll = normalize_dll_name(&request.dll)?;
-    let current_dir = request
-        .current_dir
-        .unwrap_or(std::env::current_dir().context("resolving current directory")?);
+    let current_dir = match request.current_dir {
+        Some(current_dir) => current_dir,
+        None => std::env::current_dir().context("resolving current directory")?,
+    };
     let windows_dir = PathBuf::from(
         std::env::var("WINDIR")
             .or_else(|_| std::env::var("SystemRoot"))
@@ -526,7 +527,7 @@ pub fn breakpoint_plan(request: BreakpointPlanRequest) -> anyhow::Result<Value> 
                 "write" | "read" | "read_write" => (
                     subject,
                     request.address.is_some() && cursor.is_some(),
-                    json!([
+                    with_thread_filter(json!([
                         "windbg-tool",
                         "replay",
                         "watch-memory",
@@ -548,7 +549,7 @@ pub fn breakpoint_plan(request: BreakpointPlanRequest) -> anyhow::Result<Value> 
                             .direction
                             .clone()
                             .unwrap_or_else(|| "previous".to_string())
-                    ]),
+                    ]), request.thread_unique_id),
                     "TTD memory watchpoints replay to the next or previous matching access.",
                     "bounded_replay",
                 ),
@@ -599,6 +600,14 @@ pub fn breakpoint_plan(request: BreakpointPlanRequest) -> anyhow::Result<Value> 
             })]
         }
     }))
+}
+
+fn with_thread_filter(mut command: Value, thread_unique_id: Option<u64>) -> Value {
+    if let (Some(thread), Some(args)) = (thread_unique_id, command.as_array_mut()) {
+        args.push(json!("--thread-unique-id"));
+        args.push(json!(thread));
+    }
+    command
 }
 
 fn collect_source_matches(
@@ -700,4 +709,33 @@ fn normalized_components(path: &Path) -> Vec<String> {
         .filter(|part| !part.is_empty() && *part != "." && *part != ".." && !part.ends_with(':'))
         .map(str::to_ascii_lowercase)
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ttd_watchpoint_plan_keeps_thread_filter() -> anyhow::Result<()> {
+        let plan = breakpoint_plan(BreakpointPlanRequest {
+            session_id: Some(1),
+            cursor_id: Some(2),
+            target_id: None,
+            address: Some("0x1000".to_string()),
+            symbol: None,
+            module: None,
+            kind: "write".to_string(),
+            size: Some(8),
+            direction: None,
+            thread_unique_id: Some(7),
+        })?;
+        assert_eq!(plan["supported"], true);
+        let command = plan["command"].as_array().unwrap();
+        let flag = command
+            .iter()
+            .position(|arg| arg == "--thread-unique-id")
+            .expect("thread filter flag");
+        assert_eq!(command[flag + 1], 7);
+        Ok(())
+    }
 }

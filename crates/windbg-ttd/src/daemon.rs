@@ -195,11 +195,17 @@ mod windows {
         loop {
             tokio::select! {
                 result = server.connect() => {
-                    result.with_context(|| format!("accepting named pipe client on {pipe_name}"))?;
-                    let connected = server;
-                    server = create_server(&pipe_name, false)
+                    let next = create_server(&pipe_name, false)
                         .with_context(|| format!("creating next named pipe server instance {pipe_name}"))?;
-                    spawn_connection(connected, service.clone(), shutdown_tx.clone());
+                    let connected = std::mem::replace(&mut server, next);
+                    match result {
+                        Ok(()) => spawn_connection(connected, service.clone(), shutdown_tx.clone()),
+                        // A single client that disconnects before the accept completes
+                        // (e.g. ERROR_NO_DATA) must not take down the daemon and its sessions.
+                        Err(error) => {
+                            tracing::warn!(%error, pipe = %pipe_name, "named pipe client connect failed");
+                        }
+                    }
                 }
                 _ = &mut shutdown_rx => {
                     tracing::info!("TTD daemon shutdown requested");
@@ -248,7 +254,7 @@ mod windows {
                 StatusCode::BAD_REQUEST,
                 json!({
                     "ok": false,
-                    "error": error.to_string(),
+                    "error": format!("{error:#}"),
                 }),
             ),
         };
@@ -291,7 +297,7 @@ mod windows {
                     }),
                     Err(error) => json!({
                         "ok": false,
-                        "error": error.to_string(),
+                        "error": format!("{error:#}"),
                     }),
                 };
                 Ok(json_response(StatusCode::OK, response))

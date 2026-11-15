@@ -551,7 +551,13 @@ fn dump_triage_value(session: &DebuggerSession, input: DumpTriageInput<'_>) -> V
     let bugcheck_driver = if input.user_exception.is_some() {
         kernel_only.clone()
     } else {
-        dump_bugcheck_driver(session)
+        // IMAGE_FILE_MACHINE_I386 targets use 32-bit kernel pointers.
+        let pointer_size = if input.target.processor_type == Some(0x014C) {
+            4
+        } else {
+            8
+        };
+        dump_bugcheck_driver(session, pointer_size)
     };
     let evidence = if input.user_exception.is_some() {
         json!({
@@ -689,8 +695,14 @@ fn dump_target_fault_address(
     }
 }
 
+/// Bugcheck codes with the 0x10000000 bit (for example 0x1000001E,
+/// KMODE_EXCEPTION_NOT_HANDLED_M) are documented as identical to their base code.
+fn canonical_bugcheck_code(code: u32) -> u32 {
+    code & !0x1000_0000
+}
+
 fn dump_fault_address(data: &windbg_dbgeng::BugCheckData) -> Option<u64> {
-    match data.code {
+    match canonical_bugcheck_code(data.code) {
         0x0000_001E | 0x0000_003B => Some(data.parameters[1]),
         _ => None,
     }
@@ -703,7 +715,7 @@ fn dump_exception_context(
     max_frames: u32,
 ) -> Option<Value> {
     let data = bugcheck?;
-    let candidates = match data.code {
+    let candidates = match canonical_bugcheck_code(data.code) {
         0x0000_003B => vec![("parameter_3_exception_context", data.parameters[2])],
         // KMODE_EXCEPTION_NOT_HANDLED does not promise a CONTEXT parameter. Some
         // contemporary kernel builds preserve one in parameter four, so probe only
@@ -750,7 +762,7 @@ fn dump_exception_context(
             .unwrap_or("none"),
         "context": selected.map(|candidate| candidate["context"].clone()),
         "candidates": decoded,
-        "detail": if data.code == 0x0000_001E {
+        "detail": if canonical_bugcheck_code(data.code) == 0x0000_001E {
             "For bugcheck 0x1E, context candidates are bounded structural probes rather than a documented parameter contract."
         } else {
             "The decoded context comes from the documented SYSTEM_SERVICE_EXCEPTION context-record parameter."
@@ -765,13 +777,13 @@ fn dump_bugcheck_value(bugcheck: &windbg_dbgeng::BugCheckDataResult) -> Value {
             "detail": bugcheck.detail,
         });
     };
-    let name = match data.code {
+    let name = match canonical_bugcheck_code(data.code) {
         0x0000_001E => "KMODE_EXCEPTION_NOT_HANDLED",
         0x0000_003B => "SYSTEM_SERVICE_EXCEPTION",
         0x0000_0051 => "REGISTRY_ERROR",
         _ => "UNKNOWN",
     };
-    let parameter_roles = match data.code {
+    let parameter_roles = match canonical_bugcheck_code(data.code) {
         0x0000_001E => json!([
             "exception_code",
             "fault_instruction_address",
@@ -809,7 +821,10 @@ fn dump_exception_record(
 ) -> Option<Value> {
     const MAX_STACK_SCAN_BYTES: u64 = 64 * 1024;
     let data = bugcheck?;
-    if !matches!(data.code, 0x0000_001E | 0x0000_003B) {
+    if !matches!(
+        canonical_bugcheck_code(data.code),
+        0x0000_001E | 0x0000_003B
+    ) {
         return None;
     }
     let mut stack_addresses = stack
@@ -896,7 +911,7 @@ fn scan_x64_exception_records(
             .filter_map(|index| stack_u64(bytes, offset + HEADER_SIZE + index * 8))
             .collect::<Vec<_>>();
         candidates.push(json!({
-            "record_address": base_address + offset as u64,
+            "record_address": base_address.wrapping_add(offset as u64),
             "exception_code": code,
             "exception_flags": stack_u32(bytes, offset + 4),
             "nested_exception_record": stack_u64(bytes, offset + 8),
@@ -1184,7 +1199,7 @@ fn selected_exception_register(exception_context: &Option<Value>, name: &str) ->
         .as_u64()
 }
 
-fn dump_bugcheck_driver(session: &DebuggerSession) -> Value {
+fn dump_bugcheck_driver(session: &DebuggerSession, pointer_size: u32) -> Value {
     let pointer = match session.evaluate("poi(nt!KiBugCheckDriver)") {
         Ok(result) => match result.unsigned_value {
             Some(0) => {
@@ -1209,31 +1224,41 @@ fn dump_bugcheck_driver(session: &DebuggerSession) -> Value {
             });
         }
     };
-    match session.read_memory(pointer, 260) {
+    // KiBugCheckDriver is a PUNICODE_STRING: the pointer addresses a UNICODE_STRING header
+    // whose Buffer holds the UTF-16 driver name (not a NUL-terminated ANSI string).
+    let header_size = if pointer_size == 4 { 8 } else { 16 };
+    let header = match session.read_memory(pointer, header_size) {
+        Ok(memory) => memory,
+        Err(error) => {
+            return json!({
+                "status": "unavailable",
+                "pointer": pointer,
+                "detail": format!("DbgEng could not read the KiBugCheckDriver UNICODE_STRING: {error}"),
+            });
+        }
+    };
+    let Some((length, buffer)) = decode_hex_bytes(&header.data)
+        .and_then(|bytes| decode_unicode_string_header(&bytes, pointer_size))
+        .filter(|(length, buffer)| *length > 0 && *buffer != 0)
+    else {
+        return json!({
+            "status": "pointer_present_name_unavailable",
+            "pointer": pointer,
+            "unicode_string": header,
+            "detail": "KiBugCheckDriver points to an empty, truncated, or null UNICODE_STRING.",
+        });
+    };
+    let name_bytes = u32::from(length & !1).min(MAX_BUGCHECK_DRIVER_NAME_BYTES);
+    match session.read_memory(buffer, name_bytes) {
         Ok(memory) => {
-            let bytes = decode_hex_bytes(&memory.data);
-            let driver_name = bytes
-                .as_deref()
-                .map(|bytes| {
-                    let end = bytes
-                        .iter()
-                        .position(|byte| *byte == 0)
-                        .unwrap_or(bytes.len());
-                    bytes[..end]
-                        .iter()
-                        .map(|byte| {
-                            if byte.is_ascii_graphic() || *byte == b' ' {
-                                char::from(*byte)
-                            } else {
-                                '\u{FFFD}'
-                            }
-                        })
-                        .collect::<String>()
-                })
+            let driver_name = decode_hex_bytes(&memory.data)
+                .map(|bytes| decode_utf16le_name(&bytes))
                 .filter(|name| !name.is_empty());
             json!({
                 "status": if driver_name.is_some() { "captured" } else { "pointer_present_name_unavailable" },
                 "pointer": pointer,
+                "buffer": buffer,
+                "length_bytes": length,
                 "driver_name": driver_name,
                 "memory": memory,
                 "detail": "KiBugCheckDriver is direct crash evidence only when the kernel recorded a non-null driver name.",
@@ -1242,9 +1267,35 @@ fn dump_bugcheck_driver(session: &DebuggerSession) -> Value {
         Err(error) => json!({
             "status": "unavailable",
             "pointer": pointer,
-            "detail": format!("DbgEng could not read the KiBugCheckDriver string: {error}"),
+            "buffer": buffer,
+            "detail": format!("DbgEng could not read the KiBugCheckDriver string buffer: {error}"),
         }),
     }
+}
+
+const MAX_BUGCHECK_DRIVER_NAME_BYTES: u32 = 520;
+
+/// Decode a target `UNICODE_STRING` header into `(Length, Buffer)`.
+fn decode_unicode_string_header(bytes: &[u8], pointer_size: u32) -> Option<(u16, u64)> {
+    let length = u16::from_le_bytes(bytes.get(0..2)?.try_into().ok()?);
+    let buffer = if pointer_size == 4 {
+        u64::from(u32::from_le_bytes(bytes.get(4..8)?.try_into().ok()?))
+    } else {
+        u64::from_le_bytes(bytes.get(8..16)?.try_into().ok()?)
+    };
+    Some((length, buffer))
+}
+
+fn decode_utf16le_name(bytes: &[u8]) -> String {
+    let units = bytes
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|pair| u16::from_le_bytes(*pair))
+        .take_while(|unit| *unit != 0);
+    char::decode_utf16(units)
+        .map(|unit| unit.unwrap_or(char::REPLACEMENT_CHARACTER))
+        .collect()
 }
 
 fn dump_pool_tracker_observation(
@@ -1755,6 +1806,8 @@ fn dump_evidence_grades(
     let tracker_classification = pool_tracker["classification"].as_str();
     let tracker_grade = match tracker_classification {
         Some("active_tracker_table_entry" | "supplied_tracker_table_entry") => "observed",
+        // Without a validated exception entry the dump holds no tracker evidence at all.
+        Some("no_validated_exception_entry_available") => "not_established",
         Some(_) => "possible",
         None => "not_established",
     };
@@ -2071,7 +2124,7 @@ fn dump_recommendations(bugcheck: &windbg_dbgeng::BugCheckDataResult) -> Value {
             "detail": "Capture a kernel or complete dump if the next crash needs bugcheck-specific triage.",
         }]);
     };
-    match data.code {
+    match canonical_bugcheck_code(data.code) {
         0x0000_003B => json!([
             {
                 "priority": "high",
@@ -2240,6 +2293,19 @@ mod tests {
             "exception_parameter_1_or_build_specific_context_candidate"
         );
         assert_eq!(dump_fault_address(&data), Some(0xFFFF_F800_E439_70B0));
+
+        let suffixed = windbg_dbgeng::BugCheckData {
+            code: 0x1000_001E,
+            ..data
+        };
+        assert_eq!(dump_fault_address(&suffixed), Some(0xFFFF_F800_E439_70B0));
+        let value = dump_bugcheck_value(&windbg_dbgeng::BugCheckDataResult {
+            status: "captured".to_string(),
+            data: Some(suffixed),
+            detail: "fixture".to_string(),
+        });
+        assert_eq!(value["name"], "KMODE_EXCEPTION_NOT_HANDLED");
+        assert_eq!(value["code"], 0x1000_001E);
     }
 
     #[test]
@@ -2380,6 +2446,53 @@ mod tests {
             pool_tracker_entry_provenance(&fault, Some(0x1000), None)["status"],
             "unvalidated"
         );
+    }
+
+    #[test]
+    fn bugcheck_driver_decodes_unicode_string_layouts() {
+        let mut x64 = vec![0_u8; 16];
+        x64[0..2].copy_from_slice(&18_u16.to_le_bytes());
+        x64[2..4].copy_from_slice(&20_u16.to_le_bytes());
+        x64[8..16].copy_from_slice(&0xFFFF_A001_2345_6780_u64.to_le_bytes());
+        assert_eq!(
+            decode_unicode_string_header(&x64, 8),
+            Some((18, 0xFFFF_A001_2345_6780))
+        );
+
+        let mut x86 = vec![0_u8; 8];
+        x86[0..2].copy_from_slice(&18_u16.to_le_bytes());
+        x86[4..8].copy_from_slice(&0x8123_4560_u32.to_le_bytes());
+        assert_eq!(
+            decode_unicode_string_header(&x86, 4),
+            Some((18, 0x8123_4560))
+        );
+        assert_eq!(decode_unicode_string_header(&x64[..12], 8), None);
+
+        let name = "mydrv.sys"
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .collect::<Vec<_>>();
+        assert_eq!(decode_utf16le_name(&name), "mydrv.sys");
+    }
+
+    #[test]
+    fn exception_record_scan_does_not_overflow_near_address_space_end() {
+        let mut bytes = vec![0_u8; 0x24];
+        bytes[4..8].copy_from_slice(&0xC000_0005_u32.to_le_bytes());
+        bytes[0x14..0x1C].copy_from_slice(&0x1234_u64.to_le_bytes());
+        let records = scan_x64_exception_records(u64::MAX - 1, &bytes, 0xC000_0005, 0x1234);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0]["record_address"], 2_u64);
+    }
+
+    #[test]
+    fn missing_tracker_entry_is_not_graded_as_possible() {
+        let grades = dump_evidence_grades(
+            &json!({}),
+            &json!({"classification": "no_validated_exception_entry_available"}),
+            &json!({"status": "not_set"}),
+        );
+        assert_eq!(grades["observations"][0]["grade"], "not_established");
     }
 
     #[test]

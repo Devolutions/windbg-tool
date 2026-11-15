@@ -50,7 +50,10 @@ fn instruction_classification(instruction: &Instruction, text: &str) -> Value {
         FlowControl::Interrupt | FlowControl::XbeginXabortXend => tags.push("control_transfer"),
         _ => tags.push("control_transfer"),
     }
-    if has_memory_operand(instruction) {
+    // LEA and multi-byte NOPs encode a memory operand but never dereference it.
+    if has_memory_operand(instruction)
+        && !matches!(instruction.mnemonic(), Mnemonic::Lea | Mnemonic::Nop)
+    {
         tags.push("memory_access");
     }
     let stack_related = lower.contains("rsp")
@@ -175,6 +178,23 @@ mod tests {
                     .is_some_and(|tags| tags.iter().any(|tag| tag == "stack_related"))),
             "{instructions:?}"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn lea_and_nop_are_not_tagged_memory_access() -> anyhow::Result<()> {
+        // lea rax, [rip+0x10]; nop dword [rax+rax]; mov rax, [rcx]
+        let bytes = hex_to_bytes("488d05100000000f1f4400004c8b01")?;
+        let instructions = disassemble_x64(0x140001000, &bytes, 3);
+        assert_eq!(instructions.len(), 3, "{instructions:?}");
+        let has_tag = |index: usize| {
+            instructions[index]["classification"]["tags"]
+                .as_array()
+                .is_some_and(|tags| tags.iter().any(|tag| tag == "memory_access"))
+        };
+        assert!(!has_tag(0), "{:?}", instructions[0]);
+        assert!(!has_tag(1), "{:?}", instructions[1]);
+        assert!(has_tag(2), "{:?}", instructions[2]);
         Ok(())
     }
 }

@@ -1078,6 +1078,13 @@ pub async fn call(state: &mut ServiceState, call: ToolCall) -> anyhow::Result<Va
 }
 
 fn parse<T: for<'de> Deserialize<'de>>(value: Value) -> anyhow::Result<T> {
+    // `ToolCall.arguments` defaults to null when a caller omits it; a struct
+    // cannot deserialize from null, so treat it as an empty argument object.
+    let value = if value.is_null() {
+        Value::Object(Default::default())
+    } else {
+        value
+    };
     serde_json::from_value(value).context("invalid tool arguments")
 }
 
@@ -1137,7 +1144,12 @@ fn tool_is_read_only(name: &str) -> bool {
 fn tool_is_destructive(name: &str) -> bool {
     matches!(
         name,
-        "ttd_close_trace" | "job_cancel" | "target_close" | "target_terminate"
+        "ttd_close_trace"
+            | "job_cancel"
+            | "target_close"
+            | "target_terminate"
+            // `overwrite: true` truncates an existing file at `path`.
+            | "target_write_dump"
     )
 }
 
@@ -1228,6 +1240,12 @@ fn tool_is_open_world(name: &str) -> bool {
             | "pe_exports"
             | "source_resolve"
             | "target_write_dump"
+            // Dump targets prefetch images/PDBs from the public symbol server
+            // (unless opened offline) before resolving an address.
+            | "target_symbol_by_offset"
+            | "target_source_by_offset"
+            | "target_disassemble"
+            | "symbols_doctor"
     )
 }
 
@@ -1241,3 +1259,24 @@ fn input_schema<T: JsonSchema>() -> JsonObject {
 
 #[allow(dead_code)]
 fn _position_schema_anchor(_: Position) {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn omitted_arguments_parse_as_empty_object() {
+        assert!(parse::<EmptyArgs>(Value::Null).is_ok());
+        let recipes = parse::<RecipesArgs>(Value::Null).expect("all-optional args");
+        assert!(recipes.topic.is_none());
+        assert!(parse::<SessionArg>(Value::Null).is_err());
+    }
+
+    #[test]
+    fn annotations_flag_overwriting_and_network_tools() {
+        assert!(tool_is_destructive("target_write_dump"));
+        assert!(tool_is_open_world("target_symbol_by_offset"));
+        assert!(tool_is_open_world("target_source_by_offset"));
+        assert!(!tool_is_open_world("target_read_memory"));
+    }
+}

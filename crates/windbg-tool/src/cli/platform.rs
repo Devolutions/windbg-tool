@@ -84,7 +84,7 @@ pub(super) fn run_live_startup_break(
     let module_load_filter = args
         .wait_for_module
         .as_deref()
-        .map(validate_module_load_filter)
+        .map(|module| validate_module_load_filter(module, "--wait-for-module"))
         .transpose()?;
     validate_startup_breakpoint_mode(args.hardware_execute, &breakpoint_spec)?;
     let session = launch_live_session(LiveLaunchSessionOptions {
@@ -208,11 +208,7 @@ pub(super) fn run_live_startup_break(
         LiveLaunchEnd::Detach => session.detach(),
         LiveLaunchEnd::Terminate => session.terminate(),
     };
-    match (result, cleanup) {
-        (Ok(result), Ok(())) => print_value(result, output),
-        (Err(error), _) => Err(error),
-        (Ok(_), Err(error)) => Err(error).context("failed to end the live debug session"),
-    }
+    finish_live_session_result(result, cleanup, output)
 }
 
 const STARTUP_PROFILE_CORECLR_MODULE: &str = "coreclr.dll";
@@ -323,12 +319,12 @@ pub(super) fn run_live_startup_profile(
     let phase_module = args
         .phase_module
         .as_deref()
-        .map(validate_module_load_filter)
+        .map(|module| validate_module_load_filter(module, "--phase-module"))
         .transpose()?;
     let completion_module = args
         .completion_module
         .as_deref()
-        .map(validate_module_load_filter)
+        .map(|module| validate_module_load_filter(module, "--completion-module"))
         .transpose()?;
     let observed_phase_module = phase_module
         .as_deref()
@@ -339,19 +335,7 @@ pub(super) fn run_live_startup_profile(
         "--runs greater than one requires --end terminate so a bounded run cannot leave a detached target behind"
     );
     if let Some(path) = args.output.as_deref() {
-        ensure!(
-            !path.exists(),
-            "refusing to overwrite startup-profile artifact {}",
-            path.display()
-        );
-        let parent = path
-            .parent()
-            .context("startup-profile artifact path must have a parent directory")?;
-        ensure!(
-            parent.is_dir(),
-            "startup-profile artifact directory does not exist: {}",
-            parent.display()
-        );
+        validate_new_artifact_path(path, "startup-profile")?;
     }
 
     let mut runs = Vec::with_capacity(args.runs as usize);
@@ -382,7 +366,7 @@ pub(super) fn run_live_startup_profile(
                 runs.push(json!({
                     "run": run_index,
                     "status": "failed",
-                    "error": error.to_string()
+                    "error": format!("{error:#}")
                 }));
                 break;
             }
@@ -432,7 +416,7 @@ pub(super) fn run_live_startup_profile(
         ]
     });
     if let Some(path) = args.output {
-        fs::write(&path, serde_json::to_vec_pretty(&result)?)
+        write_new_artifact(&path, &serde_json::to_vec_pretty(&result)?)
             .with_context(|| format!("writing startup-profile artifact {}", path.display()))?;
         result["artifact"] = json!({
             "path": path,
@@ -512,19 +496,7 @@ pub(super) fn run_live_startup_report(
         );
     }
     if let Some(path) = args.output.as_deref() {
-        ensure!(
-            !path.exists(),
-            "refusing to overwrite startup-report artifact {}",
-            path.display()
-        );
-        let parent = path
-            .parent()
-            .context("startup-report artifact path must have a parent directory")?;
-        ensure!(
-            parent.is_dir(),
-            "startup-report artifact directory does not exist: {}",
-            parent.display()
-        );
+        validate_new_artifact_path(path, "startup-report")?;
     }
 
     let artifact = read_startup_profile_artifact(&args.artifact, "report source")?;
@@ -538,7 +510,7 @@ pub(super) fn run_live_startup_report(
     };
     let mut report = startup_profile_module_report(&artifact, &filters)?;
     if let Some(path) = args.output {
-        fs::write(&path, serde_json::to_vec_pretty(&report)?)
+        write_new_artifact(&path, &serde_json::to_vec_pretty(&report)?)
             .with_context(|| format!("writing startup-report artifact {}", path.display()))?;
         report["report_artifact"] = json!({
             "path": path,
@@ -566,6 +538,50 @@ pub(super) fn run_live_startup_report(
 struct StartupProfileArtifact {
     value: Value,
     summary: Value,
+}
+
+fn validate_new_artifact_path(path: &Path, role: &str) -> anyhow::Result<()> {
+    ensure!(
+        !path.exists(),
+        "refusing to overwrite {role} artifact {}",
+        path.display()
+    );
+    // A bare relative file name has an empty parent, which means the current directory.
+    let parent = path
+        .parent()
+        .map(|parent| {
+            if parent.as_os_str().is_empty() {
+                Path::new(".")
+            } else {
+                parent
+            }
+        })
+        .with_context(|| format!("{role} artifact path must have a parent directory"))?;
+    ensure!(
+        parent.is_dir(),
+        "{role} artifact directory does not exist: {}",
+        parent.display()
+    );
+    Ok(())
+}
+
+fn write_new_artifact(path: &Path, contents: &[u8]) -> anyhow::Result<()> {
+    use std::io::Write as _;
+
+    // create_new keeps the earlier refuse-to-overwrite check true even if the path
+    // appeared while a long startup profile was being collected.
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .with_context(|| {
+            format!(
+                "creating new artifact {} (existing files are never overwritten)",
+                path.display()
+            )
+        })?;
+    file.write_all(contents)?;
+    Ok(())
 }
 
 fn read_startup_profile_artifact(
@@ -917,7 +933,9 @@ fn startup_profile_report_row_matches(row: &Value, filters: &StartupProfileRepor
     let Some(filter) = filters.module_substring.as_deref() else {
         return true;
     };
-    let filter = filter.to_ascii_lowercase();
+    // Image paths in the artifact are normalized to forward slashes, so a Windows-style
+    // filter such as `Program\App.dll` must be normalized the same way to match.
+    let filter = normalize_startup_profile_path(filter).to_ascii_lowercase();
     ["basename", "module_name", "image_path"]
         .into_iter()
         .filter_map(|field| row["module"][field].as_str())
@@ -1369,14 +1387,31 @@ fn collect_startup_profile_run(
             run.cleanup = json!({
                 "action": end,
                 "status": "error",
-                "error": error.to_string()
+                "error": format!("{error:#}")
             });
             Ok(run)
         }
         (Err(error), Ok(_)) => Err(error),
         (Err(error), Err(cleanup_error)) => Err(error).context(format!(
-            "also failed to end the live debug session: {cleanup_error}"
+            "also failed to end the live debug session: {cleanup_error:#}"
         )),
+    }
+}
+
+fn finish_live_session_result(
+    result: anyhow::Result<Value>,
+    cleanup: anyhow::Result<()>,
+    output: &OutputOptions,
+) -> anyhow::Result<()> {
+    match (result, cleanup) {
+        (Ok(result), Ok(())) => print_value(result, output),
+        (Err(error), Ok(())) => Err(error),
+        // Keep the cleanup failure visible: the target may still be running or stopped
+        // under a debugger that windbg-tool no longer controls.
+        (Err(error), Err(cleanup_error)) => Err(error).context(format!(
+            "also failed to end the live debug session: {cleanup_error:#}"
+        )),
+        (Ok(_), Err(error)) => Err(error).context("failed to end the live debug session"),
     }
 }
 
@@ -3055,11 +3090,7 @@ pub(super) fn run_live_managed_break(
         LiveLaunchEnd::Detach => session.detach(),
         LiveLaunchEnd::Terminate => session.terminate(),
     };
-    match (result, cleanup) {
-        (Ok(result), Ok(())) => print_value(result, output),
-        (Err(error), _) => Err(error),
-        (Ok(_), Err(error)) => Err(error).context("failed to end the live debug session"),
-    }
+    finish_live_session_result(result, cleanup, output)
 }
 
 fn run_live_managed_hardware_break(
@@ -3235,11 +3266,7 @@ fn run_live_managed_hardware_break(
         LiveLaunchEnd::Detach => session.detach(),
         LiveLaunchEnd::Terminate => session.terminate(),
     };
-    match (result, cleanup) {
-        (Ok(result), Ok(())) => print_value(result, output),
-        (Err(error), _) => Err(error),
-        (Ok(_), Err(error)) => Err(error).context("failed to end the live debug session"),
-    }
+    finish_live_session_result(result, cleanup, output)
 }
 
 fn continue_to_dbgeng_module_load(
@@ -3331,6 +3358,10 @@ fn wait_for_managed_code_breakpoint(
         let wait = session
             .wait_for_event(remaining_ms)
             .context("waiting for the managed code breakpoint")?;
+        ensure!(
+            wait.name.as_deref() != Some("timeout"),
+            "timed out waiting for the managed code breakpoint"
+        );
         let event = session
             .last_event()
             .context("reading the managed code breakpoint event")?;
@@ -3376,15 +3407,15 @@ fn wait_for_managed_code_breakpoint(
     )
 }
 
-fn validate_module_load_filter(value: &str) -> anyhow::Result<String> {
+fn validate_module_load_filter(value: &str, argument: &str) -> anyhow::Result<String> {
     let value = value.trim();
-    ensure!(!value.is_empty(), "--wait-for-module must not be empty");
+    ensure!(!value.is_empty(), "{argument} must not be empty");
     ensure!(
         value
             .chars()
             .all(|character| character.is_ascii_alphanumeric()
                 || matches!(character, '.' | '_' | '-')),
-        "--wait-for-module must be a module basename"
+        "{argument} must be a module basename"
     );
     Ok(value.to_string())
 }
@@ -3453,6 +3484,14 @@ fn parse_managed_method_signature(value: Option<&str>) -> anyhow::Result<Option<
         }),
         "--signature must contain hexadecimal byte pairs separated only by whitespace, '-', '_', or ':'"
     );
+    // A separator must not split a byte: "0-E 1-2" is not the byte sequence 0E 12.
+    ensure!(
+        value
+            .split(|character: char| character.is_ascii_whitespace()
+                || matches!(character, '-' | '_' | ':'))
+            .all(|group| group.len() % 2 == 0),
+        "--signature must contain complete hexadecimal byte pairs between separators"
+    );
     let hexadecimal = value
         .chars()
         .filter(|character| character.is_ascii_hexdigit())
@@ -3489,7 +3528,7 @@ fn format_managed_method_signature(signature: &[u8]) -> String {
 }
 
 fn validate_managed_module(value: &str) -> anyhow::Result<String> {
-    let path = validate_module_load_filter(value)?;
+    let path = validate_module_load_filter(value, "--managed-module")?;
     ensure!(
         Path::new(&path)
             .extension()
@@ -3541,6 +3580,10 @@ fn wait_for_dbgeng_managed_module_load(
         let wait = session
             .wait_for_event(remaining_ms)
             .context("waiting for the managed module-load event")?;
+        ensure!(
+            wait.name.as_deref() != Some("timeout"),
+            "timed out waiting for DbgEng's managed module-load event"
+        );
         let event = session
             .last_event()
             .context("reading the managed module-load event")?;
@@ -3607,6 +3650,10 @@ fn wait_for_managed_module_in_dac(
         let wait = session
             .wait_for_event(remaining_ms)
             .context("waiting for the next CLR managed-module notification")?;
+        ensure!(
+            wait.name.as_deref() != Some("timeout"),
+            "timed out waiting for the CLR to register the selected managed module"
+        );
         let event = session
             .last_event()
             .context("reading the CLR managed-module notification")?;
@@ -3659,6 +3706,10 @@ fn startup_breakpoint_spec(args: &LiveStartupBreakArgs) -> anyhow::Result<Startu
     ensure!(
         selections == 1,
         "specify exactly one of --initial-break, --address, --module with --module-offset, or --symbol"
+    );
+    ensure!(
+        args.module.is_none() || args.module_offset.is_some(),
+        "--module is used only with --module-offset; it does not scope --address or --symbol"
     );
     if args.initial_break {
         return Ok(StartupBreakpointSpec::InitialBreak);
@@ -4454,6 +4505,13 @@ fn find_enabled_sudo() -> anyhow::Result<Option<(PathBuf, WindowsSudoMode)>> {
         .arg("config")
         .output()
         .context("checking Windows sudo configuration")?;
+    // A disabled sudo is "unavailable", which lets the caller explain how to elevate,
+    // rather than an unrecognized configuration or a failed configuration check.
+    if windows_sudo_reports_disabled(&String::from_utf8_lossy(&output.stdout))
+        || windows_sudo_reports_disabled(&String::from_utf8_lossy(&output.stderr))
+    {
+        return Ok(None);
+    }
     ensure!(
         output.status.success(),
         "Windows sudo configuration check failed: {}",
@@ -4463,6 +4521,14 @@ fn find_enabled_sudo() -> anyhow::Result<Option<(PathBuf, WindowsSudoMode)>> {
         "Windows sudo returned an unrecognized configuration; run `sudo config` to inspect it",
     )?;
     Ok(Some((sudo, mode)))
+}
+
+fn windows_sudo_reports_disabled(output: &str) -> bool {
+    // "Disable Input" normalizes to "disableinput", so only the "disabled" state matches.
+    output
+        .to_ascii_lowercase()
+        .replace([' ', '-'], "")
+        .contains("disabled")
 }
 
 fn parse_windows_sudo_mode(output: &str) -> Option<WindowsSudoMode> {
@@ -5830,5 +5896,114 @@ mod tests {
         assert_eq!(excluded.len(), 1);
         assert_eq!(excluded[0].start.index, 2);
         assert_eq!(excluded[0].end.index, 3);
+    }
+
+    #[test]
+    fn new_artifact_paths_accept_bare_file_names_and_never_overwrite() {
+        let bare = PathBuf::from(format!(
+            "windbg-tool-artifact-{}-{}.json",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        validate_new_artifact_path(&bare, "startup-profile").unwrap();
+
+        let temp = test_directory();
+        fs::create_dir_all(&temp).unwrap();
+        let existing = temp.join("existing.json");
+        fs::write(&existing, b"original").unwrap();
+        assert!(validate_new_artifact_path(&existing, "startup-profile").is_err());
+        assert!(write_new_artifact(&existing, b"replacement").is_err());
+        assert_eq!(fs::read(&existing).unwrap(), b"original");
+        assert!(validate_new_artifact_path(
+            &temp.join("missing").join("a.json"),
+            "startup-profile"
+        )
+        .is_err());
+        let fresh = temp.join("fresh.json");
+        write_new_artifact(&fresh, b"{}").unwrap();
+        assert_eq!(fs::read(&fresh).unwrap(), b"{}");
+        fs::remove_dir_all(temp).unwrap();
+    }
+
+    #[test]
+    fn startup_report_module_filter_matches_windows_style_paths() {
+        let row = json!({
+            "classification": ["rdm_application_path"],
+            "resumed_wall_elapsed_ms": 10,
+            "module": {
+                "basename": "RemoteDesktopManager.dll",
+                "image_path": "D:/RDM/RemoteDesktopManager/Program/RemoteDesktopManager.dll"
+            }
+        });
+        let filters = StartupProfileReportFilters {
+            run: 1,
+            module_substring: Some(r"program\remotedesktopmanager".to_string()),
+            runtime_only: false,
+            rdm_only: false,
+            min_resumed_ms: None,
+            max_rows: 8,
+        };
+        assert!(startup_profile_report_row_matches(&row, &filters));
+    }
+
+    #[test]
+    fn module_load_filter_errors_name_the_offending_argument() {
+        let error = validate_module_load_filter("C:\\x\\app.dll", "--completion-module")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("--completion-module"), "{error}");
+        let error = validate_managed_module(" ").unwrap_err().to_string();
+        assert!(error.contains("--managed-module"), "{error}");
+    }
+
+    #[test]
+    fn managed_signature_separators_must_not_split_bytes() {
+        assert!(parse_managed_method_signature(Some("0-0")).is_err());
+        assert!(parse_managed_method_signature(Some("0 E 1 2")).is_err());
+        assert_eq!(
+            parse_managed_method_signature(Some("000E 01")).unwrap(),
+            Some(vec![0x00, 0x0e, 0x01])
+        );
+    }
+
+    #[test]
+    fn startup_breakpoint_rejects_module_without_module_offset() {
+        let args = LiveStartupBreakArgs {
+            command_line: "target.exe".to_string(),
+            initial_break: false,
+            hardware_execute: false,
+            address: None,
+            module: Some("target.dll".to_string()),
+            module_offset: None,
+            symbol: Some("target!entry".to_string()),
+            wait_for_module: None,
+            initial_break_timeout_ms: 5000,
+            wait_timeout_ms: 10000,
+            max_frames: 16,
+            end: "terminate".to_string(),
+        };
+        assert!(startup_breakpoint_spec(&args).is_err());
+    }
+
+    #[test]
+    fn detects_disabled_windows_sudo() {
+        assert!(windows_sudo_reports_disabled(
+            "Sudo is currently in Disabled mode on this machine"
+        ));
+        assert!(windows_sudo_reports_disabled(
+            "Sudo is disabled on this machine. To enable it, go to the Developer Settings page"
+        ));
+        assert!(!windows_sudo_reports_disabled(
+            "Sudo is currently in Disable Input mode"
+        ));
+        assert!(!windows_sudo_reports_disabled(
+            "Sudo is currently in Input Closed mode"
+        ));
+        assert!(!windows_sudo_reports_disabled(
+            "Sudo is currently in Inline mode"
+        ));
     }
 }

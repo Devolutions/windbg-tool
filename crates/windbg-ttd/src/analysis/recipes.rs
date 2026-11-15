@@ -235,9 +235,9 @@ pub fn recipes_manifest() -> Value {
                 "Use dump_pool_triage when pool tracker / free-list corruption is suspected."
             ],
             "commands": [
-                "windbg-tool dump inspect --path <dump>",
-                "windbg-tool dump triage --path <dump>",
-                "windbg-tool dump pool-triage --path <dump>"
+                "windbg-tool dump inspect <dump>",
+                "windbg-tool dump triage <dump>",
+                "windbg-tool dump pool-triage <dump>"
             ],
             "mcp_tools": ["dump_inspect", "dump_triage", "dump_pool_triage", "dump_open_session", "target_stack_recover"]
         }
@@ -287,5 +287,17 @@ mod tests {
         assert_eq!(by_id["recipes"].as_array().unwrap().len(), 1);
         let by_tag = recipes_value(Some("ttd")).unwrap();
         assert!(by_tag["recipes"].as_array().unwrap().len() >= 2);
+    }
+
+    #[test]
+    fn dump_recipe_commands_use_positional_dump_path() {
+        let dump = recipes_value(Some("dump-triage")).unwrap();
+        let commands = dump["recipes"][0]["commands"].as_array().unwrap();
+        assert!(!commands.is_empty());
+        for command in commands {
+            let command = command.as_str().unwrap();
+            assert!(!command.contains("--path"), "{command}");
+            assert!(command.ends_with(" <dump>"), "{command}");
+        }
     }
 }

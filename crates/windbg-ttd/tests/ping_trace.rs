@@ -7,9 +7,9 @@ use common::{
 use windbg_ttd::ttd_replay::{
     AddressClassification, AddressInfoRequest, LoadTraceRequest, MemoryAccessDirection,
     MemoryAccessMask, MemoryBufferRequest, MemoryRangeRequest, MemoryWatchpointRequest,
-    ModuleInfoRequest, Position, PositionOrPercent, PositionRequest, QueryMemoryPolicy,
-    ReadMemoryRequest, RegisterContextRequest, SessionRegistry, StackReadRequest, StepDirection,
-    StepKind, StepRequest, TraceInfo,
+    ModuleEventKind, ModuleInfoRequest, Position, PositionOrPercent, PositionRequest,
+    QueryMemoryPolicy, ReadMemoryRequest, RegisterContextRequest, SessionRegistry,
+    StackReadRequest, StepDirection, StepKind, StepRequest, TraceInfo,
 };
 
 #[test]
@@ -284,6 +284,16 @@ fn assert_native_timeline_lists(
         "module event list should include ping.exe lifecycle data"
     );
     for event in &module_events.events {
+        if event.kind == ModuleEventKind::Load {
+            // Modules mapped before recording began (the image, ntdll, ...) are reported at
+            // sequences ahead of the first replayable position, so only bound them by the end.
+            assert!(
+                !position_after(event.position, info.lifetime_end),
+                "module load {event:?} is after trace end {:?}",
+                info.lifetime_end
+            );
+            continue;
+        }
         assert_position_in_range(event.position, info.lifetime_start, info.lifetime_end);
     }
 

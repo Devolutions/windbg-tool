@@ -1,5 +1,5 @@
 param(
-    [string] $OutDir = "..\target\ttd-runtime",
+    [string] $OutDir = (Join-Path $PSScriptRoot "..\target\ttd-runtime"),
     [ValidateSet("x64", "x86", "arm64")]
     [string] $Arch = "x64",
     [string] $MsixBundle = ""
