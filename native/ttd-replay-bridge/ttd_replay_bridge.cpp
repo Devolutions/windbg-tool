@@ -447,6 +447,36 @@ TTD_MCP_EXPORT TtdMcpStatus ttd_mcp_build_index(TtdMcpTrace* trace, uint32_t fla
     return TTD_MCP_OK;
 }
 
+// Newer TTD runtimes use {SequenceId::Max, 0} as a sentinel: it terminates the keyframe list and
+// marks module unloads and thread exits that never happened inside the trace. It is not a
+// replayable position (it lies past the trace's last position), so callers must not see it.
+static bool is_real_position(TTD::Replay::Position const& position) {
+    return position.Sequence < TTD::SequenceId::Max;
+}
+
+template <typename Event>
+static size_t count_real_events(Event const* events, size_t total) {
+    size_t count = 0;
+    for (size_t index = 0; index < total; ++index) {
+        if (is_real_position(events[index].Position)) {
+            ++count;
+        }
+    }
+    return count;
+}
+
+static size_t real_keyframe_count(TtdMcpTrace* trace) {
+    TTD::Replay::Position const* const keyframes = trace->engine->GetKeyframeList();
+    size_t const total = trace->engine->GetKeyframeCount();
+    size_t count = 0;
+    for (size_t index = 0; index < total; ++index) {
+        if (is_real_position(keyframes[index])) {
+            ++count;
+        }
+    }
+    return count;
+}
+
 TTD_MCP_EXPORT TtdMcpStatus ttd_mcp_trace_info(TtdMcpTrace* trace, TtdMcpTraceInfo* info) {
     if (trace == nullptr || info == nullptr) {
         set_error("trace and info pointers are required");
@@ -467,7 +497,7 @@ TTD_MCP_EXPORT TtdMcpStatus ttd_mcp_trace_info(TtdMcpTrace* trace, TtdMcpTraceIn
         static_cast<uint32_t>(trace->engine->GetModuleCount()),
         static_cast<uint32_t>(trace->engine->GetModuleInstanceCount()),
         static_cast<uint32_t>(trace->engine->GetExceptionEventCount()),
-        static_cast<uint32_t>(trace->engine->GetKeyframeCount()),
+        static_cast<uint32_t>(real_keyframe_count(trace)),
     };
     return TTD_MCP_OK;
 }
@@ -571,7 +601,7 @@ TTD_MCP_EXPORT TtdMcpStatus ttd_mcp_list_keyframes(TtdMcpTrace* trace, TtdMcpPos
     }
 
     std::scoped_lock lock(trace->mutex);
-    size_t const required = trace->engine->GetKeyframeCount();
+    size_t const required = real_keyframe_count(trace);
     TtdMcpStatus const count_status = set_required_count(required, count);
     if (count_status != TTD_MCP_OK) {
         return count_status;
@@ -582,8 +612,12 @@ TTD_MCP_EXPORT TtdMcpStatus ttd_mcp_list_keyframes(TtdMcpTrace* trace, TtdMcpPos
     }
 
     TTD::Replay::Position const* const source = trace->engine->GetKeyframeList();
-    for (size_t index = 0; index < required; ++index) {
-        keyframes[index] = to_bridge_position(source[index]);
+    size_t const total = trace->engine->GetKeyframeCount();
+    size_t written = 0;
+    for (size_t index = 0; index < total && written < required; ++index) {
+        if (is_real_position(source[index])) {
+            keyframes[written++] = to_bridge_position(source[index]);
+        }
     }
 
     return TTD_MCP_OK;
@@ -596,9 +630,11 @@ TTD_MCP_EXPORT TtdMcpStatus ttd_mcp_list_module_events(TtdMcpTrace* trace, TtdMc
     }
 
     std::scoped_lock lock(trace->mutex);
-    size_t const loaded_count = trace->engine->GetModuleLoadedEventCount();
-    size_t const unloaded_count = trace->engine->GetModuleUnloadedEventCount();
-    size_t const required = loaded_count + unloaded_count;
+    TTD::Replay::ModuleLoadedEvent const* const loaded = trace->engine->GetModuleLoadedEventList();
+    size_t const loaded_total = trace->engine->GetModuleLoadedEventCount();
+    TTD::Replay::ModuleUnloadedEvent const* const unloaded = trace->engine->GetModuleUnloadedEventList();
+    size_t const unloaded_total = trace->engine->GetModuleUnloadedEventCount();
+    size_t const required = count_real_events(loaded, loaded_total) + count_real_events(unloaded, unloaded_total);
     TtdMcpStatus const count_status = set_required_count(required, count);
     if (count_status != TTD_MCP_OK) {
         return count_status;
@@ -608,27 +644,32 @@ TTD_MCP_EXPORT TtdMcpStatus ttd_mcp_list_module_events(TtdMcpTrace* trace, TtdMc
         return TTD_MCP_OK;
     }
 
-    TTD::Replay::ModuleLoadedEvent const* const loaded = trace->engine->GetModuleLoadedEventList();
-    for (size_t index = 0; index < loaded_count; ++index) {
+    size_t written = 0;
+    for (size_t index = 0; index < loaded_total; ++index) {
         TTD::Replay::ModuleLoadedEvent const& event = loaded[index];
+        if (!is_real_position(event.Position)) {
+            continue;
+        }
         TtdMcpModuleEventInfo output = {};
         output.kind = 0;
         output.position = to_bridge_position(event.Position);
         output.module = to_bridge_module(event.pModule);
         output.module.load_position = output.position;
-        events[index] = output;
+        events[written++] = output;
     }
 
-    TTD::Replay::ModuleUnloadedEvent const* const unloaded = trace->engine->GetModuleUnloadedEventList();
-    for (size_t index = 0; index < unloaded_count; ++index) {
+    for (size_t index = 0; index < unloaded_total; ++index) {
         TTD::Replay::ModuleUnloadedEvent const& event = unloaded[index];
+        if (!is_real_position(event.Position)) {
+            continue;
+        }
         TtdMcpModuleEventInfo output = {};
         output.kind = 1;
         output.position = to_bridge_position(event.Position);
         output.module = to_bridge_module(event.pModule);
         output.module.unload_position = output.position;
         output.module.has_unload_position = 1;
-        events[loaded_count + index] = output;
+        events[written++] = output;
     }
 
     return TTD_MCP_OK;
@@ -641,9 +682,11 @@ TTD_MCP_EXPORT TtdMcpStatus ttd_mcp_list_thread_events(TtdMcpTrace* trace, TtdMc
     }
 
     std::scoped_lock lock(trace->mutex);
-    size_t const created_count = trace->engine->GetThreadCreatedEventCount();
-    size_t const terminated_count = trace->engine->GetThreadTerminatedEventCount();
-    size_t const required = created_count + terminated_count;
+    TTD::Replay::ThreadCreatedEvent const* const created = trace->engine->GetThreadCreatedEventList();
+    size_t const created_total = trace->engine->GetThreadCreatedEventCount();
+    TTD::Replay::ThreadTerminatedEvent const* const terminated = trace->engine->GetThreadTerminatedEventList();
+    size_t const terminated_total = trace->engine->GetThreadTerminatedEventCount();
+    size_t const required = count_real_events(created, created_total) + count_real_events(terminated, terminated_total);
     TtdMcpStatus const count_status = set_required_count(required, count);
     if (count_status != TTD_MCP_OK) {
         return count_status;
@@ -653,28 +696,33 @@ TTD_MCP_EXPORT TtdMcpStatus ttd_mcp_list_thread_events(TtdMcpTrace* trace, TtdMc
         return TTD_MCP_OK;
     }
 
-    TTD::Replay::ThreadCreatedEvent const* const created = trace->engine->GetThreadCreatedEventList();
-    for (size_t index = 0; index < created_count; ++index) {
+    size_t written = 0;
+    for (size_t index = 0; index < created_total; ++index) {
         TTD::Replay::ThreadCreatedEvent const& event = created[index];
+        if (!is_real_position(event.Position)) {
+            continue;
+        }
         TtdMcpThreadEventInfo output = {};
         output.kind = 0;
         output.position = to_bridge_position(event.Position);
         if (event.pThreadInfo != nullptr) {
             output.thread = to_bridge_thread(*event.pThreadInfo);
         }
-        events[index] = output;
+        events[written++] = output;
     }
 
-    TTD::Replay::ThreadTerminatedEvent const* const terminated = trace->engine->GetThreadTerminatedEventList();
-    for (size_t index = 0; index < terminated_count; ++index) {
+    for (size_t index = 0; index < terminated_total; ++index) {
         TTD::Replay::ThreadTerminatedEvent const& event = terminated[index];
+        if (!is_real_position(event.Position)) {
+            continue;
+        }
         TtdMcpThreadEventInfo output = {};
         output.kind = 1;
         output.position = to_bridge_position(event.Position);
         if (event.pThreadInfo != nullptr) {
             output.thread = to_bridge_thread(*event.pThreadInfo);
         }
-        events[created_count + index] = output;
+        events[written++] = output;
     }
 
     return TTD_MCP_OK;

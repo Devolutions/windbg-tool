@@ -617,7 +617,9 @@ mod tests {
         let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let port = listener.local_addr().unwrap().port();
         // "localhost" commonly resolves to ::1 first; the IPv4 listener must still be found.
-        let probe = connect_probe("localhost", port, 1000).unwrap();
+        // The timeout applies per address and a refused ::1 connect can consume all of it on
+        // Windows, so keep it generous enough that a loaded test machine cannot flake.
+        let probe = connect_probe("localhost", port, 10_000).unwrap();
         assert_eq!(probe["status"], "ok", "{probe}");
     }
 }
