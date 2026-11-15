@@ -862,8 +862,7 @@ impl SessionRegistry {
         &mut self,
         request: MemoryWatchpointRequest,
     ) -> anyhow::Result<MemoryWatchpointResponse> {
-        ensure!(request.size > 0, "size must be greater than zero");
-        ensure!(request.address != 0, "address must be non-zero");
+        validate_memory_watchpoint_request(&request)?;
         let cursor = self.cursor_mut(request.session_id, request.cursor_id)?;
         let Some(native) = cursor.native.as_ref() else {
             bail!("ttd_memory_watchpoint requires a native TTD replay cursor")
@@ -908,6 +907,27 @@ impl SessionRegistry {
             .get_mut(&cursor_id)
             .ok_or_else(|| anyhow::anyhow!("unknown cursor id: {cursor_id}"))
     }
+}
+
+fn validate_memory_watchpoint_request(request: &MemoryWatchpointRequest) -> anyhow::Result<()> {
+    ensure!(request.size > 0, "size must be greater than zero");
+    ensure!(request.address != 0, "address must be non-zero");
+    ensure!(
+        request
+            .address
+            .checked_add(u64::from(request.size) - 1)
+            .is_some(),
+        "watchpoint address range overflows the guest address space"
+    );
+    if let Some(thread_unique_id) = request.thread_unique_id {
+        // The native bridge narrows this to TTD's 32-bit UniqueThreadId; reject values
+        // that would otherwise be truncated into a different thread's id.
+        ensure!(
+            thread_unique_id <= u32::MAX as u64,
+            "thread_unique_id is outside the native TTD range"
+        );
+    }
+    Ok(())
 }
 
 fn read_exact_memory(
@@ -1065,12 +1085,19 @@ fn module_name_matches(module: &TraceModule, query: &str) -> bool {
 fn parse_address(address: &str) -> anyhow::Result<u64> {
     let trimmed = address.trim();
     ensure!(!trimmed.is_empty(), "address must not be empty");
+    // Accept WinDbg-formatted addresses such as 0x00007ff6`12340000.
+    let cleaned = trimmed.replace('`', "");
+    let trimmed = cleaned.as_str();
     let (digits, radix) = trimmed
         .strip_prefix("0x")
         .or_else(|| trimmed.strip_prefix("0X"))
         .map(|hex| (hex, 16))
         .unwrap_or((trimmed, 10));
     ensure!(!digits.is_empty(), "address must include digits");
+    ensure!(
+        !digits.starts_with(['+', '-']),
+        "address must not have a sign prefix"
+    );
     u64::from_str_radix(digits, radix)
         .map_err(|error| anyhow::anyhow!("invalid address {address:?}: {error}"))
 }
@@ -1189,7 +1216,7 @@ fn try_open_native_trace(
     let index_status = native
         .index_status(0)
         .map(|status| status.status)
-        .unwrap_or_else(|_| "loaded".to_string());
+        .unwrap_or_else(|_| "unknown".to_string());
     let trace_file = trace_metadata
         .as_ref()
         .map(|metadata| metadata.file.clone());
@@ -1369,6 +1396,38 @@ mod tests {
         assert!(module_name_matches(&module, " ping "));
         assert!(!module_name_matches(&module, ""));
         assert!(!module_name_matches(&module, "   "));
+    }
+
+    #[test]
+    fn rejects_watchpoints_that_would_be_truncated_or_wrap() {
+        let request =
+            |address: u64, size: u32, thread_unique_id: Option<u64>| MemoryWatchpointRequest {
+                session_id: 1,
+                cursor_id: 1,
+                address,
+                size,
+                access: MemoryAccessMask::Write,
+                direction: MemoryAccessDirection::Previous,
+                thread_unique_id,
+            };
+        assert!(validate_memory_watchpoint_request(&request(0x1000, 8, Some(3))).is_ok());
+        assert!(validate_memory_watchpoint_request(&request(u64::MAX - 7, 8, None)).is_ok());
+        assert!(validate_memory_watchpoint_request(&request(u64::MAX - 6, 8, None)).is_err());
+        assert!(
+            validate_memory_watchpoint_request(&request(0x1000, 8, Some(u32::MAX as u64 + 3)))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn parses_windbg_formatted_addresses() {
+        assert_eq!(
+            parse_address("0x00007ff6`12340000").unwrap(),
+            0x0000_7ff6_1234_0000
+        );
+        assert_eq!(parse_address("4096").unwrap(), 4096);
+        assert!(parse_address("+4096").is_err());
+        assert!(parse_address("0x+10").is_err());
     }
 
     #[test]

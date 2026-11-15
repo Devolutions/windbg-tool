@@ -255,7 +255,8 @@ pub fn qword_values(address: u64, bytes: &[u8]) -> Value {
 }
 
 pub fn plausible_x64_pointer(value: u64) -> bool {
-    value != 0
+    // The low 64 KiB is never mapped on Windows; small integers are not pointers.
+    value >= 0x10000
         && value.is_multiple_of(8)
         && !(0x0000_8000_0000_0000..0xffff_8000_0000_0000).contains(&value)
 }
@@ -324,6 +325,18 @@ mod tests {
                     .any(|item| item["plausible_x64_pointer"] == true)),
             "{classification}"
         );
+    }
+
+    #[test]
+    fn small_integers_are_not_plausible_pointers() {
+        assert!(!plausible_x64_pointer(0));
+        assert!(!plausible_x64_pointer(8));
+        assert!(!plausible_x64_pointer(0x100));
+        assert!(!plausible_x64_pointer(0xfff8));
+        assert!(plausible_x64_pointer(0x10000));
+        assert!(plausible_x64_pointer(0x7ff6_1234_1000));
+        assert!(plausible_x64_pointer(0xffff_f800_0000_1000));
+        assert!(!plausible_x64_pointer(0x0000_8000_0000_0000));
     }
 
     #[test]

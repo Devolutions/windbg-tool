@@ -4,6 +4,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::Duration;
 use zip::ZipArchive;
 
 pub const DEFAULT_APPINSTALLER_URL: &str = "https://aka.ms/windbg/download";
@@ -84,7 +85,8 @@ impl WindbgManager {
             None
         };
         let update_available = match (&installed_version, &latest_version) {
-            (Some(installed), Some(latest)) => Some(installed != latest),
+            // A recorded version whose DbgX.Shell.exe is missing is reinstalled by `update`.
+            (Some(installed), Some(latest)) => Some(installed != latest || dbgx_path.is_none()),
             (None, Some(_)) => Some(true),
             _ => None,
         };
@@ -268,6 +270,14 @@ pub fn parse_bundle_manifest(xml: &str) -> anyhow::Result<Vec<BundlePackage>> {
     let packages = document
         .descendants()
         .filter(|node| node.has_tag_name("Package"))
+        // Resource packages (language/scale packs) usually omit Architecture,
+        // which would otherwise make them look like installable neutral
+        // application packages.
+        .filter(|node| {
+            !node
+                .attribute("Type")
+                .is_some_and(|kind| kind.eq_ignore_ascii_case("resource"))
+        })
         .filter_map(|node| {
             Some(BundlePackage {
                 file_name: node.attribute("FileName")?.to_string(),
@@ -317,7 +327,17 @@ fn select_bundle_package(bundle_path: &Path, arch: Architecture) -> anyhow::Resu
 }
 
 fn download_file(url: &str, destination: &Path) -> anyhow::Result<()> {
-    let mut response = reqwest::blocking::get(url)
+    // `reqwest::blocking::get` applies a 30 second total timeout that also
+    // covers reading the body, which is far too short for the multi-hundred
+    // megabyte WinDbg bundle on typical connections.
+    let client = reqwest::blocking::Client::builder()
+        .connect_timeout(Duration::from_secs(30))
+        .timeout(None::<Duration>)
+        .build()
+        .context("creating WinDbg download client")?;
+    let mut response = client
+        .get(url)
+        .send()
         .with_context(|| format!("requesting {url}"))?
         .error_for_status()
         .with_context(|| format!("requesting {url}"))?;
@@ -471,5 +491,27 @@ impl InstallLock {
 impl Drop for InstallLock {
     fn drop(&mut self) {
         let _ = fs::remove_file(&self.path);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bundle_manifest_skips_resource_packages() {
+        let packages = parse_bundle_manifest(
+            r#"
+            <Bundle>
+              <Packages>
+                <Package Type="application" FileName="windbg-x64.msix" Architecture="x64" />
+                <Package Type="resource" FileName="windbg-scale-100.msix" ResourceId="split.scale-100" />
+              </Packages>
+            </Bundle>
+            "#,
+        )
+        .unwrap();
+        assert_eq!(packages.len(), 1);
+        assert!(select_package(&packages, Architecture::X86).is_err());
     }
 }

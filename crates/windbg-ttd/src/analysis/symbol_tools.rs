@@ -101,7 +101,9 @@ pub fn ttd_symbols_nearest(
     let address_info = state.ttd.address_info(AddressInfoRequest {
         session_id: request.session_id,
         cursor_id: request.cursor_id,
-        address: request.address.clone(),
+        // Pass the already-parsed value: address_info does not accept the WinDbg-style
+        // backtick/underscore separators that parse_u64_argument strips.
+        address: format!("0x{address:X}"),
     })?;
     let address_info = serde_json::to_value(address_info)?;
     let Some(module) = address_info["module"].as_object() else {
@@ -129,6 +131,17 @@ pub fn ttd_symbols_nearest(
         .and_then(Value::as_u64)
         .context("address_info module did not include an RVA")?;
     let path = PathBuf::from(path);
+    if !path.is_file() {
+        return Ok(json!({
+            "session_id": request.session_id,
+            "cursor_id": request.cursor_id,
+            "address": address,
+            "address_info": address_info,
+            "module_path": path,
+            "symbol": null,
+            "reason": "module binary is not available at this path on the host"
+        }));
+    }
     let exports = read_export_symbols(&path)?;
     let nearest = nearest_export(&exports, rva);
     let export_sample = request.include_exports.then(|| {
@@ -412,6 +425,7 @@ fn session_pe_diagnostics(modules: &[Value]) -> Value {
     let mut with_path_count = 0usize;
     let mut local_file_count = 0usize;
     let mut parsed_count = 0usize;
+    let mut truncated = false;
     let mut samples = Vec::new();
     let mut seen_paths = std::collections::HashSet::new();
 
@@ -429,6 +443,7 @@ fn session_pe_diagnostics(modules: &[Value]) -> Value {
             continue;
         }
         if samples.len() >= MAX_PARSED_MODULES {
+            truncated = true;
             continue;
         }
         let diagnostic = module_pe_diagnostics(module);
@@ -445,7 +460,7 @@ fn session_pe_diagnostics(modules: &[Value]) -> Value {
         "local_files": local_file_count,
         "parsed_count": parsed_count,
         "sample_limit": MAX_PARSED_MODULES,
-        "truncated": local_file_count > MAX_PARSED_MODULES,
+        "truncated": truncated,
         "samples": samples,
         "hint": "Use symbols diagnose with name or address for a single-module PE/PDB identity."
     })
@@ -625,5 +640,22 @@ fn status_value<T: serde::Serialize>(result: anyhow::Result<T>) -> Value {
             Err(error) => json!({ "ok": false, "error": error.to_string() }),
         },
         Err(error) => json!({ "ok": false, "error": error.to_string() }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn session_pe_diagnostics_truncation_ignores_duplicate_paths() -> anyhow::Result<()> {
+        let executable = std::env::current_exe()?;
+        let module = json!({ "name": "self", "path": executable });
+        let modules = vec![module; 40];
+        let value = session_pe_diagnostics(&modules);
+        assert_eq!(value["local_files"], 40);
+        assert_eq!(value["samples"].as_array().map(Vec::len), Some(1));
+        assert_eq!(value["truncated"], false);
+        Ok(())
     }
 }

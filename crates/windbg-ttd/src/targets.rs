@@ -237,6 +237,7 @@ pub struct TargetContinueWaitRequest {
 pub struct TargetMemoryReadRequest {
     pub target_id: TargetId,
     pub address: u64,
+    #[schemars(range(min = 1, max = 65536))]
     pub size: u32,
 }
 
@@ -378,6 +379,15 @@ pub struct TargetSummary {
 #[derive(Debug, Clone, Serialize)]
 pub struct TargetListResponse {
     pub targets: Vec<TargetSummary>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub unavailable_targets: Vec<UnavailableTarget>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct UnavailableTarget {
+    pub target_id: TargetId,
+    pub kind: DebuggerSessionKind,
+    pub error: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -516,19 +526,30 @@ pub struct TargetWriteDumpResponse {
 
 impl TargetRegistry {
     pub fn list_targets(&self) -> anyhow::Result<TargetListResponse> {
-        let mut targets = self
-            .targets
-            .iter()
-            .map(|(target_id, target)| {
-                Ok(TargetSummary {
+        // One target that can no longer be selected (for example a live process
+        // that already exited) must not hide every other target from the list.
+        let mut targets = Vec::new();
+        let mut unavailable_targets = Vec::new();
+        for (target_id, target) in &self.targets {
+            match target.summary() {
+                Ok(summary) => targets.push(TargetSummary {
                     target_id: *target_id,
-                    target: target.summary()?,
+                    target: summary,
                     native_symbols: target.native_symbols.clone(),
-                })
-            })
-            .collect::<anyhow::Result<Vec<_>>>()?;
+                }),
+                Err(error) => unavailable_targets.push(UnavailableTarget {
+                    target_id: *target_id,
+                    kind: target.kind(),
+                    error: format!("{error:#}"),
+                }),
+            }
+        }
         targets.sort_by_key(|target| target.target_id);
-        Ok(TargetListResponse { targets })
+        unavailable_targets.sort_by_key(|target| target.target_id);
+        Ok(TargetListResponse {
+            targets,
+            unavailable_targets,
+        })
     }
 
     pub fn target_count(&self) -> usize {
@@ -642,12 +663,16 @@ impl TargetRegistry {
             .targets
             .remove(&request.target_id)
             .with_context(|| format!("unknown target id: {}", request.target_id))?;
-        let terminate_result = target
+        if let Err(error) = target
             .worker
-            .call("terminate", |session| session.terminate());
-        let shutdown_result = target.worker.shutdown(false);
-        terminate_result?;
-        shutdown_result?;
+            .call("terminate", |session| session.terminate())
+        {
+            // Keep the still-attached target registered so the caller can retry or
+            // detach it with target_close instead of silently orphaning the debuggee.
+            self.targets.insert(request.target_id, target);
+            return Err(error);
+        }
+        target.worker.shutdown(false)?;
         Ok(TargetClosedResponse {
             target_id: request.target_id,
             closed: true,
@@ -661,11 +686,13 @@ impl TargetRegistry {
         request: TargetWaitRequest,
     ) -> anyhow::Result<DebuggerExecutionStatus> {
         let timeout_ms = request.timeout_ms;
-        self.target(request.target_id)?
-            .worker
-            .call("wait_for_event", move |session| {
-                session.wait_for_event(timeout_ms)
-            })
+        let target = self.target(request.target_id)?;
+        // Dump targets have no event stream, and WaitForEvent on the shared engine
+        // could resume a different live target that was left in a go state.
+        ensure_live_target(request.target_id, target.kind())?;
+        target.worker.call("wait_for_event", move |session| {
+            session.wait_for_event(timeout_ms)
+        })
     }
 
     pub fn continue_execution(
@@ -744,7 +771,7 @@ impl TargetRegistry {
         &self,
         request: TargetMemoryReadRequest,
     ) -> anyhow::Result<TargetMemoryReadResponse> {
-        ensure!(request.size > 0, "size must be greater than zero");
+        validate_target_memory_read_size(request.size)?;
         let target = self.target(request.target_id)?;
         let address = request.address;
         let size = request.size;
@@ -1423,6 +1450,19 @@ fn default_target_output_total_chars() -> u32 {
     8192
 }
 
+/// Matches the TTD `ttd_read_memory` bound; larger reads would be hex-encoded
+/// into a response that can exhaust memory or exceed the daemon response cap.
+const MAX_TARGET_MEMORY_READ_BYTES: u32 = 0x10000;
+
+fn validate_target_memory_read_size(size: u32) -> anyhow::Result<()> {
+    ensure!(size > 0, "size must be greater than zero");
+    ensure!(
+        size <= MAX_TARGET_MEMORY_READ_BYTES,
+        "size must be 64 KiB or less"
+    );
+    Ok(())
+}
+
 fn validate_target_memory_map_region_limit(region_limit: u32) -> anyhow::Result<()> {
     ensure!(
         (1..=MAX_VIRTUAL_MEMORY_MAP_REGIONS).contains(&region_limit),
@@ -1501,11 +1541,26 @@ fn validate_breakpoint_set_request(request: &TargetBreakpointSetRequest) -> anyh
             request.size.is_none(),
             "target code breakpoints do not accept a data size"
         );
-    } else if let Some(size) = request.size {
+    } else {
+        let size = request.size.unwrap_or(1);
         ensure!(
             matches!(size, 1 | 2 | 4 | 8),
             "target data breakpoint size must be 1, 2, 4, or 8 bytes"
         );
+        // x86/x64 debug registers only support one-byte instruction breakpoints
+        // and require the watched address to be aligned to the watched length.
+        if matches!(kind, TargetBreakpointKind::Execute) {
+            ensure!(
+                size == 1,
+                "target execute breakpoints must use a size of 1 byte"
+            );
+        }
+        if let Some(address) = request.address {
+            ensure!(
+                address % u64::from(size) == 0,
+                "target data breakpoint address 0x{address:X} must be aligned to its {size}-byte size"
+            );
+        }
     }
     Ok(())
 }
@@ -1604,6 +1659,26 @@ mod tests {
         assert!(validate_breakpoint_set_request(&bad_size).is_err());
         bad_size.size = Some(8);
         assert!(validate_breakpoint_set_request(&bad_size).is_ok());
+
+        let mut misaligned = bad_size.clone();
+        misaligned.address = Some(0x1004);
+        assert!(validate_breakpoint_set_request(&misaligned).is_err());
+        misaligned.size = Some(4);
+        assert!(validate_breakpoint_set_request(&misaligned).is_ok());
+
+        let mut execute = address.clone();
+        execute.kind = Some(TargetBreakpointKind::Execute);
+        assert!(validate_breakpoint_set_request(&execute).is_ok());
+        execute.size = Some(4);
+        assert!(validate_breakpoint_set_request(&execute).is_err());
+    }
+
+    #[test]
+    fn validates_memory_read_size_before_accessing_a_target() {
+        assert!(validate_target_memory_read_size(1).is_ok());
+        assert!(validate_target_memory_read_size(MAX_TARGET_MEMORY_READ_BYTES).is_ok());
+        assert!(validate_target_memory_read_size(0).is_err());
+        assert!(validate_target_memory_read_size(MAX_TARGET_MEMORY_READ_BYTES + 1).is_err());
     }
 
     #[test]

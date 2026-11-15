@@ -5,7 +5,9 @@
 //! registers are unchanged at fault time, the source slot and the containing object are
 //! re-read from the dump.
 
-use super::fault_operand::{fill_pattern, memory_operand, register_name, FaultRegisters};
+use super::fault_operand::{
+    address_size_mask, fill_pattern, memory_operand, register_name, FaultRegisters,
+};
 use iced_x86::{
     Code, Decoder, DecoderOptions, FlowControl, Formatter, Instruction, InstructionInfoFactory,
     Mnemonic, NasmFormatter, OpAccess, OpKind, Register,
@@ -297,6 +299,7 @@ fn classify(
         && instruction.op0_kind() == OpKind::Register
         && instruction.op1_kind() == OpKind::Register
         && instruction.op0_register() == instruction.op1_register()
+        && instruction.op0_register().size() >= 4
     {
         "self_zeroing"
     } else if instruction.mnemonic() == Mnemonic::Mov
@@ -339,16 +342,14 @@ fn memory_load(
         .into_iter()
         .filter(|register| *register != Register::None && *register != Register::RIP)
         .collect::<Vec<_>>();
-    let modified = address_registers
-        .iter()
-        .find(|register| {
-            writes(factory, instruction, **register)
-                || after.iter().any(|later| {
-                    writes(factory, later, **register)
-                        || (is_call(later) && is_volatile(**register, registers.bitness()))
-                })
-        })
-        .copied();
+    let bitness = registers.bitness();
+    let modified = address_registers.iter().copied().find(|register| {
+        writes(factory, instruction, *register)
+            || modified_after(factory, after, *register, bitness)
+    });
+    // The destination's fault-time value is the loaded value only if nothing overwrites it later.
+    let destination_preserved =
+        !modified_after(factory, after, instruction.op0_register(), bitness);
     let mut value = json!({
         "base": register_name(base),
         "index": register_name(index),
@@ -369,11 +370,15 @@ fn memory_load(
         );
         return value;
     }
-    let mask = if registers.bitness() == 32 {
-        u64::from(u32::MAX)
-    } else {
-        u64::MAX
-    };
+    let mask = address_size_mask(
+        base,
+        index,
+        if registers.bitness() == 32 {
+            u64::from(u32::MAX)
+        } else {
+            u64::MAX
+        },
+    );
     let source_address = if instruction.is_ip_rel_memory_operand() {
         Some(instruction.ip_rel_memory_address() & mask)
     } else {
@@ -399,7 +404,9 @@ fn memory_load(
     };
     let width = instruction.memory_size().size() as u32;
     let current = read_value(sources, source_address, width);
-    let loaded = registers.value(instruction.op0_register());
+    let loaded = destination_preserved
+        .then(|| registers.value(instruction.op0_register()))
+        .flatten();
     value["status"] = json!("resolved");
     value["source_address"] = json!(source_address);
     value["source_region"] = (sources.region)(source_address).unwrap_or(Value::Null);
@@ -423,6 +430,17 @@ fn memory_load(
     }
     value["detail"] = json!("The slot was re-read from the dump using fault-time register values. A matching value shows the slot still held the bad pointer when the dump was written; it does not show which code stored it.");
     value
+}
+
+fn modified_after(
+    factory: &mut InstructionInfoFactory,
+    after: &[Instruction],
+    register: Register,
+    bitness: u32,
+) -> bool {
+    after.iter().any(|later| {
+        writes(factory, later, register) || (is_call(later) && is_volatile(register, bitness))
+    })
 }
 
 fn object_value(
@@ -661,6 +679,27 @@ mod tests {
             "address_registers_modified"
         );
         assert_eq!(value["steps"][0]["load"]["modified_register"], "rbx");
+    }
+
+    #[test]
+    fn ignores_overwritten_load_destination_and_partial_self_xor() {
+        // mov rdx,[rbx+10h]; mov rcx,rdx; mov edx,0 -> rdx no longer holds the loaded value.
+        let mut overwritten = memory(&[
+            0x48, 0x8b, 0x53, 0x10, 0x48, 0x89, 0xd1, 0xba, 0x00, 0x00, 0x00, 0x00,
+        ]);
+        for offset in 0..8 {
+            overwritten.insert(0x5010 + offset, 0);
+        }
+        let value = run(&overwritten, &exception(registers(0x5000, 0), 0));
+        let load = &value["steps"][1]["load"];
+        assert_eq!(value["steps"][1]["kind"], "memory_load", "{value:#}");
+        assert_eq!(load["current_value"], 0);
+        assert!(load["matches_loaded_register"].is_null(), "{value:#}");
+
+        // xor cl,cl only clears the low byte of rcx.
+        let partial = memory(&[0x30, 0xc9]);
+        let value = run(&partial, &exception(registers(0x5000, 0), 0));
+        assert_eq!(value["steps"][0]["kind"], "other");
     }
 
     fn memory_with_call() -> HashMap<u64, u8> {

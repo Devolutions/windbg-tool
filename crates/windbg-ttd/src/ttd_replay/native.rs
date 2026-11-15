@@ -1352,13 +1352,20 @@ impl From<TtdMcpExceptionInfo> for TraceException {
 
 impl From<TtdMcpModuleEventInfo> for TraceModuleEvent {
     fn from(event: TtdMcpModuleEventInfo) -> Self {
+        let kind = match event.kind {
+            0 => ModuleEventKind::Load,
+            _ => ModuleEventKind::Unload,
+        };
+        let mut module = TraceModule::from(event.module);
+        if kind == ModuleEventKind::Unload {
+            // Unload events carry no load time; the bridge leaves it zeroed, which would
+            // otherwise be reported as a bogus 0:0 load position.
+            module.load_position = None;
+        }
         Self {
-            kind: match event.kind {
-                0 => ModuleEventKind::Load,
-                _ => ModuleEventKind::Unload,
-            },
+            kind,
             position: event.position.into(),
-            module: event.module.into(),
+            module,
         }
     }
 }
@@ -1765,4 +1772,59 @@ fn wide_path(path: &Path) -> Vec<u16> {
         .encode_utf16()
         .chain(std::iter::once(0))
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unload_module_event_does_not_report_a_load_position() {
+        let unload = TraceModuleEvent::from(TtdMcpModuleEventInfo {
+            kind: 1,
+            position: TtdMcpPosition {
+                sequence: 0x40,
+                steps: 2,
+            },
+            module: TtdMcpModuleInfo {
+                unload_position: TtdMcpPosition {
+                    sequence: 0x40,
+                    steps: 2,
+                },
+                has_unload_position: 1,
+                ..TtdMcpModuleInfo::default()
+            },
+        });
+        assert_eq!(unload.kind, ModuleEventKind::Unload);
+        assert_eq!(unload.module.load_position, None);
+        assert_eq!(
+            unload.module.unload_position,
+            Some(Position {
+                sequence: 0x40,
+                steps: 2
+            })
+        );
+
+        let load = TraceModuleEvent::from(TtdMcpModuleEventInfo {
+            kind: 0,
+            position: TtdMcpPosition {
+                sequence: 0x10,
+                steps: 0,
+            },
+            module: TtdMcpModuleInfo {
+                load_position: TtdMcpPosition {
+                    sequence: 0x10,
+                    steps: 0,
+                },
+                ..TtdMcpModuleInfo::default()
+            },
+        });
+        assert_eq!(
+            load.module.load_position,
+            Some(Position {
+                sequence: 0x10,
+                steps: 0
+            })
+        );
+    }
 }

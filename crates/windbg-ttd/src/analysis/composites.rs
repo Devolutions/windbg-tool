@@ -320,6 +320,20 @@ pub fn debug_snapshot(
         legacy["current_disassembly"] =
             section_result(|| disasm_at_cursor(state, session_id, cursor_id, count, bytes));
     }
+    // The legacy context snapshot bounds modules to 64 and leaves active threads unbounded;
+    // apply the caller's limits so max_modules/max_threads are honored for TTD subjects too.
+    if args.max_modules != 64 && section_enabled(&args, "modules") {
+        legacy["modules"] = section_result(|| {
+            let value = serde_json::to_value(state.ttd.cursor_modules(session_id, cursor_id)?)?;
+            Ok(bound_array(value, "modules", args.max_modules))
+        });
+    }
+    if let Some(threads) = legacy
+        .get_mut("active_threads")
+        .and_then(|section| section.get_mut("value"))
+    {
+        *threads = bound_array(threads.take(), "threads", args.max_threads);
+    }
     let mut sections = Map::new();
     add_legacy_section(&mut sections, "trace_info", &legacy, "info");
     add_legacy_section(&mut sections, "capabilities", &legacy, "debug capabilities");

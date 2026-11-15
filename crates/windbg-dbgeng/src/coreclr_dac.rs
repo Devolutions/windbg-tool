@@ -150,6 +150,7 @@ unsafe trait IXCLRDataProcess: IUnknown {
     unsafe fn Reserved34(&self) -> HRESULT;
     unsafe fn Reserved35(&self) -> HRESULT;
     unsafe fn Reserved36(&self) -> HRESULT;
+    unsafe fn Reserved37(&self) -> HRESULT;
     unsafe fn GetOtherNotificationFlags(&self, flags: *mut u32) -> HRESULT;
     unsafe fn SetOtherNotificationFlags(&self, flags: u32) -> HRESULT;
 }
@@ -393,11 +394,18 @@ impl ICLRDataTarget_Impl for DbgEngDataTarget_Impl {
         if image_path.is_null() || base_address.is_null() {
             return E_INVALIDARG;
         }
+        // The DAC asks for image file names such as "coreclr.dll", but DbgEng module names omit
+        // the extension, so look up the extension-less name exactly like SOS does.
+        let module_name = dbgeng_module_name(unsafe { image_path.as_wide() });
         let mut index = 0;
         let mut base = 0;
         match unsafe {
-            self.symbols
-                .GetModuleByModuleNameWide(image_path, 0, Some(&mut index), Some(&mut base))
+            self.symbols.GetModuleByModuleNameWide(
+                PCWSTR(module_name.as_ptr()),
+                0,
+                Some(&mut index),
+                Some(&mut base),
+            )
         } {
             Ok(()) => {
                 unsafe { *base_address = base };
@@ -487,23 +495,46 @@ impl ICLRDataTarget_Impl for DbgEngDataTarget_Impl {
         if context.is_null() {
             return E_POINTER;
         }
-        let mut current_thread = 0;
-        let thread_result = unsafe { self.GetCurrentThreadID(&mut current_thread) };
-        if thread_result.is_err() {
-            return thread_result;
-        }
-        if thread_id != current_thread || context_size < size_of::<CONTEXT>() as u32 {
+        if context_size < size_of::<CONTEXT>() as u32 {
             return E_INVALIDARG;
         }
-        let native_context = unsafe { &mut *context.cast::<CONTEXT>() };
-        native_context.ContextFlags =
-            windows::Win32::System::Diagnostics::Debug::CONTEXT_FLAGS(context_flags);
-        match unsafe {
+        // The DAC asks for arbitrary OS threads (not only the debugger's current one), while
+        // IDebugAdvanced::GetThreadContext reads the current thread: switch to the requested
+        // thread and restore the previous selection afterwards, as SOS's DbgEng services do.
+        let engine_thread = match unsafe { self.system_objects.GetThreadIdBySystemId(thread_id) } {
+            Ok(id) => id,
+            Err(error) => return error.code(),
+        };
+        let previous_thread = match unsafe { self.system_objects.GetCurrentThreadId() } {
+            Ok(id) => id,
+            Err(error) => return error.code(),
+        };
+        let switched = previous_thread != engine_thread;
+        if switched {
+            if let Err(error) = unsafe { self.system_objects.SetCurrentThreadId(engine_thread) } {
+                return error.code();
+            }
+        }
+        // The DAC passes a plain byte buffer with no alignment guarantee, so never form a
+        // `&mut CONTEXT` (16-byte aligned) over it; write ContextFlags unaligned instead.
+        unsafe {
+            context
+                .add(std::mem::offset_of!(CONTEXT, ContextFlags))
+                .cast::<u32>()
+                .write_unaligned(context_flags);
+        }
+        let result = unsafe {
             self.advanced
-                .GetThreadContext(native_context as *mut CONTEXT as *mut c_void, context_size)
-        } {
-            Ok(()) => HRESULT(0),
-            Err(error) => error.code(),
+                .GetThreadContext(context.cast::<c_void>(), context_size)
+        };
+        let restore = if switched {
+            unsafe { self.system_objects.SetCurrentThreadId(previous_thread) }
+        } else {
+            Ok(())
+        };
+        match (result, restore) {
+            (Ok(()), Ok(())) => HRESULT(0),
+            (Err(error), _) | (Ok(()), Err(error)) => error.code(),
         }
     }
 
@@ -595,8 +626,10 @@ impl CoreClrDacBridge {
         coreclr_path: &Path,
         allow_target_writes: bool,
     ) -> anyhow::Result<Self> {
+        // The data target reports an AMD64 machine and AMD64 CONTEXT layout, so a 64-bit
+        // pointer width alone (e.g. an ARM64 host) is not sufficient.
         ensure!(
-            size_of::<usize>() == size_of::<u64>(),
+            cfg!(target_arch = "x86_64"),
             "the CoreCLR DAC bridge supports only x64 debugger hosts"
         );
         ensure!(
@@ -882,11 +915,14 @@ impl CoreClrDacBridge {
             .ok()
             .context("starting managed module enumeration")?;
         let result = (|| -> anyhow::Result<_> {
+            // A file-name-only match is a fallback: keep enumerating so an exact full-path match
+            // later in the list wins over a same-named module loaded from another directory.
+            let mut file_name_match = None;
             loop {
                 let mut raw = std::ptr::null_mut();
                 let status = unsafe { self.process.EnumModule(&mut enumeration, &mut raw) };
                 if status == S_FALSE {
-                    return Ok(None);
+                    return Ok(file_name_match);
                 }
                 status.ok().context("enumerating managed modules")?;
                 let module = ensure_interface::<IXCLRDataModule>(
@@ -905,8 +941,12 @@ impl CoreClrDacBridge {
                 let Ok(actual_path) = utf16_path(&path) else {
                     continue;
                 };
-                if module_paths_match(expected_path, &actual_path) {
-                    return Ok(Some(module));
+                match module_path_match(expected_path, &actual_path) {
+                    Some(ModulePathMatch::Exact) => return Ok(Some(module)),
+                    Some(ModulePathMatch::FileName) if file_name_match.is_none() => {
+                        file_name_match = Some(module);
+                    }
+                    _ => {}
                 }
             }
         })();
@@ -1168,15 +1208,44 @@ fn utf16_path(value: &[u16]) -> anyhow::Result<PathBuf> {
     Ok(PathBuf::from(utf16_string(value, "managed module path")?))
 }
 
-fn module_paths_match(expected: &Path, actual: &Path) -> bool {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ModulePathMatch {
+    Exact,
+    FileName,
+}
+
+fn module_path_match(expected: &Path, actual: &Path) -> Option<ModulePathMatch> {
     let expected = expected.to_string_lossy();
     let actual = actual.to_string_lossy();
-    expected.eq_ignore_ascii_case(&actual)
-        || expected
-            .rsplit(['\\', '/'])
-            .next()
-            .zip(actual.rsplit(['\\', '/']).next())
-            .is_some_and(|(expected, actual)| expected.eq_ignore_ascii_case(actual))
+    if expected.eq_ignore_ascii_case(&actual) {
+        return Some(ModulePathMatch::Exact);
+    }
+    expected
+        .rsplit(['\\', '/'])
+        .next()
+        .zip(actual.rsplit(['\\', '/']).next())
+        .is_some_and(|(expected, actual)| expected.eq_ignore_ascii_case(actual))
+        .then_some(ModulePathMatch::FileName)
+}
+
+/// Converts an image path or file name ("coreclr.dll") into the NUL-terminated DbgEng module
+/// name ("coreclr"): the final path component without its extension.
+fn dbgeng_module_name(image_path: &[u16]) -> Vec<u16> {
+    let is_separator = |unit: &u16| *unit == u16::from(b'\\') || *unit == u16::from(b'/');
+    let file_name = match image_path.iter().rposition(is_separator) {
+        Some(separator) => &image_path[separator + 1..],
+        None => image_path,
+    };
+    let stem_length = file_name
+        .iter()
+        .rposition(|unit| *unit == u16::from(b'.'))
+        .filter(|&dot| dot > 0)
+        .unwrap_or(file_name.len());
+    file_name[..stem_length]
+        .iter()
+        .copied()
+        .chain(std::iter::once(0))
+        .collect()
 }
 
 fn signature_hex(signature: &[u8]) -> (String, bool) {
@@ -1213,6 +1282,58 @@ mod tests {
         let (hex, truncated) = signature_hex(&vec![0xAB; MAX_SIGNATURE_HEX_CHARS]);
         assert_eq!(hex.len(), MAX_SIGNATURE_HEX_CHARS - 2);
         assert!(truncated);
+    }
+
+    #[test]
+    fn process_notification_flag_slots_match_xclrdata_idl() {
+        // xclrdata.idl: IUnknown (3) + GetOtherNotificationFlags at 38, SetOtherNotificationFlags at 39.
+        let slot = size_of::<usize>();
+        assert_eq!(
+            std::mem::offset_of!(IXCLRDataProcess_Vtbl, GetOtherNotificationFlags),
+            (3 + 38) * slot
+        );
+        assert_eq!(
+            std::mem::offset_of!(IXCLRDataProcess_Vtbl, SetOtherNotificationFlags),
+            (3 + 39) * slot
+        );
+    }
+
+    #[test]
+    fn dbgeng_module_names_drop_directory_and_extension() {
+        let name = |text: &str| {
+            String::from_utf16(
+                dbgeng_module_name(&text.encode_utf16().collect::<Vec<_>>())
+                    .strip_suffix(&[0])
+                    .unwrap(),
+            )
+            .unwrap()
+        };
+        assert_eq!(name("coreclr.dll"), "coreclr");
+        assert_eq!(name("C:\\rt\\coreclr.dll"), "coreclr");
+        assert_eq!(name("coreclr"), "coreclr");
+        assert_eq!(name("System.Private.CoreLib.dll"), "System.Private.CoreLib");
+    }
+
+    #[test]
+    fn module_path_match_distinguishes_exact_and_file_name_matches() {
+        assert_eq!(
+            module_path_match(Path::new("C:\\App\\Lib.dll"), Path::new("c:\\app\\lib.DLL")),
+            Some(ModulePathMatch::Exact)
+        );
+        assert_eq!(
+            module_path_match(
+                Path::new("C:\\App\\Lib.dll"),
+                Path::new("D:\\Other\\lib.dll")
+            ),
+            Some(ModulePathMatch::FileName)
+        );
+        assert_eq!(
+            module_path_match(
+                Path::new("C:\\App\\Lib.dll"),
+                Path::new("C:\\App\\Other.dll")
+            ),
+            None
+        );
     }
 
     #[test]

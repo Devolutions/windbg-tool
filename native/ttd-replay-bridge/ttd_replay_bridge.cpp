@@ -7,6 +7,7 @@
 #include <limits>
 #include <mutex>
 #include <string>
+#include <type_traits>
 #include <vector>
 
 namespace {
@@ -258,8 +259,15 @@ struct TtdMcpCursor {
 class BridgeErrorReporting final : public TTD::ErrorReporting {
 public:
     void __fastcall VPrintError(char const* const format, va_list args) override {
+        if (format == nullptr) {
+            set_error(nullptr);
+            return;
+        }
+
+        // vsprintf_s invokes the CRT invalid-parameter handler (process abort) when the
+        // formatted message does not fit; truncate long engine diagnostics instead.
         char buffer[2048] = {};
-        vsprintf_s(buffer, format, args);
+        _vsnprintf_s(buffer, sizeof(buffer), _TRUNCATE, format, args);
         set_error(buffer);
     }
 };
@@ -690,6 +698,14 @@ TTD_MCP_EXPORT TtdMcpStatus ttd_mcp_new_cursor(TtdMcpTrace* trace, TtdMcpCursor*
 }
 
 TTD_MCP_EXPORT void ttd_mcp_free_cursor(TtdMcpCursor* cursor) {
+    if (cursor == nullptr) {
+        return;
+    }
+
+    // Destroying the replay cursor touches shared engine state; serialize it with the
+    // other engine calls. The mutex lives in the trace, which outlives the cursor.
+    std::mutex& trace_mutex = cursor->trace->mutex;
+    std::scoped_lock lock(trace_mutex);
     delete cursor;
 }
 
@@ -1119,8 +1135,19 @@ TTD_MCP_EXPORT TtdMcpStatus ttd_mcp_memory_watchpoint(TtdMcpCursor* cursor, uint
         return TTD_MCP_INVALID_ARGUMENT;
     }
 
+    if (static_cast<uint64_t>(size) - 1 > std::numeric_limits<uint64_t>::max() - address) {
+        set_error("watchpoint address range overflows the guest address space");
+        return TTD_MCP_INVALID_ARGUMENT;
+    }
+
     if (direction > 1) {
         set_error("direction must be 0 for forward or 1 for backward");
+        return TTD_MCP_INVALID_ARGUMENT;
+    }
+
+    using UniqueThreadIdValue = std::underlying_type_t<TTD::Replay::UniqueThreadId>;
+    if (thread_unique_id > static_cast<uint64_t>(std::numeric_limits<UniqueThreadIdValue>::max())) {
+        set_error("thread_unique_id is outside the native TTD range");
         return TTD_MCP_INVALID_ARGUMENT;
     }
 

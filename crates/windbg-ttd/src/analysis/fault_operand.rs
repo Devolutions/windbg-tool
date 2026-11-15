@@ -302,6 +302,7 @@ pub(super) fn memory_operand(
         ),
         _ => return None,
     };
+    let address_mask = address_size_mask(base, index_register, address_mask);
     let segment = instruction.memory_segment();
     let base_value = (base != Register::None)
         .then(|| registers.value(base))
@@ -350,6 +351,21 @@ pub(super) fn memory_operand(
         },
         base_register: if ip_relative { Register::None } else { base },
     })
+}
+
+/// Narrows `mode_mask` to the operand's address size: 32-bit (0x67 in 64-bit mode) and 16-bit
+/// addressing wrap at 4 GiB / 64 KiB, which the base/index register width reveals.
+pub(super) fn address_size_mask(base: Register, index: Register, mode_mask: u64) -> u64 {
+    let size = if base != Register::None {
+        base.size()
+    } else {
+        index.size()
+    };
+    match size {
+        4 => mode_mask & u64::from(u32::MAX),
+        2 => mode_mask & u64::from(u16::MAX),
+        _ => mode_mask,
+    }
 }
 
 fn string_register(op_kind: OpKind, register64: Register) -> Register {
@@ -516,6 +532,20 @@ mod tests {
         assert_eq!(value["memory_operands"][0]["scale"], 4);
         assert!(kinds(&value).contains(&"debug_fill_pattern"));
         assert!(kinds(&value).contains(&"non_canonical_address"));
+    }
+
+    #[test]
+    fn wraps_effective_address_for_32_bit_address_size_in_64_bit_mode() {
+        let registers = amd64(0, 0xFFFF_FFF0);
+        // mov eax, [ecx+20h] (0x67 address-size override) wraps at 4 GiB.
+        let value = analyze_fault_operand(
+            FaultRegisters::Amd64(&registers),
+            0x1000,
+            &access("read", 0, 0x10),
+            &[0x67, 0x8b, 0x41, 0x20],
+        );
+        assert_eq!(value["memory_operands"][0]["effective_address"], 0x10);
+        assert_eq!(value["matched_operand"], 0);
     }
 
     #[test]

@@ -341,6 +341,10 @@ fn load_library_from_path(
         LoadLibraryExW, LOAD_LIBRARY_SEARCH_DEFAULT_DIRS, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR,
     };
 
+    // LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR rejects relative paths with ERROR_INVALID_PARAMETER, and
+    // WINDBG_DBGENG_RUNTIME_DIR may be relative to the current directory.
+    let path = std::path::absolute(path)
+        .with_context(|| format!("resolving {component} path {}", path.display()))?;
     let mut path_wide = path.as_os_str().encode_wide().collect::<Vec<_>>();
     path_wide.push(0);
     unsafe {
@@ -470,6 +474,41 @@ fn enable_initial_break(
 
     unsafe { control.AddEngineOptions(DEBUG_ENGOPT_INITIAL_BREAK) }
         .context("enabling the DbgEng initial-break engine option")?;
+    Ok(())
+}
+
+/// Engine options and event filters are global to the in-process DbgEng engine, so a setting
+/// made for one session persists into later launches/attaches. Set both explicitly so a stale
+/// `sxe cpr` or initial-break option from an earlier session cannot change where this one stops.
+#[cfg(windows)]
+fn configure_initial_stop(
+    control: &windows::Win32::System::Diagnostics::Debug::Extensions::IDebugControl5,
+    initial_stop: LiveInitialStop,
+) -> anyhow::Result<()> {
+    use windows::core::PCWSTR;
+    use windows::Win32::System::Diagnostics::Debug::Extensions::{
+        DEBUG_ENGOPT_INITIAL_BREAK, DEBUG_EXECUTE_DEFAULT, DEBUG_OUTCTL_THIS_CLIENT,
+    };
+
+    match initial_stop {
+        LiveInitialStop::SoftwareBreakpoint => {
+            enable_initial_break(control)?;
+            let command = "sxi cpr\0".encode_utf16().collect::<Vec<_>>();
+            unsafe {
+                control.ExecuteWide(
+                    DEBUG_OUTCTL_THIS_CLIENT,
+                    PCWSTR(command.as_ptr()),
+                    DEBUG_EXECUTE_DEFAULT,
+                )
+            }
+            .context("restoring the default DbgEng create-process event filter")?;
+        }
+        LiveInitialStop::CreateProcessEvent => {
+            enable_create_process_stop(control)?;
+            unsafe { control.RemoveEngineOptions(DEBUG_ENGOPT_INITIAL_BREAK) }
+                .context("clearing the DbgEng initial-break engine option")?;
+        }
+    }
     Ok(())
 }
 
@@ -1830,6 +1869,12 @@ fn x64_page_table_entry(
     let supports_large_page = matches!(level, "PDPTE" | "PDE");
     let large_page = supports_large_page && raw_value & (1 << 7) != 0;
     let is_leaf = level == "PTE" || large_page;
+    // Bit 12 of a large-page PDPTE/PDE is the PAT bit, not part of the frame address.
+    let frame_mask = if large_page {
+        X64_PHYSICAL_ADDRESS_MASK & !(1 << 12)
+    } else {
+        X64_PHYSICAL_ADDRESS_MASK
+    };
     X64PageTableEntry {
         level: level.to_string(),
         index,
@@ -1845,8 +1890,13 @@ fn x64_page_table_entry(
         large_page,
         global: is_leaf.then_some(raw_value & (1 << 8) != 0),
         no_execute: raw_value & (1 << 63) != 0,
-        page_frame_number: (raw_value & X64_PHYSICAL_ADDRESS_MASK) >> 12,
+        page_frame_number: (raw_value & frame_mask) >> 12,
     }
+}
+
+fn x64_large_page_physical_address(raw_value: u64, address: u64, page_size: u64) -> u64 {
+    let offset_mask = page_size - 1;
+    (raw_value & X64_PHYSICAL_ADDRESS_MASK & !offset_mask) | (address & offset_mask)
 }
 
 fn unavailable_x64_page_table_walk(address: u64, detail: String) -> X64PageTableWalk {
@@ -2130,18 +2180,14 @@ impl DebuggerSession {
             extra_information_used as usize <= extra_information.len(),
             "DbgEng last-event payload exceeds the bounded {MAX_EVENT_EXTRA_BYTES}-byte limit"
         );
-        ensure!(
-            description_used as usize <= description.len(),
-            "DbgEng last-event description exceeds the bounded {MAX_EVENT_DESCRIPTION_CHARS}-character limit"
-        );
-
-        let description_len = description_used as usize;
+        // DbgEng truncates an oversized description (S_FALSE) and reports the full size in
+        // DescriptionUsed; keep the bounded prefix instead of discarding the whole event.
+        let description_len = (description_used as usize).min(description.len());
         let description = &description[..description_len];
-        let description_len = if description.last().is_some_and(|character| *character == 0) {
-            description_len - 1
-        } else {
-            description_len
-        };
+        let description_len = description
+            .iter()
+            .position(|character| *character == 0)
+            .unwrap_or(description_len);
         let description = String::from_utf16_lossy(&description[..description_len]);
         let description = (!description.is_empty()).then_some(description);
         let extra_information = &extra_information[..extra_information_used as usize];
@@ -2848,8 +2894,8 @@ impl DebuggerSession {
             let is_pd = *level == "PDE";
             if entry.large_page && (is_pdpt || is_pd) {
                 let page_size = if is_pdpt { 1u64 << 30 } else { 1u64 << 21 };
-                let page_mask = !(page_size - 1);
-                let physical_address = (raw_value & page_mask) | (address & (page_size - 1));
+                let physical_address =
+                    x64_large_page_physical_address(raw_value, address, page_size);
                 entries.push(entry);
                 return X64PageTableWalk {
                     status: "captured".to_string(),
@@ -3224,10 +3270,17 @@ impl DebuggerSession {
     ) -> anyhow::Result<()> {
         use windows::core::PCWSTR;
 
-        for path in symbol_directories {
+        // The image path is resolved through the same symbol-server machinery, and ';' would
+        // split one directory into several search-path elements.
+        for path in symbol_directories.iter().chain(image_directories) {
+            let path = path.to_string_lossy();
             ensure!(
-                !path.to_string_lossy().to_ascii_lowercase().contains("srv*"),
-                "DbgEng local symbol paths must not contain a symbol-server expression"
+                !path.to_ascii_lowercase().contains("srv*"),
+                "DbgEng local symbol and image paths must not contain a symbol-server expression"
+            );
+            ensure!(
+                !path.contains(';'),
+                "DbgEng local symbol and image paths must not contain ';': {path}"
             );
         }
         let symbol_path = symbol_directories
@@ -3618,14 +3671,14 @@ impl DebuggerSession {
         };
 
         let breakpoint = self.add_compatible_breakpoint(DEBUG_BREAKPOINT_CODE)?;
-        unsafe {
+        self.configure_new_breakpoint(&breakpoint, |breakpoint| unsafe {
             breakpoint.SetOffset(address).with_context(|| {
                 format!("DbgEng could not set code breakpoint offset 0x{address:X}")
             })?;
             breakpoint
                 .AddFlags(DEBUG_BREAKPOINT_ENABLED)
-                .context("DbgEng could not enable code breakpoint")?;
-        }
+                .context("DbgEng could not enable code breakpoint")
+        })?;
         self.breakpoint_info(&breakpoint)
     }
 
@@ -3641,7 +3694,7 @@ impl DebuggerSession {
         let mut expression_wide = expression.encode_utf16().collect::<Vec<_>>();
         expression_wide.push(0);
         let breakpoint = self.add_compatible_breakpoint(DEBUG_BREAKPOINT_CODE)?;
-        unsafe {
+        self.configure_new_breakpoint(&breakpoint, |breakpoint| unsafe {
             breakpoint
                 .SetOffsetExpressionWide(PCWSTR(expression_wide.as_ptr()))
                 .with_context(|| {
@@ -3649,8 +3702,8 @@ impl DebuggerSession {
                 })?;
             breakpoint
                 .AddFlags(DEBUG_BREAKPOINT_ENABLED)
-                .context("DbgEng could not enable code breakpoint")?;
-        }
+                .context("DbgEng could not enable code breakpoint")
+        })?;
         self.breakpoint_info(&breakpoint)
     }
 
@@ -3684,11 +3737,12 @@ impl DebuggerSession {
         };
 
         let breakpoint = self.add_compatible_breakpoint(DEBUG_BREAKPOINT_DATA)?;
-        unsafe {
+        self.configure_new_breakpoint(&breakpoint, |breakpoint| unsafe {
             breakpoint.SetOffset(address)?;
             breakpoint.SetDataParameters(size, access_type)?;
             breakpoint.AddFlags(DEBUG_BREAKPOINT_ENABLED)?;
-        }
+            Ok(())
+        })?;
         self.breakpoint_info(&breakpoint)
     }
 
@@ -3700,7 +3754,7 @@ impl DebuggerSession {
         let breakpoint = self
             .add_compatible_breakpoint(DEBUG_BREAKPOINT_DATA)
             .context("DbgEng could not create a processor execute breakpoint")?;
-        unsafe {
+        self.configure_new_breakpoint(&breakpoint, |breakpoint| unsafe {
             breakpoint.SetOffset(address).with_context(|| {
                 format!("DbgEng could not set processor execute breakpoint offset 0x{address:X}")
             })?;
@@ -3709,8 +3763,8 @@ impl DebuggerSession {
                 .context("DbgEng could not configure a one-byte processor execute breakpoint")?;
             breakpoint
                 .AddFlags(DEBUG_BREAKPOINT_ENABLED)
-                .context("DbgEng could not enable the processor execute breakpoint")?;
-        }
+                .context("DbgEng could not enable the processor execute breakpoint")
+        })?;
         self.breakpoint_info(&breakpoint)
     }
 
@@ -3849,6 +3903,27 @@ impl DebuggerSession {
                 )
             }),
         }
+    }
+
+    /// Applies the caller's settings to a freshly added breakpoint and removes it again when
+    /// configuration fails, so a failed request does not leave an orphaned engine breakpoint.
+    fn configure_new_breakpoint<F>(
+        &self,
+        breakpoint: &windows::Win32::System::Diagnostics::Debug::Extensions::IDebugBreakpoint2,
+        configure: F,
+    ) -> anyhow::Result<()>
+    where
+        F: FnOnce(
+            &windows::Win32::System::Diagnostics::Debug::Extensions::IDebugBreakpoint2,
+        ) -> anyhow::Result<()>,
+    {
+        let result = configure(breakpoint);
+        if result.is_err() {
+            unsafe {
+                let _ = self.control.RemoveBreakpoint2(breakpoint);
+            }
+        }
+        result
     }
 
     fn module_info(&self, index: u32, base_address: u64) -> ModuleInfo {
@@ -4260,10 +4335,7 @@ fn launch_live_session_impl(options: LiveLaunchSessionOptions) -> anyhow::Result
     let system_objects: IDebugSystemObjects =
         client.cast().context("querying IDebugSystemObjects")?;
     let symbol_path = configure_dbgeng_symbol_path(&symbols)?;
-    match options.initial_stop {
-        LiveInitialStop::SoftwareBreakpoint => enable_initial_break(&control)?,
-        LiveInitialStop::CreateProcessEvent => enable_create_process_stop(&control)?,
-    }
+    configure_initial_stop(&control, options.initial_stop)?;
     unsafe {
         // DbgEng can mutate the command buffer; command_line is owned and remains live for the call.
         client
@@ -4321,7 +4393,7 @@ fn attach_live_session_impl(options: LiveAttachOptions) -> anyhow::Result<Debugg
     let system_objects: IDebugSystemObjects =
         client.cast().context("querying IDebugSystemObjects")?;
     let symbol_path = configure_dbgeng_symbol_path(&symbols)?;
-    enable_initial_break(&control)?;
+    configure_initial_stop(&control, LiveInitialStop::SoftwareBreakpoint)?;
     unsafe {
         client.AttachProcess(0, options.process_id, DEBUG_ATTACH_DEFAULT)?;
     }
@@ -4355,7 +4427,7 @@ fn open_dump_session_impl(options: DumpOpenOptions) -> anyhow::Result<DebuggerSe
     use windows::core::{Interface, PCWSTR};
     use windows::Win32::System::Diagnostics::Debug::Extensions::{
         IDebugClient5, IDebugControl5, IDebugDataSpaces4, IDebugRegisters, IDebugSymbols5,
-        IDebugSystemObjects, DEBUG_WAIT_DEFAULT,
+        IDebugSystemObjects,
     };
 
     let runtime = inspect_dbgeng_runtime()?;
@@ -4373,10 +4445,9 @@ fn open_dump_session_impl(options: DumpOpenOptions) -> anyhow::Result<DebuggerSe
     let symbol_path = configure_dbgeng_symbol_path(&symbols)?;
     unsafe {
         client.OpenDumpFileWide(PCWSTR(path.as_ptr()), 0)?;
-        control
-            .WaitForEvent(DEBUG_WAIT_DEFAULT, 5000)
-            .context("DbgEng dump WaitForEvent failed")?;
     }
+    // WaitForEvent reports its timeout as S_FALSE, which the generated wrapper maps to Ok.
+    wait_for_initial_event(&control, 5000, "dump open")?;
 
     Ok(DebuggerSession {
         kind: DebuggerSessionKind::Dump,
@@ -4602,20 +4673,19 @@ fn write_process_dump_file(
     };
     use windows::Win32::System::LibraryLoader::GetProcAddress;
     use windows::Win32::System::Threading::{
-        OpenProcess, PROCESS_QUERY_INFORMATION, PROCESS_VM_READ,
+        OpenProcess, PROCESS_DUP_HANDLE, PROCESS_QUERY_INFORMATION, PROCESS_VM_READ,
     };
 
     if !options.overwrite && options.path.exists() {
         bail!("dump output already exists: {}", options.path.display());
     }
 
-    let process = unsafe {
-        OpenProcess(
-            PROCESS_QUERY_INFORMATION | PROCESS_VM_READ,
-            false,
-            process_id,
-        )?
-    };
+    // MiniDumpWriteDump documents PROCESS_DUP_HANDLE as required to collect handle data.
+    let mut process_access = PROCESS_QUERY_INFORMATION | PROCESS_VM_READ;
+    if options.kind == DumpKind::Full {
+        process_access |= PROCESS_DUP_HANDLE;
+    }
+    let process = unsafe { OpenProcess(process_access, false, process_id)? };
     struct ProcessHandleGuard(HANDLE);
     impl Drop for ProcessHandleGuard {
         fn drop(&mut self) {
@@ -4625,14 +4695,6 @@ fn write_process_dump_file(
         }
     }
     let process_guard = ProcessHandleGuard(process);
-
-    let file = OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(options.overwrite)
-        .create_new(!options.overwrite)
-        .open(&options.path)
-        .with_context(|| format!("failed to create dump file: {}", options.path.display()))?;
 
     let dump_type = match options.kind {
         DumpKind::Mini => MINIDUMP_TYPE(0),
@@ -4663,6 +4725,13 @@ fn write_process_dump_file(
     // GetProcAddress returns an untyped module export. MiniDumpWriteDump has the documented
     // DbgHelp ABI and the module remains loaded for the duration of this call.
     let mini_dump_write_dump: MiniDumpWriteDumpFn = unsafe { std::mem::transmute(procedure) };
+    let file = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(options.overwrite)
+        .create_new(!options.overwrite)
+        .open(&options.path)
+        .with_context(|| format!("failed to create dump file: {}", options.path.display()))?;
     let write_result = unsafe {
         mini_dump_write_dump(
             process_guard.0,
@@ -4676,13 +4745,16 @@ fn write_process_dump_file(
     };
     let write_error = (!write_result.as_bool()).then(Error::from_win32);
     drop(process_guard);
+    drop(file);
     if let Some(error) = write_error {
+        // Do not leave a truncated dump behind; it would also block a no-overwrite retry.
+        let _ = std::fs::remove_file(&options.path);
         bail!("MiniDumpWriteDump failed: {error}");
     }
-    drop(file);
     let metadata = std::fs::metadata(&options.path)
         .with_context(|| format!("dump file was not created: {}", options.path.display()))?;
     if metadata.len() == 0 {
+        let _ = std::fs::remove_file(&options.path);
         bail!("created an empty dump file: {}", options.path.display());
     }
     Ok(DumpWriteResult {
@@ -5129,5 +5201,27 @@ mod tests {
         assert_eq!(entry.global, Some(true));
         assert!(entry.no_execute);
         assert_eq!(entry.page_frame_number, 0x12345);
+    }
+
+    #[test]
+    fn large_page_frame_number_excludes_the_pat_bit() {
+        // 2 MiB PDE at physical 0x4020_0000 with PS (bit 7) and PAT (bit 12) set.
+        let entry = x64_page_table_entry("PDE", 1, 0x2_000, 0x8000_0000_4020_1083);
+        assert!(entry.large_page);
+        assert_eq!(entry.page_frame_number, 0x4_0200);
+    }
+
+    #[test]
+    fn large_page_physical_address_masks_non_address_bits() {
+        // NX (bit 63), protection-key bits, and PAT (bit 12) must not leak into the address.
+        let raw = 0xf800_0000_4020_1083;
+        assert_eq!(
+            x64_large_page_physical_address(raw, 0xffff_8000_0012_3456, 1 << 21),
+            0x4032_3456
+        );
+        assert_eq!(
+            x64_large_page_physical_address(0x8000_0001_4000_1083, 0x3fff_ffff, 1 << 30),
+            0x1_7fff_ffff
+        );
     }
 }

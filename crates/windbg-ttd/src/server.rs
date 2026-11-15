@@ -111,15 +111,17 @@ inspect with ttd_trace_info, ttd_registers, ttd_read_memory, ttd_memory_watchpoi
         request: CallToolRequestParams,
         _context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
+        // MCP clients may omit `arguments` for tools whose fields are all optional;
+        // treat that as an empty object so struct deserialization succeeds.
         let call = ToolCall {
             name: request.name.into_owned(),
-            arguments: request.arguments.map(Value::Object).unwrap_or(Value::Null),
+            arguments: Value::Object(request.arguments.unwrap_or_default()),
         };
         let result = self.call_backend(call).await;
 
         match result {
             Ok(value) => Ok(tool_text(value)),
-            Err(error) => Ok(tool_error(json!({ "error": error.to_string() }))),
+            Err(error) => Ok(tool_error(json!({ "error": error_message(&error) }))),
         }
     }
 }
@@ -140,6 +142,12 @@ fn tool_error(value: Value) -> CallToolResult {
         is_error: Some(true),
         meta: None,
     }
+}
+
+/// Formats the full anyhow context chain; `to_string()` would keep only the
+/// outermost context (for example "invalid tool arguments") and drop the cause.
+fn error_message(error: &anyhow::Error) -> String {
+    format!("{error:#}")
 }
 
 fn pretty_json(value: Value) -> String {
@@ -167,6 +175,16 @@ mod tests {
         assert_eq!(
             error.content,
             vec![Content::text("{\n  \"error\": \"failed\"\n}")]
+        );
+    }
+
+    #[test]
+    fn tool_error_message_keeps_the_cause_chain() {
+        let error = anyhow::anyhow!("missing field `session_id`").context("invalid tool arguments");
+
+        assert_eq!(
+            error_message(&error),
+            "invalid tool arguments: missing field `session_id`"
         );
     }
 }

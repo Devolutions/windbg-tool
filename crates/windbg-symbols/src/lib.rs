@@ -6,6 +6,7 @@ use serde::Serialize;
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 pub const MICROSOFT_SYMBOL_SERVER: &str = "https://msdl.microsoft.com/download/symbols";
@@ -58,7 +59,7 @@ impl PeImageIdentity {
             is_safe_file_name(&image_name),
             "PE image filename must be a basename without path separators"
         );
-        let image_store_key = format!("{image_timestamp:X}{image_size:X}");
+        let image_store_key = format!("{image_timestamp:08X}{image_size:X}");
         Ok(Self {
             image_store_path: format!("{image_name}\\{image_store_key}\\{image_name}"),
             image_name,
@@ -95,6 +96,13 @@ pub fn inspect_pe_identity_bytes(
         OPTIONAL_HEADER_PE32_PLUS => optional + 112,
         _ => bail!("unsupported PE optional header magic 0x{magic:04x}"),
     };
+    // NumberOfRvaAndSizes immediately precedes the data directory array.
+    let data_dir_count = read_u32(data, data_dir_base - 4)? as usize;
+    ensure!(
+        data_dir_count > IMAGE_DIRECTORY_ENTRY_DEBUG
+            && data_dir_base + (IMAGE_DIRECTORY_ENTRY_DEBUG + 1) * 8 <= optional + optional_size,
+        "PE has no CodeView debug directory"
+    );
     let image_size = read_u32(data, optional + 56)?;
     let section_table = optional + optional_size;
     let sections = read_sections(data, section_table, section_count)?;
@@ -118,7 +126,7 @@ pub fn inspect_pe_identity_bytes(
         is_safe_file_name(&image_name),
         "PE image filename must be a basename without path separators"
     );
-    let image_store_key = format!("{timestamp:X}{image_size:X}");
+    let image_store_key = format!("{timestamp:08X}{image_size:X}");
     Ok(PeIdentity {
         image_store_path: format!("{image_name}\\{image_store_key}\\{image_name}"),
         image_name,
@@ -323,10 +331,12 @@ fn download_image_blocking(identity: &PeImageIdentity, cache_dir: &Path) -> anyh
         );
     }
 
+    static DOWNLOAD_SEQUENCE: AtomicU64 = AtomicU64::new(0);
     let temporary = parent.join(format!(
-        ".{}.{}.download",
+        ".{}.{}.{}.download",
         identity.image_name,
-        std::process::id()
+        std::process::id(),
+        DOWNLOAD_SEQUENCE.fetch_add(1, Ordering::Relaxed)
     ));
     let mut output = OpenOptions::new()
         .write(true)
@@ -463,13 +473,30 @@ fn is_safe_file_name(name: &str) -> bool {
 fn run_async<T: Send + 'static>(
     future: impl std::future::Future<Output = anyhow::Result<T>> + Send + 'static,
 ) -> anyhow::Result<T> {
-    match tokio::runtime::Handle::try_current() {
-        Ok(handle) => tokio::task::block_in_place(|| handle.block_on(future)),
-        Err(_) => tokio::runtime::Builder::new_multi_thread()
+    fn block_on_new_runtime<T>(
+        future: impl std::future::Future<Output = anyhow::Result<T>>,
+    ) -> anyhow::Result<T> {
+        tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
             .context("creating native symbol download runtime")?
-            .block_on(future),
+            .block_on(future)
+    }
+
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+            tokio::task::block_in_place(|| handle.block_on(future))
+        }
+        // `block_in_place` panics on a current-thread runtime, and blocking on a
+        // nested runtime from inside one is not allowed either, so run the
+        // download on a dedicated OS thread with its own runtime.
+        Ok(_) => std::thread::Builder::new()
+            .name("windbg-symbol-pdb-download".to_string())
+            .spawn(move || block_on_new_runtime(future))
+            .context("starting native symbol download thread")?
+            .join()
+            .map_err(|_| anyhow::anyhow!("native symbol download thread panicked"))?,
+        Err(_) => block_on_new_runtime(future),
     }
 }
 
@@ -622,6 +649,46 @@ mod tests {
             image_download_url(&identity).unwrap().as_str(),
             "https://msdl.microsoft.com/download/symbols/ntoskrnl.exe/90B083DA1450000/ntoskrnl.exe"
         );
+    }
+
+    #[test]
+    fn image_store_key_zero_pads_timestamp_to_eight_digits() {
+        let identity = PeImageIdentity::new("ntdll.dll", 0x0012_3456, 0x0020_1000).unwrap();
+
+        assert_eq!(identity.image_store_key, "00123456201000");
+        assert_eq!(
+            identity.image_store_path,
+            "ntdll.dll\\00123456201000\\ntdll.dll"
+        );
+    }
+
+    #[test]
+    fn pe_identity_ignores_debug_slot_beyond_number_of_rva_and_sizes() {
+        let mut bytes = test_pe_header(0x4A63_AF4E, 0x0145_0000);
+        let optional = 0x84 + 20;
+        // Only six data directories are present; the bytes where the debug
+        // directory would be belong to something else (e.g. the section table).
+        bytes[0x84 + 16..0x84 + 18].copy_from_slice(&(112u16 + 6 * 8).to_le_bytes());
+        bytes[optional + 108..optional + 112].copy_from_slice(&6u32.to_le_bytes());
+        let debug_dir = optional + 112 + IMAGE_DIRECTORY_ENTRY_DEBUG * 8;
+        bytes[debug_dir..debug_dir + 4].copy_from_slice(&0x2000u32.to_le_bytes());
+        bytes[debug_dir + 4..debug_dir + 8].copy_from_slice(&28u32.to_le_bytes());
+
+        let error = inspect_pe_identity_bytes(&bytes, Some("test.exe")).unwrap_err();
+        assert!(
+            error.to_string().contains("no CodeView debug directory"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn run_async_does_not_panic_inside_current_thread_runtime() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let value = runtime.block_on(async { run_async(async { Ok(42u32) }) });
+        assert_eq!(value.unwrap(), 42);
     }
 
     #[test]

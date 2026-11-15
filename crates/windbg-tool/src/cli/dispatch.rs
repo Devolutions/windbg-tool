@@ -7,6 +7,17 @@ use super::platform;
 use super::remote;
 use super::*;
 
+/// clap renders errors as `error: ...`; failure output already adds its own `Error:` prefix
+/// (or a structured envelope), so strip clap's prefix and trailing blank lines.
+fn clap_error_message(error: &clap::Error) -> String {
+    let rendered = error.to_string();
+    let trimmed = rendered.trim_end();
+    trimmed
+        .strip_prefix("error: ")
+        .unwrap_or(trimmed)
+        .to_string()
+}
+
 pub(super) async fn run_cli() -> anyhow::Result<()> {
     let cli = match Cli::try_parse() {
         Ok(cli) => cli,
@@ -19,7 +30,7 @@ pub(super) async fn run_cli() -> anyhow::Result<()> {
             error.print()?;
             return Ok(());
         }
-        Err(error) => return Err(invalid_argument(error.to_string()).into()),
+        Err(error) => return Err(invalid_argument(clap_error_message(&error)).into()),
     };
     let output = OutputOptions::new(cli.compact, cli.field, cli.raw, cli.envelope);
     let pipe = cli.pipe.unwrap_or_else(default_pipe_name);
@@ -542,5 +553,19 @@ pub(super) async fn run_cli() -> anyhow::Result<()> {
         Some(Commands::Watchpoint(args)) => {
             call_and_print(pipe, watchpoint_call(args)?, &output).await
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn strips_clap_error_prefix_and_trailing_whitespace() {
+        let error =
+            Cli::try_parse_from(["windbg-tool", "memory", "read", "--session", "x"]).unwrap_err();
+        let message = clap_error_message(&error);
+        assert!(message.starts_with("invalid value 'x'"), "{message}");
+        assert!(!message.ends_with('\n'), "{message:?}");
     }
 }
