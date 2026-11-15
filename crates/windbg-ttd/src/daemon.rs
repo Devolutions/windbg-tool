@@ -12,20 +12,33 @@ const LEGACY_PIPE_ENV: &str = "TTD_MCP_PIPE";
 
 pub fn default_pipe_name() -> String {
     if let Some(pipe) = env::var_os(PIPE_ENV).and_then(non_empty_os_string) {
-        return pipe;
+        return normalize_pipe_name(&pipe);
     }
     if let Some(pipe) = env::var_os(LEGACY_PIPE_ENV).and_then(non_empty_os_string) {
-        return pipe;
+        return normalize_pipe_name(&pipe);
     }
 
     let mut hasher = DefaultHasher::new();
     env::var("USERNAME")
         .unwrap_or_else(|_| "user".to_string())
+        .to_ascii_lowercase()
         .hash(&mut hasher);
     if let Ok(current_dir) = env::current_dir() {
-        current_dir.hash(&mut hasher);
+        current_dir
+            .to_string_lossy()
+            .to_ascii_lowercase()
+            .hash(&mut hasher);
     }
     format!(r"\\.\pipe\windbg-tool-{:016x}", hasher.finish())
+}
+
+pub fn normalize_pipe_name(pipe: &str) -> String {
+    let trimmed = pipe.trim();
+    if trimmed.starts_with(r"\\") {
+        trimmed.to_string()
+    } else {
+        format!(r"\\.\pipe\{trimmed}")
+    }
 }
 
 fn non_empty_os_string(value: std::ffi::OsString) -> Option<String> {
@@ -35,7 +48,7 @@ fn non_empty_os_string(value: std::ffi::OsString) -> Option<String> {
 
 #[cfg(windows)]
 pub async fn run_daemon(pipe_name: String) -> anyhow::Result<()> {
-    windows::run_daemon(pipe_name).await
+    windows::run_daemon(normalize_pipe_name(&pipe_name)).await
 }
 
 #[cfg(not(windows))]
@@ -52,7 +65,9 @@ pub struct DaemonClient {
 #[cfg(windows)]
 impl DaemonClient {
     pub fn new(pipe_name: String) -> Self {
-        Self { pipe_name }
+        Self {
+            pipe_name: normalize_pipe_name(&pipe_name),
+        }
     }
 
     pub async fn health(&self) -> anyhow::Result<Value> {
@@ -304,15 +319,21 @@ mod windows {
     }
 
     async fn read_body(request: Request<Incoming>) -> anyhow::Result<Bytes> {
-        let body = request
-            .into_body()
+        let limited = http_body_util::Limited::new(request.into_body(), MAX_REQUEST_BYTES);
+        let body = limited
             .collect()
             .await
-            .context("reading HTTP request body")?
+            .map_err(|error| {
+                if error
+                    .downcast_ref::<http_body_util::LengthLimitError>()
+                    .is_some()
+                {
+                    anyhow::anyhow!("request body exceeds {MAX_REQUEST_BYTES} bytes")
+                } else {
+                    anyhow::anyhow!("reading HTTP request body: {error}")
+                }
+            })?
             .to_bytes();
-        if body.len() > MAX_REQUEST_BYTES {
-            bail!("request body exceeds {} bytes", MAX_REQUEST_BYTES);
-        }
         Ok(body)
     }
 
@@ -434,6 +455,9 @@ mod windows {
             .context("daemon response status code was invalid")?;
 
         let body_end = response_body_end(bytes)?.unwrap_or(bytes.len());
+        if body_end > MAX_RESPONSE_BYTES {
+            bail!("daemon response exceeds {MAX_RESPONSE_BYTES} bytes");
+        }
         if body_end > bytes.len() {
             bail!("daemon response ended before the declared content-length");
         }

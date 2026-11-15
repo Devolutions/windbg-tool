@@ -52,3 +52,20 @@ fn falls_back_to_neutral_package() -> anyhow::Result<()> {
     );
     Ok(())
 }
+
+#[test]
+fn rejects_unsafe_appinstaller_versions() {
+    for bad_version in ["..", "../evil", "1.0/../../evil", ".download", "C:1.0"] {
+        let xml = format!(
+            r#"
+            <AppInstaller Version="{bad_version}" xmlns="http://schemas.microsoft.com/appx/appinstaller/2018">
+              <MainBundle Uri="https://example.test/windbg.msixbundle" />
+            </AppInstaller>
+            "#
+        );
+        assert!(
+            parse_appinstaller(&xml).is_err(),
+            "accepted unsafe version {bad_version:?}"
+        );
+    }
+}

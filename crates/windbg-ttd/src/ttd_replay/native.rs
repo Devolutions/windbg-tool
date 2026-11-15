@@ -404,12 +404,15 @@ pub struct NativeTrace {
 
 pub struct NativeCursor {
     bridge: Arc<NativeBridge>,
+    _trace: Arc<NativeTrace>,
     handle: NonNull<TtdMcpCursor>,
 }
 
+// SAFETY: NativeTrace methods synchronize access through TtdMcpTrace::mutex in the C++ bridge.
 unsafe impl Send for NativeBridge {}
 unsafe impl Sync for NativeBridge {}
 unsafe impl Send for NativeTrace {}
+unsafe impl Sync for NativeTrace {}
 unsafe impl Send for NativeCursor {}
 
 impl NativeBridge {
@@ -662,7 +665,7 @@ impl NativeTrace {
         })
     }
 
-    pub fn new_cursor(&self) -> anyhow::Result<NativeCursor> {
+    pub fn new_cursor(self: &Arc<Self>) -> anyhow::Result<NativeCursor> {
         let new_cursor: Symbol<NewCursorFn> =
             unsafe { self.bridge.symbol(b"ttd_mcp_new_cursor\0")? };
         let mut handle = std::ptr::null_mut();
@@ -672,6 +675,7 @@ impl NativeTrace {
 
         Ok(NativeCursor {
             bridge: Arc::clone(&self.bridge),
+            _trace: Arc::clone(self),
             handle,
         })
     }
@@ -922,7 +926,7 @@ impl NativeCursor {
             sequence: result.sequence,
             bytes_available: result.bytes_available,
             bytes_returned,
-            complete: result.complete != 0,
+            complete: result.complete != 0 && result.bytes_available > 0,
             policy,
             encoding: "hex".to_string(),
             data: bytes_to_hex(&buffer),

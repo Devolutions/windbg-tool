@@ -302,7 +302,9 @@ fn classify(
     } else if instruction.mnemonic() == Mnemonic::Mov
         && instruction.op0_kind() == OpKind::Register
         && instruction.op1_kind() == OpKind::Register
+        && instruction.op0_register().size() >= 4
         && instruction.op1_register().full_register() != Register::None
+        && instruction.op0_register().full_register() != instruction.op1_register().full_register()
     {
         let source = instruction.op1_register();
         step["source_register"] = json!(register_name(source));

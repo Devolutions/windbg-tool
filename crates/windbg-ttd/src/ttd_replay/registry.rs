@@ -6,6 +6,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::Arc;
 
 const PEB_PROCESS_PARAMETERS_OFFSET_X64: usize = 0x20;
 const TEB_STACK_BASE_OFFSET_X64: usize = 0x08;
@@ -30,9 +31,9 @@ pub struct SessionRegistry {
 struct TraceSession {
     info: TraceInfo,
     symbols: ResolvedSymbolConfig,
-    native: Option<NativeTrace>,
     next_cursor_id: CursorId,
     cursors: HashMap<CursorId, ReplayCursor>,
+    native: Option<Arc<NativeTrace>>,
 }
 
 struct ReplayCursor {
@@ -72,7 +73,7 @@ impl SessionRegistry {
         let symbol_path = symbols.symbol_path.clone();
         let needs_trace_list = request.trace_index.is_some() || request.companion_path.is_some();
         let (info, native) = match try_open_native_trace(&request, &symbols) {
-            Ok((info, native)) => (info, Some(native)),
+            Ok((info, native)) => (info, Some(Arc::new(native))),
             Err(error) if needs_trace_list => return Err(error),
             Err(error) => (
                 placeholder_trace_info(request.trace_path.clone(), error),
@@ -85,9 +86,9 @@ impl SessionRegistry {
             TraceSession {
                 info: info.clone(),
                 symbols: symbols.clone(),
-                native,
                 next_cursor_id: 0,
                 cursors: HashMap::new(),
+                native,
             },
         );
 
@@ -152,7 +153,17 @@ impl SessionRegistry {
     }
 
     pub fn trace_info(&self, session_id: SessionId) -> anyhow::Result<TraceInfo> {
-        Ok(self.session(session_id)?.info.clone())
+        let session = self.session(session_id)?;
+        let mut info = session.info.clone();
+        if let Some(native) = session.native.as_ref() {
+            if let Ok(status) = native.index_status(session_id) {
+                info.index_status = status.status;
+            }
+            if let Ok(latest) = native.trace_info() {
+                info.keyframe_count = latest.keyframe_count();
+            }
+        }
+        Ok(info)
     }
 
     pub fn capabilities(&self, session_id: SessionId) -> anyhow::Result<CapabilitiesResponse> {
@@ -330,8 +341,13 @@ impl SessionRegistry {
     }
 
     pub fn module_info(&self, request: ModuleInfoRequest) -> anyhow::Result<ModuleInfoResponse> {
+        let query_name = request
+            .name
+            .as_deref()
+            .map(str::trim)
+            .filter(|name| !name.is_empty());
         ensure!(
-            request.name.is_some() || request.address.is_some(),
+            query_name.is_some() || request.address.is_some(),
             "name or address is required"
         );
         let modules = self.list_modules(request.session_id)?.modules;
@@ -350,7 +366,7 @@ impl SessionRegistry {
             }
         }
 
-        if let Some(name) = request.name.as_deref() {
+        if let Some(name) = query_name {
             if let Some(module) = modules
                 .iter()
                 .find(|module| module_name_matches(module, name))
@@ -597,8 +613,10 @@ impl SessionRegistry {
             .ok_or_else(|| anyhow::anyhow!("TEB read did not include StackBase"))?;
         let stack_limit = read_u64(&teb, TEB_STACK_LIMIT_OFFSET_X64)
             .ok_or_else(|| anyhow::anyhow!("TEB read did not include StackLimit"))?;
-        let stack_pointer_in_range =
-            stack_limit <= registers.stack_pointer && registers.stack_pointer <= stack_base;
+        let stack_pointer_in_range = stack_limit > 0
+            && stack_limit < stack_base
+            && stack_limit <= registers.stack_pointer
+            && registers.stack_pointer <= stack_base;
 
         Ok(StackInfo {
             session_id,
@@ -632,7 +650,14 @@ impl SessionRegistry {
         })?;
         let pointers = if request.decode_pointers {
             let bytes = hex_to_bytes(&memory.data)?;
-            let modules = self.list_modules(request.session_id)?.modules;
+            let modules = self
+                .cursor_modules(request.session_id, request.cursor_id)
+                .map(|modules| modules.modules)
+                .unwrap_or_else(|_| {
+                    self.list_modules(request.session_id)
+                        .map(|modules| modules.modules)
+                        .unwrap_or_default()
+                });
             decode_stack_pointers(memory.address, &bytes, &modules)
         } else {
             Vec::new()
@@ -682,11 +707,14 @@ impl SessionRegistry {
             "PEB ProcessParameters pointer is null"
         );
 
+        let command_line_field_address = process_parameters_address
+            .checked_add(RTL_USER_PROCESS_PARAMETERS_COMMAND_LINE_OFFSET_X64 as u64)
+            .ok_or_else(|| anyhow::anyhow!("ProcessParameters CommandLine address overflow"))?;
         let process_parameters = read_exact_memory(
             cursor,
             session_id,
             cursor_id,
-            process_parameters_address + RTL_USER_PROCESS_PARAMETERS_COMMAND_LINE_OFFSET_X64 as u64,
+            command_line_field_address,
             UNICODE_STRING_X64_SIZE as u32,
             "RTL_USER_PROCESS_PARAMETERS.CommandLine",
         )?;
@@ -921,7 +949,7 @@ fn hex_to_bytes(hex: &str) -> anyhow::Result<Vec<u8>> {
         "hex string length must be even"
     );
     let mut bytes = Vec::with_capacity(hex.len() / 2);
-    for chunk in hex.as_bytes().chunks_exact(2) {
+    for chunk in hex.as_bytes().as_chunks::<2>().0 {
         let high = hex_digit(chunk[0])?;
         let low = hex_digit(chunk[1])?;
         bytes.push((high << 4) | low);
@@ -954,10 +982,17 @@ fn utf16le_to_string(bytes: &[u8]) -> anyhow::Result<String> {
         "UTF-16LE byte count must be even"
     );
     let units = bytes
-        .chunks_exact(2)
-        .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .copied()
+        .map(u16::from_le_bytes)
         .collect::<Vec<_>>();
-    String::from_utf16(&units).map_err(Into::into)
+    let end = units
+        .iter()
+        .position(|&unit| unit == 0)
+        .unwrap_or(units.len());
+    String::from_utf16(&units[..end]).map_err(Into::into)
 }
 
 fn apply_i64_offset(base: u64, offset: i64) -> anyhow::Result<u64> {
@@ -975,12 +1010,13 @@ fn decode_stack_pointers(
     modules: &[TraceModule],
 ) -> Vec<StackPointerValue> {
     bytes
-        .chunks_exact(POINTER_SIZE_X64)
+        .as_chunks::<POINTER_SIZE_X64>()
+        .0
+        .iter()
         .enumerate()
         .filter_map(|(index, chunk)| {
             let offset = (index * POINTER_SIZE_X64) as u32;
-            let raw: [u8; POINTER_SIZE_X64] = chunk.try_into().ok()?;
-            let value = u64::from_le_bytes(raw);
+            let value = u64::from_le_bytes(*chunk);
             if value == 0 {
                 return None;
             }
@@ -1005,7 +1041,14 @@ fn address_in_module(address: u64, module: &TraceModule) -> bool {
 }
 
 fn module_name_matches(module: &TraceModule, query: &str) -> bool {
+    let query = query.trim();
+    if query.is_empty() {
+        return false;
+    }
     module.name.eq_ignore_ascii_case(query)
+        || Path::new(&module.name)
+            .file_stem()
+            .is_some_and(|stem| stem.to_string_lossy().eq_ignore_ascii_case(query))
         || module
             .path
             .as_ref()
@@ -1013,6 +1056,9 @@ fn module_name_matches(module: &TraceModule, query: &str) -> bool {
         || module.path.as_ref().is_some_and(|path| {
             path.file_name()
                 .is_some_and(|file_name| file_name.to_string_lossy().eq_ignore_ascii_case(query))
+                || path
+                    .file_stem()
+                    .is_some_and(|stem| stem.to_string_lossy().eq_ignore_ascii_case(query))
         })
 }
 
@@ -1082,13 +1128,14 @@ fn register_context(registers: &CursorRegisters) -> AddressRegisterContext {
 }
 
 fn stack_context(address: u64, stack: &StackInfo) -> AddressStackContext {
+    let valid_stack = stack.stack_limit > 0 && stack.stack_limit < stack.stack_base;
     AddressStackContext {
         stack_base: stack.stack_base,
         stack_base_hex: hex_u64(stack.stack_base),
         stack_limit: stack.stack_limit,
         stack_limit_hex: hex_u64(stack.stack_limit),
         stack_pointer_in_range: stack.stack_pointer_in_range,
-        address_in_stack: stack.stack_limit <= address && address < stack.stack_base,
+        address_in_stack: valid_stack && stack.stack_limit <= address && address < stack.stack_base,
         offset_from_sp: signed_delta(address, stack.stack_pointer),
         offset_from_fp: signed_delta(address, stack.frame_pointer),
     }
@@ -1139,6 +1186,10 @@ fn try_open_native_trace(
         bridge.open_trace(&request.trace_path, symbols)?
     };
     let info = native.trace_info()?;
+    let index_status = native
+        .index_status(0)
+        .map(|status| status.status)
+        .unwrap_or_else(|_| "loaded".to_string());
     let trace_file = trace_metadata
         .as_ref()
         .map(|metadata| metadata.file.clone());
@@ -1156,7 +1207,7 @@ fn try_open_native_trace(
         TraceInfo {
             trace_path: request.trace_path.clone(),
             backend: "ttd-replay-native".to_string(),
-            index_status: "loaded".to_string(),
+            index_status,
             trace_file,
             trace_session_id,
             trace_group_id,
@@ -1301,5 +1352,55 @@ mod tests {
         ];
         assert_eq!(index_build_flags(&flags).unwrap(), 0x07);
         assert!(index_build_flags(&["unknown".to_string()]).is_err());
+    }
+
+    #[test]
+    fn matches_module_name_by_stem_and_rejects_empty_query() {
+        let module = TraceModule {
+            name: "ping.exe".to_string(),
+            path: Some(PathBuf::from(r"C:\Windows\System32\ping.exe")),
+            base_address: 0x1000,
+            size: 0x2000,
+            load_position: None,
+            unload_position: None,
+        };
+        assert!(module_name_matches(&module, "ping"));
+        assert!(module_name_matches(&module, "PING.EXE"));
+        assert!(module_name_matches(&module, " ping "));
+        assert!(!module_name_matches(&module, ""));
+        assert!(!module_name_matches(&module, "   "));
+    }
+
+    #[test]
+    fn utf16le_to_string_truncates_at_first_nul() {
+        let bytes = [b'p', 0, b'i', 0, 0, 0, b'x', 0];
+        assert_eq!(utf16le_to_string(&bytes).unwrap(), "pi");
+    }
+
+    #[test]
+    fn stack_context_rejects_zero_or_inverted_bounds() {
+        let invalid = StackInfo {
+            session_id: 1,
+            cursor_id: 1,
+            position: Position::MIN,
+            thread: None,
+            teb_address: 0x1000,
+            stack_base: 0,
+            stack_limit: 0,
+            stack_pointer: 0,
+            frame_pointer: 0,
+            stack_pointer_in_range: false,
+        };
+        assert!(!stack_context(0, &invalid).address_in_stack);
+
+        let valid = StackInfo {
+            stack_base: 0x2000,
+            stack_limit: 0x1000,
+            stack_pointer: 0x2000,
+            stack_pointer_in_range: true,
+            ..invalid
+        };
+        assert!(stack_context(0x1ff8, &valid).address_in_stack);
+        assert!(!stack_context(0x2000, &valid).address_in_stack);
     }
 }

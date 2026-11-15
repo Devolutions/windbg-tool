@@ -719,16 +719,31 @@ fn cpp_exception(
         info.catchable_type_count = Some(count);
         let take = count.min(MAX_CPP_EXCEPTION_TYPES);
         info.types_truncated = count > take;
-        let entries = read_exact(memory, catchable_array + 4, take * 4)
+        let entries_addr = catchable_array
+            .checked_add(4)
+            .context("CatchableTypeArray entries address overflow")?;
+        let entries = read_exact(memory, entries_addr, take * 4)
             .context("reading CatchableTypeArray entries")?;
         for index in 0..take as usize {
-            let catchable_type = resolve(minidump_u32(&entries, index * 4));
+            let catchable_type_field = minidump_u32(&entries, index * 4);
+            ensure!(
+                catchable_type_field != 0,
+                "CatchableType {index} pointer/RVA is null"
+            );
+            let catchable_type = resolve(catchable_type_field);
             let catchable = read_exact(memory, catchable_type, 8)
                 .with_context(|| format!("reading CatchableType {index}"))?;
-            let type_descriptor = resolve(minidump_u32(&catchable, 4));
-            let (decorated_name, name_truncated) =
-                read_c_string(memory, type_descriptor + u64::from(pointer_size) * 2)
-                    .with_context(|| format!("reading TypeDescriptor {index} name"))?;
+            let type_descriptor_field = minidump_u32(&catchable, 4);
+            ensure!(
+                type_descriptor_field != 0,
+                "TypeDescriptor {index} pointer/RVA is null"
+            );
+            let type_descriptor = resolve(type_descriptor_field);
+            let name_addr = type_descriptor
+                .checked_add(u64::from(pointer_size) * 2)
+                .with_context(|| format!("TypeDescriptor {index} name address overflow"))?;
+            let (decorated_name, name_truncated) = read_c_string(memory, name_addr)
+                .with_context(|| format!("reading TypeDescriptor {index} name"))?;
             info.types.push(CppExceptionType {
                 name: undecorate_type_name(&decorated_name),
                 decorated_name,
@@ -741,7 +756,10 @@ fn cpp_exception(
                 .iter()
                 .any(|entry| entry.decorated_name == CPP_STD_EXCEPTION_TYPE)
         {
-            let what_pointer = read_exact(memory, object + u64::from(pointer_size), pointer_size)
+            let what_field_addr = object
+                .checked_add(u64::from(pointer_size))
+                .context("std::exception data address overflow")?;
+            let what_pointer = read_exact(memory, what_field_addr, pointer_size)
                 .context("reading std::exception data")?;
             let what_pointer = if relative {
                 minidump_u64(&what_pointer, 0)
@@ -1170,12 +1188,14 @@ impl super::DebuggerSession {
         }
         let mut unwind = rva(&entry, 8);
         for _ in 0..8 {
-            let header = self.read_guest(base + unwind, 4).ok()?;
+            let unwind_addr = base.checked_add(unwind)?;
+            let header = self.read_guest(unwind_addr, 4).ok()?;
             if header.len() < 4 || header[0] >> 3 & UNW_FLAG_CHAININFO == 0 {
-                return Some(base + begin);
+                return base.checked_add(begin);
             }
             let chained_offset = 4 + ((u64::from(header[2]) + 1) & !1) * 2;
-            let chained = self.read_guest(base + unwind + chained_offset, 12).ok()?;
+            let chained_addr = unwind_addr.checked_add(chained_offset)?;
+            let chained = self.read_guest(chained_addr, 12).ok()?;
             if chained.len() < 12 {
                 return None;
             }

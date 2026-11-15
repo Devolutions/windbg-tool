@@ -69,6 +69,10 @@ pub fn timeline_sequence(event: &Value) -> u64 {
     event["sequence"].as_u64().unwrap_or(u64::MAX)
 }
 
+pub fn timeline_steps(event: &Value) -> u64 {
+    event["position"]["steps"].as_u64().unwrap_or(0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

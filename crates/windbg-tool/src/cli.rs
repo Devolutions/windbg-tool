@@ -548,6 +548,33 @@ enum TargetCommand {
     Source(TargetAddressArgs),
     #[command(about = "Write a process dump from a daemon-owned live target")]
     Dump(TargetDumpArgs),
+    #[command(
+        about = "Run pure memory/disassembly/stack classifiers against a daemon-owned live or dump target"
+    )]
+    Analysis {
+        #[command(subcommand)]
+        command: TargetAnalysisCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum TargetAnalysisCommand {
+    #[command(
+        about = "Disassemble x64 instructions from a target using the shared iced-x86 helper"
+    )]
+    Disasm(TargetAnalysisDisasmArgs),
+    #[command(about = "Format a target memory window (db/dq/ascii/utf16)")]
+    MemoryDump(TargetAnalysisMemoryDumpArgs),
+    #[command(about = "Classify a target memory window (entropy, strings, pointer-like qwords)")]
+    MemoryClassify(TargetAnalysisMemoryArgs),
+    #[command(about = "Extract bounded ASCII/UTF-16 strings from a target memory window")]
+    MemoryStrings(TargetAnalysisMemoryStringsArgs),
+    #[command(about = "Dump pointer-sized slots from a target memory window")]
+    MemoryDps(TargetAnalysisMemoryDpsArgs),
+    #[command(about = "Follow a bounded pointer chain through target memory")]
+    MemoryChase(TargetAnalysisMemoryChaseArgs),
+    #[command(about = "Recover return-address candidates from a target stack window")]
+    StackRecover(TargetAnalysisStackRecoverArgs),
 }
 
 #[derive(Debug, Subcommand)]
@@ -1704,6 +1731,96 @@ struct TargetDisasmArgs {
 }
 
 #[derive(Debug, Args)]
+struct TargetAnalysisDisasmArgs {
+    #[arg(short = 't', long = "target")]
+    target: u64,
+    #[arg(long)]
+    address: Option<String>,
+    #[arg(long, default_value_t = 16)]
+    count: u32,
+    #[arg(long, default_value_t = 128)]
+    bytes: u32,
+}
+
+#[derive(Debug, Args)]
+struct TargetAnalysisMemoryArgs {
+    #[arg(short = 't', long = "target")]
+    target: u64,
+    #[arg(long)]
+    address: String,
+    #[arg(long, default_value_t = 256)]
+    size: u32,
+}
+
+#[derive(Debug, Args)]
+struct TargetAnalysisMemoryDumpArgs {
+    #[arg(short = 't', long = "target")]
+    target: u64,
+    #[arg(long)]
+    address: String,
+    #[arg(long, default_value_t = 256)]
+    size: u32,
+    #[arg(long, default_value = "db", value_parser = ["db", "dq", "ascii", "utf16"])]
+    format: String,
+}
+
+#[derive(Debug, Args)]
+struct TargetAnalysisMemoryStringsArgs {
+    #[arg(short = 't', long = "target")]
+    target: u64,
+    #[arg(long)]
+    address: String,
+    #[arg(long, default_value_t = 256)]
+    size: u32,
+    #[arg(long, default_value = "both", value_parser = ["ascii", "utf16", "both"])]
+    encoding: String,
+    #[arg(long, default_value_t = 4)]
+    min_len: usize,
+    #[arg(long, default_value_t = 256)]
+    max_strings: usize,
+}
+
+#[derive(Debug, Args)]
+struct TargetAnalysisMemoryDpsArgs {
+    #[arg(short = 't', long = "target")]
+    target: u64,
+    #[arg(long)]
+    address: String,
+    #[arg(long, default_value_t = 256)]
+    size: u32,
+    #[arg(long, default_value_t = 8)]
+    pointer_size: u32,
+}
+
+#[derive(Debug, Args)]
+struct TargetAnalysisMemoryChaseArgs {
+    #[arg(short = 't', long = "target")]
+    target: u64,
+    #[arg(long)]
+    address: String,
+    #[arg(long, default_value_t = 0)]
+    offset: u64,
+    #[arg(long, default_value_t = 8)]
+    depth: u32,
+    #[arg(long, default_value_t = 8)]
+    pointer_size: u32,
+}
+
+#[derive(Debug, Args)]
+struct TargetAnalysisStackRecoverArgs {
+    #[arg(short = 't', long = "target")]
+    target: u64,
+    #[arg(long)]
+    address: Option<String>,
+    #[arg(long, default_value_t = 4096)]
+    size: u32,
+    #[arg(long, default_value_t = 64)]
+    max_candidates: usize,
+    #[arg(long, default_value_t = 0.45)]
+    min_confidence: f64,
+}
+
+#[derive(Debug, Args)]
 struct BreakpointSetArgs {
     #[arg(short = 't', long = "target")]
     target: u64,
@@ -2376,7 +2493,9 @@ async fn target_capabilities_and_print(
                         "status",
                         "wait",
                         "continue",
+                        "continue_and_wait",
                         "step_into",
+                        "step_over",
                         "registers",
                         "last_event",
                         "memory",
@@ -2388,10 +2507,12 @@ async fn target_capabilities_and_print(
                         "source_lookup",
                         "disassembly",
                         "breakpoints",
+                        "symbol_breakpoints",
+                        "output_capture",
                         "expression_evaluation",
                         "dump_write"
                     ],
-                    "missing": ["event_streaming", "step_over", "step_out", "symbol_breakpoints", "output_capture"]
+                    "missing": ["event_streaming", "step_out"]
                 },
                 {
                     "kind": "dump",
@@ -2857,7 +2978,12 @@ fn expected_command_path_depth(path: &[String]) -> usize {
     match path {
         [] => 1,
         [command] if command_requires_subcommand(command) => 2,
-        [command, subcommand] if command == "debug" && subcommand == "log" => 3,
+        [command, subcommand]
+            if (command == "debug" && subcommand == "log")
+                || (command == "target" && subcommand == "analysis") =>
+        {
+            3
+        }
         [command, ..] if command_requires_subcommand(command) => 2,
         _ => 1,
     }
@@ -2881,6 +3007,7 @@ fn command_requires_subcommand(command: &str) -> bool {
             | "architecture"
             | "arch"
             | "index"
+            | "exception"
             | "events"
             | "timeline"
             | "module"
@@ -3177,9 +3304,10 @@ fn command_metadata_for(metadata: &Value, path: &str) -> Option<Value> {
     metadata
         .as_array()
         .and_then(|items| {
-            items
-                .iter()
-                .find(|item| item["command"].as_str() == Some(path))
+            items.iter().find(|item| {
+                item["command"].as_str() == Some(path)
+                    || (path.starts_with("triage ") && item["command"].as_str() == Some("triage"))
+            })
         })
         .cloned()
 }
@@ -3196,18 +3324,23 @@ fn inferred_command_metadata(command: &Command, path: &[String]) -> Value {
             | "symbols exports"
             | "dbgeng server"
             | "dbgsrv"
+            | "trace record"
             | "windbg status"
             | "windbg install"
             | "windbg update"
             | "windbg path"
             | "windbg run"
             | "dump inspect"
+            | "dump triage"
+            | "dump pool-triage"
             | "dump create"
             | "live capabilities"
             | "live launch"
             | "live startup-break"
             | "live startup-profile"
+            | "live startup-compare"
             | "live startup-report"
+            | "live managed-break"
             | "breakpoint capabilities"
             | "datamodel capabilities"
     );
@@ -3222,7 +3355,13 @@ fn inferred_command_metadata(command: &Command, path: &[String]) -> Value {
         "cost": if has_session || has_cursor { "depends_on_trace_and_bounds" } else { "low" },
         "safety": if path_string.contains("terminate") || path_string.contains("remove") || path_string.contains("cancel") {
             "destructive"
-        } else if path_string.contains("write") || path_string.contains("dump") || path_string.contains("set") || path_string.contains("continue") || path_string.contains("step") {
+        } else if path_string.contains("write")
+            || path_string == "dump create"
+            || path_string == "target dump"
+            || path_string.contains("set")
+            || path_string.contains("continue")
+            || path_string.contains("step")
+        {
             "mutating_or_side_effecting"
         } else {
             "read_only"
@@ -3469,14 +3608,12 @@ fn tool_command_map() -> Value {
         { "tool": "recipes_list", "commands": ["recipes"] },
         { "tool": "recipes_get", "commands": ["recipes <topic>"] },
         { "tool": "debug_capabilities", "commands": ["debug capabilities"] },
-        { "tool": "daemon_health", "commands": ["daemon status"] },
-        { "tool": "session_list", "commands": ["sessions"] },
+        { "tool": "daemon_health", "commands": ["daemon status", "daemon ensure"] },
+        { "tool": "session_list", "commands": ["sessions", "ls"] },
         { "tool": "ttd_open", "commands": ["open"] },
         { "tool": "ttd_context_snapshot", "commands": ["context snapshot"] },
         { "tool": "debug_snapshot", "commands": ["debug snapshot"] },
         { "tool": "triage_run", "commands": ["triage crash", "triage hang", "triage access-violation", "triage memory-corruption", "triage loader", "triage symbol-health", "triage deadlock"] },
-        { "tool": "daemon_health", "commands": ["daemon status", "daemon ensure"] },
-        { "tool": "session_list", "commands": ["sessions"] },
         { "tool": "ttd_load_trace", "commands": ["load", "open"] },
         { "tool": "ttd_trace_list", "commands": ["trace list", "trace-list"] },
         { "tool": "ttd_close_trace", "commands": ["close"] },
@@ -4974,13 +5111,19 @@ fn insert_option(object: &mut Map<String, Value>, key: &str, value: Option<Value
 }
 
 fn parse_position_argument(value: &str) -> anyhow::Result<Value> {
-    if let Ok(percent) = value.parse::<u8>() {
+    let trimmed = value.trim();
+    let candidate = trimmed.strip_suffix('%').unwrap_or(trimmed).trim();
+    if let Ok(percent) = candidate.parse::<u8>() {
+        ensure!(
+            percent <= 100,
+            "position percentage must be between 0 and 100, got {percent}"
+        );
         return Ok(json!(percent));
     }
-    if value.trim_start().starts_with('{') {
-        return serde_json::from_str(value).context("parsing JSON position object");
+    if trimmed.starts_with('{') {
+        return serde_json::from_str(trimmed).context("parsing JSON position object");
     }
-    Ok(json!(value))
+    Ok(json!(trimmed))
 }
 
 fn ensure_json_object(value: Value) -> anyhow::Result<Value> {
@@ -5140,6 +5283,58 @@ mod tests {
             .map(str::to_string),
         );
         assert_eq!(path, vec!["debug", "log", "summarize"]);
+
+        let path = command_path_from_args(
+            ["exception", "focus", "--session", "1", "--cursor", "1"]
+                .into_iter()
+                .map(str::to_string),
+        );
+        assert_eq!(path, vec!["exception", "focus"]);
+    }
+
+    #[test]
+    fn classifies_unknown_session_and_cursor_errors_and_parses_percent_positions() {
+        let session_err = classify_error(anyhow::anyhow!("unknown session id: 42"));
+        assert_eq!(session_err.exit_code(), 5);
+        let cursor_err = classify_error(anyhow::anyhow!("unknown cursor id: 9"));
+        assert_eq!(cursor_err.exit_code(), 6);
+
+        assert_eq!(parse_position_argument("50").unwrap(), json!(50));
+        assert_eq!(parse_position_argument("50%").unwrap(), json!(50));
+        assert!(parse_position_argument("101%").is_err());
+        assert_eq!(parse_position_argument("10:0").unwrap(), json!("10:0"));
+    }
+
+    #[test]
+    fn cli_schema_resolves_target_analysis_and_triage_metadata() {
+        for sub in [
+            "disasm",
+            "memory-dump",
+            "memory-classify",
+            "memory-strings",
+            "memory-dps",
+            "memory-chase",
+            "stack-recover",
+        ] {
+            let schema = cli_schema(CliSchemaArgs {
+                command: vec!["target".into(), "analysis".into(), sub.into()],
+            })
+            .unwrap();
+            assert_eq!(
+                schema["command"]["path"],
+                format!("target analysis {sub}"),
+                "{schema}"
+            );
+        }
+
+        let triage = cli_schema(CliSchemaArgs {
+            command: vec!["triage".into(), "crash".into()],
+        })
+        .unwrap();
+        assert_eq!(
+            triage["command"]["metadata"]["safety"],
+            "read_only_hypothesis_generation"
+        );
     }
 
     #[test]

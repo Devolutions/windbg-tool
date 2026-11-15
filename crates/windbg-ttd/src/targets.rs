@@ -614,10 +614,16 @@ impl TargetRegistry {
             .remove(&request.target_id)
             .with_context(|| format!("unknown target id: {}", request.target_id))?;
         let detached = matches!(target.kind(), DebuggerSessionKind::Live);
-        if detached {
-            target.worker.call("detach", |session| session.detach())?;
+        let detach_result = if detached {
+            Some(target.worker.call("detach", |session| session.detach()))
+        } else {
+            None
+        };
+        let shutdown_result = target.worker.shutdown(false);
+        if let Some(Err(error)) = detach_result {
+            return Err(error);
         }
-        target.worker.shutdown(false)?;
+        shutdown_result?;
         Ok(TargetClosedResponse {
             target_id: request.target_id,
             closed: true,
@@ -630,17 +636,18 @@ impl TargetRegistry {
         &mut self,
         request: TargetRequest,
     ) -> anyhow::Result<TargetClosedResponse> {
+        let kind = self.target(request.target_id)?.kind();
+        ensure_live_target(request.target_id, kind)?;
         let mut target = self
             .targets
             .remove(&request.target_id)
             .with_context(|| format!("unknown target id: {}", request.target_id))?;
-        if target.kind() != DebuggerSessionKind::Live {
-            bail!("target {} is not a live session", request.target_id);
-        }
-        target
+        let terminate_result = target
             .worker
-            .call("terminate", |session| session.terminate())?;
-        target.worker.shutdown(false)?;
+            .call("terminate", |session| session.terminate());
+        let shutdown_result = target.worker.shutdown(false);
+        terminate_result?;
+        shutdown_result?;
         Ok(TargetClosedResponse {
             target_id: request.target_id,
             closed: true,
@@ -737,6 +744,7 @@ impl TargetRegistry {
         &self,
         request: TargetMemoryReadRequest,
     ) -> anyhow::Result<TargetMemoryReadResponse> {
+        ensure!(request.size > 0, "size must be greater than zero");
         let target = self.target(request.target_id)?;
         let address = request.address;
         let size = request.size;
@@ -886,6 +894,10 @@ impl TargetRegistry {
         &self,
         request: TargetStackTraceRequest,
     ) -> anyhow::Result<TargetStackTraceResponse> {
+        ensure!(
+            (1..=1024).contains(&request.max_frames),
+            "target stack_trace max_frames must be from 1 through 1024"
+        );
         let target = self.target(request.target_id)?;
         let max_frames = request.max_frames;
         Ok(TargetStackTraceResponse {
@@ -900,6 +912,14 @@ impl TargetRegistry {
         &self,
         request: TargetThreadContextRequest,
     ) -> anyhow::Result<TargetThreadContextResponse> {
+        ensure!(
+            (1..=1024).contains(&request.max_frames),
+            "target thread_context max_frames must be from 1 through 1024"
+        );
+        ensure!(
+            (1..=256).contains(&request.disassembly_count),
+            "target thread_context disassembly_count must be from 1 through 256"
+        );
         let target = self.target(request.target_id)?;
         let engine_thread_id = request.engine_thread_id;
         let max_frames = request.max_frames;
@@ -916,6 +936,10 @@ impl TargetRegistry {
         &self,
         request: TargetDisassembleRequest,
     ) -> anyhow::Result<TargetDisassemblyResponse> {
+        ensure!(
+            (1..=256).contains(&request.count),
+            "target disassemble count must be from 1 through 256"
+        );
         let target = self.target(request.target_id)?;
         let native_symbols = match request.address {
             Some(address) => prefetch_target_address(target, address)?,
@@ -1031,6 +1055,10 @@ impl TargetRegistry {
         &self,
         request: TargetExpressionRequest,
     ) -> anyhow::Result<TargetEvaluationResponse> {
+        ensure!(
+            !request.expression.trim().is_empty(),
+            "target expression must not be empty"
+        );
         let target = self.target(request.target_id)?;
         let expression = request.expression;
         Ok(TargetEvaluationResponse {
@@ -1180,7 +1208,6 @@ fn prefetch_dump_symbols(
     for name in [
         module.image_name.as_deref(),
         module.loaded_image_name.as_deref(),
-        module.symbol_file.as_deref(),
     ]
     .into_iter()
     .flatten()
@@ -1188,7 +1215,11 @@ fn prefetch_dump_symbols(
         let Some(file_name) = Path::new(name).file_name().map(|name| name.to_owned()) else {
             continue;
         };
-        if !image_names.contains(&file_name) {
+        let is_pdb = Path::new(&file_name)
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("pdb"));
+        if !is_pdb && !image_names.contains(&file_name) {
             image_names.push(file_name);
         }
     }
@@ -1465,6 +1496,17 @@ fn validate_breakpoint_set_request(request: &TargetBreakpointSetRequest) -> anyh
             "target symbol breakpoint expression cannot be empty"
         );
     }
+    if matches!(kind, TargetBreakpointKind::Code) {
+        ensure!(
+            request.size.is_none(),
+            "target code breakpoints do not accept a data size"
+        );
+    } else if let Some(size) = request.size {
+        ensure!(
+            matches!(size, 1 | 2 | 4 | 8),
+            "target data breakpoint size must be 1, 2, 4, or 8 bytes"
+        );
+    }
     Ok(())
 }
 
@@ -1552,6 +1594,16 @@ mod tests {
         invalid.symbol = Some("kernel32!CreateFileW".to_string());
         invalid.kind = Some(TargetBreakpointKind::Write);
         assert!(validate_breakpoint_set_request(&invalid).is_err());
+
+        let mut bad_size = address.clone();
+        bad_size.size = Some(4);
+        assert!(validate_breakpoint_set_request(&bad_size).is_err());
+
+        bad_size.kind = Some(TargetBreakpointKind::Write);
+        bad_size.size = Some(3);
+        assert!(validate_breakpoint_set_request(&bad_size).is_err());
+        bad_size.size = Some(8);
+        assert!(validate_breakpoint_set_request(&bad_size).is_ok());
     }
 
     #[test]

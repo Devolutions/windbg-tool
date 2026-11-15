@@ -267,17 +267,21 @@ impl<'a> StreamReader<'a> {
         if rva == 0 {
             return None;
         }
+        let body_rva = rva.checked_add(4)?;
         let length = minidump_u32(&self.read(rva, 4).ok()?, 0).min(MAX_STREAM_STRING_BYTES) & !1;
-        let bytes = self.read(rva + 4, length as usize).ok()?;
+        let bytes = self.read(body_rva, length as usize).ok()?;
         let units = bytes
-            .chunks_exact(2)
-            .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .copied()
+            .map(u16::from_le_bytes)
             .collect::<Vec<_>>();
-        Some(
-            String::from_utf16_lossy(&units)
-                .trim_end_matches('\0')
-                .to_string(),
-        )
+        let end = units
+            .iter()
+            .position(|&unit| unit == 0)
+            .unwrap_or(units.len());
+        Some(String::from_utf16_lossy(&units[..end]))
     }
 
     fn fault_module(&mut self, address: Option<u64>, unloaded: &UnloadedScan) -> FaultModule {
@@ -303,7 +307,7 @@ impl<'a> StreamReader<'a> {
             let needed = 4 + count as usize * MODULE_ENTRY_SIZE;
             ensure!(size as usize >= needed, "Partial MINIDUMP_MODULE_LIST");
             let table = self.read(u64::from(rva) + 4, needed - 4)?;
-            for entry in table.chunks_exact(MODULE_ENTRY_SIZE) {
+            for entry in table.as_chunks::<MODULE_ENTRY_SIZE>().0 {
                 let base = minidump_u64(entry, 0);
                 let image_size = minidump_u32(entry, 8);
                 if address < base || address - base >= u64::from(image_size) {
@@ -436,12 +440,19 @@ impl<'a> StreamReader<'a> {
             summary.count = Some(count);
             let loaded = count.min(MAX_STREAM_UNLOADED_MODULES);
             summary.truncated = loaded < count;
-            let table_bytes = loaded as usize * entry_size;
+            let table_bytes = (loaded as usize)
+                .checked_mul(entry_size)
+                .context("Unloaded module table size overflow")?;
             ensure!(
-                u64::from(header_size) + table_bytes as u64 <= u64::from(size),
+                u64::from(header_size)
+                    .checked_add(table_bytes as u64)
+                    .is_some_and(|needed| needed <= u64::from(size)),
                 "Partial MINIDUMP_UNLOADED_MODULE_LIST"
             );
-            let table = self.read(u64::from(rva) + u64::from(header_size), table_bytes)?;
+            let table_offset = u64::from(rva)
+                .checked_add(u64::from(header_size))
+                .context("Unloaded module table offset overflow")?;
+            let table = self.read(table_offset, table_bytes)?;
             for entry in table.chunks_exact(entry_size) {
                 let time_date_stamp = minidump_u32(entry, 16);
                 all.push(UnloadedModule {
@@ -498,7 +509,7 @@ impl<'a> StreamReader<'a> {
             );
             let table = self.read(u64::from(rva) + 4, table_bytes)?;
             let mut names = Vec::new();
-            for entry in table.chunks_exact(THREAD_NAME_ENTRY_SIZE) {
+            for entry in table.as_chunks::<THREAD_NAME_ENTRY_SIZE>().0 {
                 let thread_system_id = minidump_u32(entry, 0);
                 let Some(name) = self.string(minidump_u64(entry, 4)) else {
                     continue;
@@ -557,12 +568,19 @@ impl<'a> StreamReader<'a> {
             summary.count = Some(count);
             let loaded = count.min(MAX_STREAM_MEMORY_REGIONS);
             summary.truncated = loaded < count;
-            let table_bytes = loaded as usize * entry_size;
+            let table_bytes = (loaded as usize)
+                .checked_mul(entry_size)
+                .context("Memory info table size overflow")?;
             ensure!(
-                u64::from(header_size) + table_bytes as u64 <= u64::from(size),
+                u64::from(header_size)
+                    .checked_add(table_bytes as u64)
+                    .is_some_and(|needed| needed <= u64::from(size)),
                 "Partial MINIDUMP_MEMORY_INFO_LIST"
             );
-            let table = self.read(u64::from(rva) + u64::from(header_size), table_bytes)?;
+            let table_offset = u64::from(rva)
+                .checked_add(u64::from(header_size))
+                .context("Memory info table offset overflow")?;
+            let table = self.read(table_offset, table_bytes)?;
             regions.extend(table.chunks_exact(entry_size).map(memory_region));
             regions.sort_by_key(|region| region.base_address);
             summary.loaded = regions.len() as u64;
@@ -608,12 +626,19 @@ impl<'a> StreamReader<'a> {
             result.count = Some(count);
             let loaded = count.min(MAX_STREAM_HANDLES);
             result.descriptors_truncated = loaded < count;
-            let table_bytes = loaded as usize * descriptor_size;
+            let table_bytes = (loaded as usize)
+                .checked_mul(descriptor_size)
+                .context("Handle descriptor table size overflow")?;
             ensure!(
-                u64::from(header_size) + table_bytes as u64 <= u64::from(size),
+                u64::from(header_size)
+                    .checked_add(table_bytes as u64)
+                    .is_some_and(|needed| needed <= u64::from(size)),
                 "Partial MINIDUMP_HANDLE_DATA_STREAM"
             );
-            let table = self.read(u64::from(rva) + u64::from(header_size), table_bytes)?;
+            let table_offset = u64::from(rva)
+                .checked_add(u64::from(header_size))
+                .context("Handle descriptor table offset overflow")?;
+            let table = self.read(table_offset, table_bytes)?;
             let mut names: HashMap<u32, String> = HashMap::new();
             let mut counts: Vec<HandleTypeCount> = Vec::new();
             for descriptor in table.chunks_exact(descriptor_size) {
@@ -995,5 +1020,30 @@ mod tests {
         assert_eq!(utc_timestamp(0), "1970-01-01T00:00:00Z");
         assert_eq!(utc_timestamp(951_782_400), "2000-02-29T00:00:00Z");
         assert_eq!(protect_name(0x104), "PAGE_READWRITE|PAGE_GUARD");
+    }
+
+    #[test]
+    fn handles_overflowing_thread_name_rva_and_embedded_nuls() {
+        let mut names = 2u32.to_le_bytes().to_vec();
+        names.extend(1u32.to_le_bytes());
+        names.extend(u64::MAX.to_le_bytes());
+        names.extend(2u32.to_le_bytes());
+        names.extend(0xFFFF_0000u64.to_le_bytes());
+
+        let mut embedded_nul = 12u32.to_le_bytes().to_vec();
+        for unit in ['w' as u16, 'o' as u16, 0, 'x' as u16, 'y' as u16, 0] {
+            embedded_nul.extend(unit.to_le_bytes());
+        }
+        let bytes = build_dump(&[(THREAD_NAMES_STREAM, names)], &[embedded_nul]);
+        let path = write_dump("minidump-streams-nul-overflow", &bytes);
+        let directory = inspect_minidump_directory(&path);
+        let streams = inspect_user_dump_streams(&path, &directory, None, Some(2));
+        assert_eq!(streams.thread_names.status, "captured");
+        assert_eq!(streams.thread_names.names.len(), 1);
+        assert_eq!(streams.thread_names.names[0].name, "wo");
+        assert_eq!(
+            streams.thread_names.exception_thread_name.as_deref(),
+            Some("wo")
+        );
     }
 }

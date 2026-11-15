@@ -75,7 +75,8 @@ impl WindbgManager {
         let installed_version = self.installed_version()?;
         let dbgx_path = installed_version
             .as_ref()
-            .map(|version| self.version_dir(version).join("DbgX.Shell.exe"))
+            .and_then(|version| self.version_dir(version).ok())
+            .map(|dir| dir.join("DbgX.Shell.exe"))
             .filter(|path| path.is_file());
         let latest_version = if check_latest {
             Some(self.fetch_appinstaller()?.version)
@@ -104,8 +105,9 @@ impl WindbgManager {
             .with_context(|| format!("creating {}", self.install_dir.display()))?;
         let _lock = InstallLock::acquire(&self.install_dir)?;
 
+        let previous_version = self.installed_version()?;
         let appinstaller = self.fetch_appinstaller()?;
-        let version_dir = self.version_dir(&appinstaller.version);
+        let version_dir = self.version_dir(&appinstaller.version)?;
         let dbgx_path = version_dir.join("DbgX.Shell.exe");
         if !force && dbgx_path.is_file() {
             self.write_installed_version(&appinstaller.version)?;
@@ -131,6 +133,11 @@ impl WindbgManager {
             .with_context(|| format!("downloading {}", appinstaller.bundle_uri))?;
 
         let package = select_bundle_package(&bundle_path, native_architecture()?)?;
+        ensure!(
+            is_safe_single_component(&package.file_name),
+            "bundle package FileName is not a safe filename: {:?}",
+            package.file_name
+        );
         let msix_path = temp_dir.join(&package.file_name);
         extract_one_from_zip(&bundle_path, &package.file_name, &msix_path)?;
         verify_msix_trust(&msix_path)?;
@@ -156,7 +163,7 @@ impl WindbgManager {
             version: appinstaller.version,
             dbgx_path,
             installed: true,
-            updated: true,
+            updated: previous_version.is_some(),
         })
     }
 
@@ -168,7 +175,7 @@ impl WindbgManager {
         let version = self
             .installed_version()?
             .context("WinDbg is not installed; run `windbg-tool windbg install` first")?;
-        let path = self.version_dir(&version).join("DbgX.Shell.exe");
+        let path = self.version_dir(&version)?.join("DbgX.Shell.exe");
         ensure!(
             path.is_file(),
             "installed WinDbg executable is missing at {}",
@@ -187,8 +194,12 @@ impl WindbgManager {
         parse_appinstaller(&text)
     }
 
-    fn version_dir(&self, version: &str) -> PathBuf {
-        self.install_dir.join(version)
+    fn version_dir(&self, version: &str) -> anyhow::Result<PathBuf> {
+        ensure!(
+            is_safe_single_component(version),
+            "WinDbg version string is not a safe directory name: {version:?}"
+        );
+        Ok(self.install_dir.join(version))
     }
 
     fn installed_version(&self) -> anyhow::Result<Option<String>> {
@@ -200,7 +211,15 @@ impl WindbgManager {
             .with_context(|| format!("reading {}", version_file.display()))?
             .trim()
             .to_string();
-        Ok((!version.is_empty()).then_some(version))
+        if version.is_empty() {
+            return Ok(None);
+        }
+        ensure!(
+            is_safe_single_component(&version),
+            "installed version in {} is not a safe directory name: {version:?}",
+            version_file.display()
+        );
+        Ok(Some(version))
     }
 
     fn write_installed_version(&self, version: &str) -> anyhow::Result<()> {
@@ -226,6 +245,10 @@ pub fn parse_appinstaller(xml: &str) -> anyhow::Result<AppInstallerInfo> {
         .attribute("Version")
         .context("AppInstaller is missing Version")?
         .to_string();
+    ensure!(
+        is_safe_single_component(&version),
+        "AppInstaller Version is not a safe directory name: {version:?}"
+    );
     let bundle = document
         .descendants()
         .find(|node| node.has_tag_name("MainBundle"))
@@ -375,12 +398,12 @@ fn verify_msix_trust(path: &Path) -> anyhow::Result<()> {
 #[cfg(windows)]
 fn verify_msix_trust_impl(path: &Path) -> anyhow::Result<()> {
     let script = r#"
-$signature = Get-AuthenticodeSignature -LiteralPath $args[0]
+$signature = Get-AuthenticodeSignature -LiteralPath $env:WINDBG_MSIX_PATH
 if ($signature.Status -ne 'Valid') {
     Write-Error "Authenticode signature status is $($signature.Status)"
     exit 1
 }
-if ($null -eq $signature.SignerCertificate -or $signature.SignerCertificate.Subject -notmatch 'Microsoft') {
+if ($null -eq $signature.SignerCertificate -or $signature.SignerCertificate.Subject -notmatch '(^|,\s*)CN=Microsoft\b') {
     Write-Error "Signer certificate is not a Microsoft certificate"
     exit 2
 }
@@ -392,7 +415,7 @@ if ($null -eq $signature.SignerCertificate -or $signature.SignerCertificate.Subj
         .arg("Bypass")
         .arg("-Command")
         .arg(script)
-        .arg(path)
+        .env("WINDBG_MSIX_PATH", path)
         .output()
         .with_context(|| format!("verifying Authenticode signature for {}", path.display()))?;
     if !output.status.success() {
@@ -404,6 +427,18 @@ if ($null -eq $signature.SignerCertificate -or $signature.SignerCertificate.Subj
         );
     }
     Ok(())
+}
+
+fn is_safe_single_component(name: &str) -> bool {
+    !name.is_empty()
+        && name != "."
+        && name != ".."
+        && !name.starts_with('.')
+        && !name.contains(['/', '\\', ':', '\0'])
+        && !name.chars().any(char::is_control)
+        && Path::new(name)
+            .file_name()
+            .is_some_and(|file_name| file_name == name)
 }
 
 #[cfg(not(windows))]

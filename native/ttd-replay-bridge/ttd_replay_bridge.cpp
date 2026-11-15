@@ -127,10 +127,16 @@ TtdMcpModuleInfo to_bridge_module(TTD::Replay::Module const* module) noexcept {
         return output;
     }
 
-    wchar_t const* const base_name = TTD::Replay::GetModuleBaseName(module->pName, module->NameLength);
-    size_t const base_name_length = module->NameLength - static_cast<size_t>(base_name - module->pName);
-    copy_wide(output.name, std::size(output.name), base_name, base_name_length);
-    copy_wide(output.path, std::size(output.path), module->pName, module->NameLength);
+    if (module->pName != nullptr && module->NameLength > 0) {
+        wchar_t const* const base_name = TTD::Replay::GetModuleBaseName(module->pName, module->NameLength);
+        if (base_name != nullptr && base_name >= module->pName) {
+            size_t const prefix = static_cast<size_t>(base_name - module->pName);
+            if (prefix <= module->NameLength) {
+                copy_wide(output.name, std::size(output.name), base_name, module->NameLength - prefix);
+            }
+        }
+        copy_wide(output.path, std::size(output.path), module->pName, module->NameLength);
+    }
     output.base_address = static_cast<uint64_t>(module->Address);
     output.size = module->Size;
     return output;
@@ -393,6 +399,7 @@ TTD_MCP_EXPORT TtdMcpStatus ttd_mcp_index_status(TtdMcpTrace* trace, uint32_t* s
         return TTD_MCP_INVALID_ARGUMENT;
     }
 
+    std::scoped_lock lock(trace->mutex);
     *status = static_cast<uint32_t>(trace->engine->GetIndexStatus());
     return TTD_MCP_OK;
 }
@@ -403,6 +410,7 @@ TTD_MCP_EXPORT TtdMcpStatus ttd_mcp_index_file_stats(TtdMcpTrace* trace, TtdMcpI
         return TTD_MCP_INVALID_ARGUMENT;
     }
 
+    std::scoped_lock lock(trace->mutex);
     *stats = to_bridge_index_file_stats(trace->engine->GetIndexFileStats());
     return TTD_MCP_OK;
 }
@@ -422,6 +430,7 @@ TTD_MCP_EXPORT TtdMcpStatus ttd_mcp_build_index(TtdMcpTrace* trace, uint32_t fla
         return TTD_MCP_INVALID_ARGUMENT;
     }
 
+    std::scoped_lock lock(trace->mutex);
     *progress = {};
     *status = static_cast<uint32_t>(trace->engine->BuildIndex(
         index_build_progress_callback,
@@ -690,6 +699,7 @@ TTD_MCP_EXPORT TtdMcpStatus ttd_mcp_cursor_position(TtdMcpCursor* cursor, TtdMcp
         return TTD_MCP_INVALID_ARGUMENT;
     }
 
+    std::scoped_lock lock(cursor->trace->mutex);
     auto const current = cursor->cursor->GetPosition();
     *position = to_bridge_position(current);
     return TTD_MCP_OK;
@@ -701,6 +711,7 @@ TTD_MCP_EXPORT TtdMcpStatus ttd_mcp_set_position(TtdMcpCursor* cursor, TtdMcpPos
         return TTD_MCP_INVALID_ARGUMENT;
     }
 
+    std::scoped_lock lock(cursor->trace->mutex);
     cursor->cursor->SetPosition(to_replay_position(position));
     return TTD_MCP_OK;
 }
@@ -716,6 +727,7 @@ TTD_MCP_EXPORT TtdMcpStatus ttd_mcp_set_position_on_thread(TtdMcpCursor* cursor,
         return TTD_MCP_INVALID_ARGUMENT;
     }
 
+    std::scoped_lock lock(cursor->trace->mutex);
     cursor->cursor->SetPositionOnThread(
         static_cast<TTD::Replay::UniqueThreadId>(thread_unique_id),
         to_replay_position(position));
@@ -793,7 +805,7 @@ TTD_MCP_EXPORT TtdMcpStatus ttd_mcp_query_memory_range(TtdMcpCursor* cursor, uin
         static_cast<uint64_t>(bytes_available),
         static_cast<uint32_t>(bytes_copied),
         static_cast<uint64_t>(memory.Sequence),
-        bytes_copied == bytes_available ? static_cast<uint8_t>(1) : static_cast<uint8_t>(0),
+        bytes_available > 0 && bytes_copied == bytes_available ? static_cast<uint8_t>(1) : static_cast<uint8_t>(0),
     };
     return TTD_MCP_OK;
 }
@@ -1068,10 +1080,11 @@ TTD_MCP_EXPORT TtdMcpStatus ttd_mcp_step_cursor(TtdMcpCursor* cursor, uint32_t d
 
     std::scoped_lock lock(cursor->trace->mutex);
     TTD::Replay::ReplayFlags const previous_flags = cursor->cursor->GetReplayFlags();
-    TTD::Replay::ReplayFlags next_flags = previous_flags;
-    if (only_current_thread != 0) {
-        next_flags = next_flags | TTD::Replay::ReplayOnlyCurrentThread;
-    }
+    TTD::Replay::ReplayFlags const next_flags = only_current_thread != 0
+        ? (previous_flags | TTD::Replay::ReplayOnlyCurrentThread)
+        : static_cast<TTD::Replay::ReplayFlags>(
+            static_cast<uint32_t>(previous_flags)
+            & ~static_cast<uint32_t>(TTD::Replay::ReplayOnlyCurrentThread));
     cursor->cursor->SetReplayFlags(next_flags);
 
     TTD::Replay::ICursorView::ReplayResult const replay_result = direction == 0

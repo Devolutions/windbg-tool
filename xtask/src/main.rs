@@ -740,6 +740,7 @@ impl SmokeClient {
     fn start(server_path: &Path, current_dir: &Path) -> anyhow::Result<Self> {
         let mut child = Command::new(server_path)
             .current_dir(current_dir)
+            .env("WINDBG_TOOL_MCP_IN_PROCESS", "1")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())

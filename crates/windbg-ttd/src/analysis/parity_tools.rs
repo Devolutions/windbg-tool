@@ -243,8 +243,8 @@ pub fn ttd_object_vtable(
             .context("vtable read did not include hex data")?,
     )?;
     let mut entries = Vec::new();
-    for (index, chunk) in vtable_bytes.chunks_exact(8).enumerate() {
-        let target = u64::from_le_bytes(chunk.try_into()?);
+    for (index, chunk) in vtable_bytes.as_chunks::<8>().0.iter().enumerate() {
+        let target = u64::from_le_bytes(*chunk);
         let target_info = if target == 0 {
             json!({ "ok": false, "error": "null vtable entry" })
         } else {
@@ -254,10 +254,11 @@ pub fn ttd_object_vtable(
                 address: target.to_string(),
             }))
         };
+        let slot_address = vtable_address.wrapping_add(index as u64 * 8);
         entries.push(json!({
             "index": index,
-            "slot_address": vtable_address + (index as u64 * 8),
-            "slot_address_hex": format!("0x{:X}", vtable_address + (index as u64 * 8)),
+            "slot_address": slot_address,
+            "slot_address_hex": format!("0x{slot_address:X}"),
             "target": target,
             "target_hex": format!("0x{target:X}"),
             "plausible_x64_pointer": super::memory::plausible_x64_pointer(target),
@@ -281,6 +282,8 @@ pub fn ttd_object_vtable(
         "object_read": object_read_value,
         "vtable_read": vtable_read_value,
         "vtable_info": vtable_info,
+        "entries_requested": request.entries,
+        "entries_returned": entries.len(),
         "entries": entries,
         "safety": "read_only_analysis"
     }))
@@ -382,11 +385,12 @@ pub fn source_resolve(request: SourceResolveRequest) -> anyhow::Result<Value> {
         ));
     }
 
+    let scan_limit = request.max_candidates.saturating_mul(64).clamp(256, 4096);
     for root in &search_paths {
         collect_source_matches(
             root,
             &recorded_components,
-            request.max_candidates,
+            scan_limit,
             request.max_depth,
             0,
             &mut matches,
@@ -435,33 +439,79 @@ pub fn breakpoint_plan(request: BreakpointPlanRequest) -> anyhow::Result<Value> 
     {
         let subject = json!({ "kind": "target", "target_id": target });
         match kind {
-            "code" => (
+            "code" => {
+                let command = if let Some(addr) = request.address.as_ref() {
+                    json!([
+                        "windbg-tool",
+                        "breakpoint",
+                        "set",
+                        "--target",
+                        target,
+                        "--address",
+                        addr
+                    ])
+                } else {
+                    json!([
+                        "windbg-tool",
+                        "breakpoint",
+                        "set",
+                        "--target",
+                        target,
+                        "--symbol",
+                        request
+                            .symbol
+                            .clone()
+                            .unwrap_or_else(|| "<symbol>".to_string())
+                    ])
+                };
+                (
+                    subject,
+                    request.address.is_some() || request.symbol.is_some(),
+                    command,
+                    if request.symbol.is_some() && request.address.is_none() {
+                        "DbgEng live targets support deferred symbol code breakpoints."
+                    } else {
+                        "DbgEng live targets support code breakpoints by address."
+                    },
+                    "mutating",
+                )
+            }
+            "read" | "write" | "execute" | "read_write" => (
                 subject,
                 request.address.is_some(),
-                json!([
-                    "windbg-tool",
-                    "breakpoint",
-                    "set",
-                    "--target",
-                    target,
-                    "--address",
-                    request
-                        .address
-                        .clone()
-                        .unwrap_or_else(|| "<address>".to_string())
-                ]),
-                if request.symbol.is_some() {
-                    "Symbol breakpoint setting is not first-class yet; resolve the symbol to an address first."
+                if let Some(addr) = request.address.as_ref() {
+                    json!([
+                        "windbg-tool",
+                        "breakpoint",
+                        "set",
+                        "--target",
+                        target,
+                        "--address",
+                        addr,
+                        "--kind",
+                        kind,
+                        "--size",
+                        request.size.unwrap_or(1)
+                    ])
                 } else {
-                    "DbgEng live targets support code breakpoints by address."
+                    Value::Null
                 },
-                "mutating",
+                if request.address.is_some() {
+                    "DbgEng live targets support processor data breakpoints by address."
+                } else {
+                    "Data breakpoints on live targets require an address."
+                },
+                if request.address.is_some() {
+                    "mutating"
+                } else {
+                    "unsupported"
+                },
             ),
             _ => (
                 subject,
                 false,
                 Value::Null,
-                "Data watchpoints are not currently exposed for daemon-owned live targets.",
+                "Requested breakpoint kind is not supported for daemon-owned live targets.",
                 "unsupported",
             ),
         }
@@ -597,15 +647,21 @@ fn collect_source_matches(
         if matches.len() >= max_candidates {
             break;
         }
-        let entry = match entry {
-            Ok(entry) => entry,
-            Err(error) => {
-                matches.push(json!({ "error": error.to_string() }));
+        let Ok(entry) = entry else {
+            continue;
+        };
+        if entry.file_type().is_ok_and(|ft| ft.is_symlink()) {
+            continue;
+        }
+        let entry_path = entry.path();
+        if entry_path.is_dir() {
+            let dir_name = entry.file_name().to_string_lossy().to_ascii_lowercase();
+            if dir_name == ".git" && !recorded_components.iter().any(|c| c == ".git") {
                 continue;
             }
-        };
+        }
         collect_source_matches(
-            &entry.path(),
+            &entry_path,
             recorded_components,
             max_candidates,
             max_depth,
@@ -637,12 +693,11 @@ fn matching_suffix_len(candidate: &[String], recorded: &[String]) -> usize {
 }
 
 fn normalized_components(path: &Path) -> Vec<String> {
-    path.components()
-        .filter_map(|component| match component {
-            std::path::Component::Normal(value) => {
-                Some(value.to_string_lossy().to_ascii_lowercase())
-            }
-            _ => None,
-        })
+    let raw = path.to_string_lossy();
+    let trimmed = raw.trim().trim_matches('"');
+    trimmed
+        .split(['\\', '/'])
+        .filter(|part| !part.is_empty() && *part != "." && *part != ".." && !part.ends_with(':'))
+        .map(str::to_ascii_lowercase)
         .collect()
 }

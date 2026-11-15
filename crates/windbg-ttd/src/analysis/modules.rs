@@ -10,12 +10,15 @@ pub fn audit_modules(modules: &[Value], max_suspicious: usize) -> Value {
     let mut network_path = 0usize;
     let mut outside_windows_dir = 0usize;
     let mut suspicious = Vec::new();
+    let mut suspicious_truncated = false;
     let mut names: std::collections::BTreeMap<String, Vec<Value>> =
         std::collections::BTreeMap::new();
-    let windows_dir = std::env::var("WINDIR")
-        .or_else(|_| std::env::var("SystemRoot"))
-        .unwrap_or_else(|_| String::from(r"C:\Windows"))
-        .to_ascii_lowercase();
+    let windows_dir = PathBuf::from(
+        std::env::var("WINDIR")
+            .or_else(|_| std::env::var("SystemRoot"))
+            .unwrap_or_else(|_| String::from(r"C:\Windows"))
+            .to_ascii_lowercase(),
+    );
 
     for module in modules {
         let name = module["name"].as_str().unwrap_or_default();
@@ -33,11 +36,18 @@ pub fn audit_modules(modules: &[Value], max_suspicious: usize) -> Value {
         let Some(path) = module_path(module) else {
             missing_path += 1;
             reasons.push("missing_module_path");
-            push_suspicious_module(&mut suspicious, module, reasons, max_suspicious);
+            push_suspicious_module(
+                &mut suspicious,
+                &mut suspicious_truncated,
+                module,
+                reasons,
+                max_suspicious,
+            );
             continue;
         };
         let lower = path.to_ascii_lowercase();
         let path_buf = PathBuf::from(path);
+        let lower_path = PathBuf::from(&lower);
         if lower.starts_with(r"\\") {
             network_path += 1;
             reasons.push("network_path");
@@ -54,7 +64,7 @@ pub fn audit_modules(modules: &[Value], max_suspicious: usize) -> Value {
             temp_path += 1;
             reasons.push("temp_or_download_path");
         }
-        if path_buf.is_absolute() && !lower.starts_with(&windows_dir) {
+        if path_buf.is_absolute() && !lower_path.starts_with(&windows_dir) {
             outside_windows_dir += 1;
             reasons.push("outside_windows_directory");
         }
@@ -63,7 +73,13 @@ pub fn audit_modules(modules: &[Value], max_suspicious: usize) -> Value {
             reasons.push("binary_not_available_locally");
         }
         if !reasons.is_empty() {
-            push_suspicious_module(&mut suspicious, module, reasons, max_suspicious);
+            push_suspicious_module(
+                &mut suspicious,
+                &mut suspicious_truncated,
+                module,
+                reasons,
+                max_suspicious,
+            );
         }
     }
 
@@ -97,7 +113,7 @@ pub fn audit_modules(modules: &[Value], max_suspicious: usize) -> Value {
             "duplicate_name_groups": duplicates.len(),
         },
         "suspicious_modules": suspicious,
-        "suspicious_truncated": suspicious.len() >= max_suspicious,
+        "suspicious_truncated": suspicious_truncated,
         "duplicate_name_groups": duplicates,
         "safe_next_steps": [
             "Run symbols diagnose for suspicious module paths that are available locally.",
@@ -113,11 +129,13 @@ fn module_path(module: &Value) -> Option<&str> {
 
 fn push_suspicious_module(
     suspicious: &mut Vec<Value>,
+    suspicious_truncated: &mut bool,
     module: &Value,
     reasons: Vec<&'static str>,
     max_suspicious: usize,
 ) {
     if suspicious.len() >= max_suspicious {
+        *suspicious_truncated = true;
         return;
     }
     suspicious.push(json!({
@@ -160,11 +178,14 @@ pub fn search_candidate(order: usize, kind: &str, directory: &Path, dll: &str) -
 
 pub fn directory_risk(directory: &Path) -> &'static str {
     let lower = directory.to_string_lossy().to_ascii_lowercase();
-    let windows_dir = std::env::var("WINDIR")
-        .or_else(|_| std::env::var("SystemRoot"))
-        .unwrap_or_else(|_| String::from(r"C:\Windows"))
-        .to_ascii_lowercase();
-    if lower.starts_with(&windows_dir) {
+    let lower_path = PathBuf::from(&lower);
+    let windows_dir = PathBuf::from(
+        std::env::var("WINDIR")
+            .or_else(|_| std::env::var("SystemRoot"))
+            .unwrap_or_else(|_| String::from(r"C:\Windows"))
+            .to_ascii_lowercase(),
+    );
+    if lower_path.starts_with(&windows_dir) {
         "system_controlled"
     } else if lower.starts_with(r"\\") {
         "network_path"
@@ -222,6 +243,19 @@ mod tests {
             "{audit}"
         );
         assert_eq!(audit["summary"]["duplicate_name_groups"].as_u64(), Some(1));
+        assert_eq!(audit["suspicious_truncated"], false);
+    }
+
+    #[test]
+    fn windows_prefix_sibling_directory_is_not_system_controlled() {
+        assert_eq!(
+            directory_risk(Path::new(r"C:\Windows\System32")),
+            "system_controlled"
+        );
+        assert_ne!(
+            directory_risk(Path::new(r"C:\Windows_temp\evil")),
+            "system_controlled"
+        );
     }
 
     #[test]

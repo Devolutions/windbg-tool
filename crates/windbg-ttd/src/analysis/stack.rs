@@ -45,20 +45,20 @@ pub fn recover_stack_candidates(
 }
 
 pub fn stack_candidate_confidence(value: u64, slot_address: u64, in_module: bool) -> f64 {
-    let mut confidence = 0.15;
+    let mut score = 15u32;
     if in_module {
-        confidence += 0.55;
+        score += 55;
     }
     if slot_address.is_multiple_of(8) {
-        confidence += 0.10;
+        score += 10;
     }
     if plausible_x64_pointer(value) {
-        confidence += 0.15;
+        score += 15;
     }
     if value.is_multiple_of(16) {
-        confidence += 0.05;
+        score += 5;
     }
-    f64::min(confidence, 1.0)
+    f64::from(score.min(100)) / 100.0
 }
 
 pub fn stack_candidate_reasons(

@@ -33,7 +33,12 @@ fn pe_file_version(version: &str) -> String {
     let numeric = version.split(['-', '+']).next().unwrap_or(version);
     let mut parts = numeric
         .split('.')
-        .filter_map(|part| part.parse::<u16>().ok())
+        .map(|part| {
+            part.parse::<u32>()
+                .ok()
+                .map(|n| n.min(u32::from(u16::MAX)) as u16)
+                .unwrap_or(0)
+        })
         .collect::<Vec<_>>();
     while parts.len() < 4 {
         parts.push(0);

@@ -22,7 +22,7 @@ pub fn dump_db_rows(address: u64, bytes: &[u8]) -> Vec<Value> {
         .map(|(row, chunk)| {
             let offset = row * 16;
             json!({
-                "address": address + offset as u64,
+                "address": address.wrapping_add(offset as u64),
                 "offset": offset,
                 "bytes": chunk.iter().map(|byte| format!("{byte:02X}")).collect::<Vec<_>>(),
                 "ascii": chunk.iter().map(|byte| if byte.is_ascii_graphic() || *byte == b' ' { *byte as char } else { '.' }).collect::<String>(),
@@ -50,7 +50,7 @@ pub fn dump_dq_rows(address: u64, bytes: &[u8]) -> Vec<Value> {
                 })
                 .collect::<Vec<_>>();
             json!({
-                "address": address + offset as u64,
+                "address": address.wrapping_add(offset as u64),
                 "offset": offset,
                 "qwords": qwords,
             })
@@ -192,7 +192,7 @@ fn push_ascii_string(
 ) {
     if end.saturating_sub(begin) >= 4 {
         strings.push(json!({
-            "address": address + begin as u64,
+            "address": address.wrapping_add(begin as u64),
             "offset": begin,
             "length": end - begin,
             "text": String::from_utf8_lossy(&bytes[begin..end]),
@@ -219,26 +219,30 @@ pub fn utf16le_strings(address: u64, bytes: &[u8]) -> Vec<Value> {
         }
         if values.len() >= 4 {
             strings.push(json!({
-                "address": address + begin as u64,
+                "address": address.wrapping_add(begin as u64),
                 "offset": begin,
                 "code_units": values.len(),
                 "text": String::from_utf16_lossy(&values),
             }));
+            index += 2;
+        } else {
+            index = begin + 2;
         }
-        index = begin + 2;
     }
     strings
 }
 
 pub fn qword_values(address: u64, bytes: &[u8]) -> Value {
     let qwords = bytes
-        .chunks_exact(8)
+        .as_chunks::<8>()
+        .0
+        .iter()
         .take(32)
         .enumerate()
         .map(|(index, chunk)| {
-            let value = u64::from_le_bytes(chunk.try_into().expect("chunk size is exact"));
+            let value = u64::from_le_bytes(*chunk);
             json!({
-                "address": address + (index * 8) as u64,
+                "address": address.wrapping_add((index * 8) as u64),
                 "offset": index * 8,
                 "value": value,
                 "hex": format!("0x{value:016X}"),
@@ -326,7 +330,20 @@ mod tests {
     fn parses_hex_bytes_for_memory_classification() -> anyhow::Result<()> {
         assert_eq!(hex_to_bytes("4869ff")?, vec![0x48, 0x69, 0xff]);
         assert!(hex_to_bytes("123").is_err());
+        assert!(hex_to_bytes("aéb").is_err());
         Ok(())
+    }
+
+    #[test]
+    fn utf16le_strings_does_not_emit_overlapping_suffixes() {
+        let mut bytes = Vec::new();
+        for ch in "HelloWorld".encode_utf16() {
+            bytes.extend_from_slice(&ch.to_le_bytes());
+        }
+        bytes.extend_from_slice(&[0, 0]);
+        let extracted = utf16le_strings(0x1000, &bytes);
+        assert_eq!(extracted.len(), 1, "{extracted:?}");
+        assert_eq!(extracted[0]["text"], "HelloWorld");
     }
 
     #[test]

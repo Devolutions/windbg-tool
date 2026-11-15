@@ -417,6 +417,7 @@ impl ICLRDataTarget_Impl for DbgEngDataTarget_Impl {
         if buffer.is_null() || bytes_read.is_null() {
             return E_POINTER;
         }
+        unsafe { *bytes_read = 0 };
         match unsafe {
             self.data_spaces
                 .ReadVirtual(address, buffer.cast(), bytes_requested, Some(bytes_read))
@@ -437,6 +438,7 @@ impl ICLRDataTarget_Impl for DbgEngDataTarget_Impl {
         if buffer.is_null() || bytes_written.is_null() {
             return E_POINTER;
         }
+        unsafe { *bytes_written = 0 };
         if !self.allow_target_writes {
             return E_ACCESSDENIED;
         }
@@ -893,13 +895,16 @@ impl CoreClrDacBridge {
                 )?;
                 let mut path = vec![0u16; 32 * 1024];
                 let mut path_length = 0;
-                unsafe {
+                if unsafe {
                     module
                         .GetFileName(path.len() as u32, &mut path_length, path.as_mut_ptr())
-                        .ok()
+                        .is_err()
+                } {
+                    continue;
                 }
-                .context("getting a managed module file name")?;
-                let actual_path = utf16_path(&path)?;
+                let Ok(actual_path) = utf16_path(&path) else {
+                    continue;
+                };
                 if module_paths_match(expected_path, &actual_path) {
                     return Ok(Some(module));
                 }

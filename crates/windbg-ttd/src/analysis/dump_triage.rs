@@ -73,6 +73,10 @@ fn triage_profile_label(profile: Option<&str>) -> &'static str {
 
 /// Open a dump and produce the structured inspect/triage JSON payload.
 pub fn dump_triage(request: DumpTriageRequest) -> anyhow::Result<Value> {
+    anyhow::ensure!(
+        (1..=1024).contains(&request.max_frames),
+        "dump_triage max_frames must be from 1 through 1024"
+    );
     let inspected_address = request
         .inspect_address
         .as_deref()
@@ -123,7 +127,12 @@ pub fn dump_triage(request: DumpTriageRequest) -> anyhow::Result<Value> {
     let stack_elapsed_ms = stack_started.elapsed().as_millis() as u64;
     let triage_started = Instant::now();
     if let Some(exception) = &mut user_exception {
-        session.unwind_user_dump_exception(exception, request.max_frames);
+        session.unwind_user_dump_exception(
+            exception,
+            request
+                .max_frames
+                .min(windbg_dbgeng::MAX_USER_EXCEPTION_STACK_FRAMES),
+        );
     }
     let user_streams = user_exception.as_ref().map(|exception| {
         windbg_dbgeng::inspect_user_dump_streams(
@@ -253,16 +262,24 @@ fn prepare_dump_native_symbols(
         });
     };
     let image_roots = dump_image_roots(extra_image_paths);
-    let image_names = [
+    let mut image_names = Vec::new();
+    for name in [
         module.image_name.as_deref(),
         module.loaded_image_name.as_deref(),
-        module.symbol_file.as_deref(),
     ]
     .into_iter()
     .flatten()
     .filter_map(|name| Path::new(name).file_name())
-    .collect::<BTreeSet<_>>();
-    let Some(image_name) = image_names.iter().next().and_then(|name| name.to_str()) else {
+    {
+        let is_pdb = Path::new(name)
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("pdb"));
+        if !is_pdb && !image_names.contains(&name) {
+            image_names.push(name);
+        }
+    }
+    let Some(image_name) = image_names.first().and_then(|name| name.to_str()) else {
         return json!({
             "status": "unavailable",
             "module": module,
@@ -1423,10 +1440,12 @@ fn dump_per_cpu_tracker_topology(
     };
     let fault_entry_slot = entry_address.and_then(|entry| {
         pointer_bytes
-            .chunks_exact(8)
+            .as_chunks::<8>()
+            .0
+            .iter()
             .enumerate()
             .find_map(|(slot, chunk)| {
-                let base = u64::from_le_bytes(chunk.try_into().expect("exact pointer chunk"));
+                let base = u64::from_le_bytes(*chunk);
                 if base != 0 && base % 0x1000 == 0 {
                     let offset = entry.checked_sub(base)?;
                     (offset % entry_stride == 0 && offset / entry_stride < table_size)
@@ -1443,8 +1462,8 @@ fn dump_per_cpu_tracker_topology(
         }
     };
     let mut tables = Vec::new();
-    for (slot, chunk) in pointer_bytes.chunks_exact(8).enumerate() {
-        let base = u64::from_le_bytes(chunk.try_into().expect("exact pointer chunk"));
+    for (slot, chunk) in pointer_bytes.as_chunks::<8>().0.iter().enumerate() {
+        let base = u64::from_le_bytes(*chunk);
         if base == 0 {
             continue;
         }
@@ -1717,7 +1736,9 @@ fn decode_hex_bytes(value: &str) -> Option<Vec<u8>> {
     }
     value
         .as_bytes()
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|pair| {
             std::str::from_utf8(pair)
                 .ok()
@@ -2234,10 +2255,12 @@ mod tests {
         pointer_bytes[slot * 8..slot * 8 + 8].copy_from_slice(&table_base.to_le_bytes());
 
         let matched = pointer_bytes
-            .chunks_exact(8)
+            .as_chunks::<8>()
+            .0
+            .iter()
             .enumerate()
             .find_map(|(slot, chunk)| {
-                let base = u64::from_le_bytes(chunk.try_into().expect("exact pointer chunk"));
+                let base = u64::from_le_bytes(*chunk);
                 if base != 0 && base % 0x1000 == 0 {
                     let offset = entry.checked_sub(base)?;
                     (offset % stride == 0 && offset / stride < table_size)

@@ -5,7 +5,6 @@ edition.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
-homepage.workspace = true
 description = "DbgEng process-server and live-launch helpers for windbg-tool"
 
 [dependencies]
@@ -13,7 +12,6 @@ anyhow.workspace = true
 serde.workspace = true
 
 [target.'cfg(windows)'.dependencies]
-libloading.workspace = true
 windows-core = "0.58"
 windows = { workspace = true, features = [
     "Win32_Foundation",
